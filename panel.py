@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.0.3"
+CURRENT_VERSION = "2.0.4"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -559,22 +559,30 @@ def version_gt(a, b):
 
 
 def get_latest_version():
-    """查询 GitHub 最新版本号（GitHub API 带重试 → jsDelivr data API 兜底）"""
-    # GitHub API 主源：失败重试 2 次（服务器网络波动/限流时常见）
-    for attempt in (1, 2, 3):
-        d = http_get_json("https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest", timeout=20)
-        if d and d.get("tag_name"):
-            return d["tag_name"].lstrip("v")
-        if attempt < 3:
-            time.sleep(2)
-    # 兜底：jsDelivr（可能有缓存滞后，比 GitHub 慢一拍）
-    d = http_get_json("https://data.jsdelivr.com/v1/package/gh/jacksonchowspare/fwpanel2", timeout=20)
-    if d and d.get("versions"):
-        return d["versions"][0]
-    # 最终兜底：gh-proxy.com 代理 GitHub API（2026-08 实测可用）
-    d = http_get_json("https://gh-proxy.com/https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest", timeout=20)
+    """查询 GitHub 最新版本号。
+
+    releases/latest 只返回正式版——仓库全为 beta 时它 404,因此随后走
+    releases 列表(实时、含 prerelease、无 CDN 延迟);jsDelivr / gh-proxy 仅兜底。
+    """
+    # 1) GitHub 最新正式版(全 beta 仓库 404 → None,不重试浪费时间)
+    d = http_get_json("https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest", timeout=15)
     if d and d.get("tag_name"):
         return d["tag_name"].lstrip("v")
+    # 2) releases 列表(实时,首个即最新,含 beta)
+    d = http_get_json("https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=10", timeout=15)
+    if isinstance(d, list) and d:
+        for x in d:
+            if x.get("tag_name"):
+                return str(x["tag_name"]).lstrip("v")
+    # 3) 网络兜底:jsDelivr data API(有缓存滞后) → gh-proxy 列表
+    d = http_get_json("https://data.jsdelivr.com/v1/package/gh/jacksonchowspare/fwpanel2", timeout=15)
+    if d and d.get("versions"):
+        return d["versions"][0]
+    d = http_get_json("https://gh-proxy.com/https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=10", timeout=15)
+    if isinstance(d, list) and d:
+        for x in d:
+            if x.get("tag_name"):
+                return str(x["tag_name"]).lstrip("v")
     return None
 
 

@@ -1203,36 +1203,49 @@ async function fedProbeOne(n) {
     if (met) met.innerHTML = "<span>⛔ 离线或令牌失效：</span><span>" + esc(e.message) + "</span>";
   }
 }
+/* 版本比较:a>b → 1,a<b → -1,相等 → 0 */
+function vcmp(a, b) {
+  const pa = String(a || "").split(".").map(Number);
+  const pb = String(b || "").split(".").map(Number);
+  const n = Math.max(pa.length, pb.length);
+  for (let i = 0; i < n; i++) { const x = pa[i] || 0, y = pb[i] || 0; if (x !== y) return x > y ? 1 : -1; }
+  return 0;
+}
 /* 检测节点是否有新版可升 → 卡片显示升级提示 + 一键升级按钮 */
 async function fedCheckUpgrade(n) {
   try {
     const u = await api("GET", "/api/fed/" + n.id + "/api/upgrade/check");
-    if (!u || !u.update_available) return;
+    if (!u) return;
+    // 目标版本:stable 最新与 beta 最新取更大者(仓库全 beta 时走 beta 通道,实时无 CDN 延迟)
+    let target = null, channel = "stable";
+    if (u.update_available && u.latest) { target = u.latest; channel = "stable"; }
+    if (u.prerelease && u.prerelease.update_available && vcmp(u.prerelease.tag, target || "") > 0) { target = u.prerelease.tag; channel = "beta"; }
+    if (!target || vcmp(target, u.current) <= 0) return;
     // 版本标签标橙提示
     const vb = $("fed_ver_b_" + n.id);
-    if (vb) { vb.style.color = "#f59e0b"; vb.textContent = "v" + u.current + " ⬆ 可升 v" + u.latest; }
+    if (vb) { vb.style.color = "#f59e0b"; vb.textContent = "v" + u.current + " ⬆ 可升 v" + target; }
     const box = $("fed_btns_" + n.id);
     if (!box || $("fed_upbtn_" + n.id)) return;
     const b = document.createElement("button");
     b.id = "fed_upbtn_" + n.id;
     b.className = "btn mini";
     b.style.cssText = "background:linear-gradient(135deg,#fbbf24,#f59e0b);border:none;color:#1c1917;font-weight:600";
-    b.textContent = "⬆ 一键升级 v" + u.latest;
-    b.onclick = () => fedUpgradeNode(n, u.latest);
+    b.textContent = "⬆ 一键升级 v" + target;
+    b.onclick = () => fedUpgradeNode(n, target, channel);
     const first = box.querySelector("button");
     if (first) box.insertBefore(b, first.nextSibling);
     else box.appendChild(b);
   } catch (e) { /* 版本检测失败(网络/节点暂忙)不打扰用户,状态卡仍正常显示 */ }
 }
 /* 一键升级节点:下发指令 → 轮询等待节点重启恢复 → 刷新卡片 */
-async function fedUpgradeNode(n, latest) {
+async function fedUpgradeNode(n, latest, channel) {
   confirmPanel("确认升级服务器节点「" + n.name + "」？\n\n将把节点面板一键升级到 v" + (latest || "最新") + "。\n升级过程节点面板会重启（约 10~30 秒），期间该节点暂时不可访问；联邦令牌与全部配置保留，升级完成后自动恢复。", async () => {
     const btn = $("fed_upbtn_" + n.id), dot = $("fed_dot_" + n.id);
     if (btn) { btn.disabled = true; btn.textContent = "升级中…"; }
     if (dot) { dot.style.background = "#f59e0b"; }
     let versionBefore = n.version;
     try {
-      try { await api("POST", "/api/fed/" + n.id + "/api/upgrade", { channel: "stable" }); }
+      try { await api("POST", "/api/fed/" + n.id + "/api/upgrade", { channel: channel || "stable" }); }
       catch (e) { /* 节点重启导致连接中断属正常,忽略 */ }
       toast("升级指令已下发，等待节点重启恢复…", "okk");
       for (let i = 0; i < 20; i++) {          // 最长 ~100s
