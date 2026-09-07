@@ -1,6 +1,6 @@
-# FW-Panel · 简易VPS控制面板
+# FW-Panel2 · 简易VPS管理面板2.0
 
-轻量易用的 Linux VPS 控制面板：**Python 标准库 + nftables**，零第三方 Python 依赖，不依赖 firewalld / ufw 等外部组件。装完即可通过网页管理防火墙规则、Docker 容器、反向代理与 SSL 证书、网卡与进程流量统计、SSH 防护与网络优化。
+轻量易用的 Linux VPS 控制面板（2.0）：**Python 标准库 + nftables**，零第三方 Python 依赖，不依赖 firewalld / ufw 等外部组件。装完即可通过网页管理防火墙规则、Docker 容器、反向代理与 SSL 证书、网卡与进程流量统计、SSH 防护与网络优化。**2.0 新增多服务器集中管理**：登录一台主面板，即可 HTTPS 直连管理任意数量的节点面板（全功能）。
 
 ## 支持系统
 
@@ -16,7 +16,7 @@
 ## 一键安装 / 升级
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash
 ```
 
 > root 用户可直接去掉 `sudo`；普通用户有 sudo 时脚本自动提权。**已安装时重跑 = 自动升级**（备份旧版 → 覆盖 → 校验 → 重启，配置/规则/代理全部保留），且带**防降级保护**：服务器当前版本 ≥ 下载版本时自动跳过，绝不降级。
@@ -46,16 +46,16 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/instal
 
 ```bash
 # 指定端口 + 仅本机访问
-curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/install.sh | sudo bash -s -- -p 17890 --bind 127.0.0.1
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- -p 17890 --bind 127.0.0.1
 
 # 指定凭据 + 安装后放行 80/443
-curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/install.sh | sudo bash -s -- --user admin --password MyPass123 --open-port 80,443
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --user admin --password MyPass123 --open-port 80,443
 
 # 一键回退到指定版本（如新版有问题，回退 v1.24.42；配置/规则全保留）
-curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/install.sh | sudo bash -s -- --version v1.24.42
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --version v1.24.42
 
 # 恢复最新版（去掉 --version 即可）
-curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/install.sh | sudo bash
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash
 ```
 
 > `--version` 下载源同样走「GitHub raw → jsDelivr → ghproxy.net → ghfast.top → gh-proxy.com」五级回退 + 内容头校验，国内网络也能稳定回退。
@@ -127,7 +127,7 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/instal
 - **回退到指定版本**（新版有问题时一键回退）：
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/install.sh | sudo bash -s -- --version v1.24.42
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --version v1.24.42
 ```
 
 > 指定版本安装会跳过防降级保护（显式指定 = 有意回退）；升级/回退下载均带内容头校验，失败自动切源，不会把错误页写入面板导致白屏。
@@ -135,7 +135,7 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/instal
 ## 卸载
 
 ```bash
-curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/install.sh | sudo bash -s -- --uninstall
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --uninstall
 ```
 
 ## 安全说明

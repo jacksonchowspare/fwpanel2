@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-fwpanel — 简易VPS控制面板（适配 Debian 13 / nftables）
+fwpanel2 — 简易VPS管理面板2.0（适配 Debian 13 / nftables）
 ================================================================
 零第三方依赖：仅使用 Python 标准库 + 系统 nft 命令。
 
@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "1.26.3"
+CURRENT_VERSION = "2.0.0"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -70,11 +70,11 @@ LOCK_SECONDS = 300             # 锁定 5 分钟
 # 升级源（国内友好优先）：jsDelivr → GitHub raw → ghproxy.net → ghfast.top → gh-proxy.com
 # ⚠ ghproxy.com 已废弃（返回 200 但内容为 HTML 错误页），不可用；后三个镜像 2026-08 实测返回真实文件
 UPGRADE_SOURCES = [
-    "https://cdn.jsdelivr.net/gh/jacksonchowspare/fwpanel@{tag}/{path}",
-    "https://raw.githubusercontent.com/jacksonchowspare/fwpanel/{tag}/{path}",
-    "https://ghproxy.net/https://raw.githubusercontent.com/jacksonchowspare/fwpanel/{tag}/{path}",
-    "https://ghfast.top/https://raw.githubusercontent.com/jacksonchowspare/fwpanel/{tag}/{path}",
-    "https://gh-proxy.com/https://raw.githubusercontent.com/jacksonchowspare/fwpanel/{tag}/{path}",
+    "https://cdn.jsdelivr.net/gh/jacksonchowspare/fwpanel2@{tag}/{path}",
+    "https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/{tag}/{path}",
+    "https://ghproxy.net/https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/{tag}/{path}",
+    "https://ghfast.top/https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/{tag}/{path}",
+    "https://gh-proxy.com/https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/{tag}/{path}",
 ]
 
 # 服务模板：名称 -> (协议, 端口)
@@ -505,17 +505,17 @@ def get_latest_version():
     """查询 GitHub 最新版本号（GitHub API 带重试 → jsDelivr data API 兜底）"""
     # GitHub API 主源：失败重试 2 次（服务器网络波动/限流时常见）
     for attempt in (1, 2, 3):
-        d = http_get_json("https://api.github.com/repos/jacksonchowspare/fwpanel/releases/latest", timeout=20)
+        d = http_get_json("https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest", timeout=20)
         if d and d.get("tag_name"):
             return d["tag_name"].lstrip("v")
         if attempt < 3:
             time.sleep(2)
     # 兜底：jsDelivr（可能有缓存滞后，比 GitHub 慢一拍）
-    d = http_get_json("https://data.jsdelivr.com/v1/package/gh/jacksonchowspare/fwpanel", timeout=20)
+    d = http_get_json("https://data.jsdelivr.com/v1/package/gh/jacksonchowspare/fwpanel2", timeout=20)
     if d and d.get("versions"):
         return d["versions"][0]
     # 最终兜底：gh-proxy.com 代理 GitHub API（2026-08 实测可用）
-    d = http_get_json("https://gh-proxy.com/https://api.github.com/repos/jacksonchowspare/fwpanel/releases/latest", timeout=20)
+    d = http_get_json("https://gh-proxy.com/https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest", timeout=20)
     if d and d.get("tag_name"):
         return d["tag_name"].lstrip("v")
     return None
@@ -535,12 +535,12 @@ def get_latest_prerelease():
             return None
         return max(tags, key=lambda v: tuple(int(p) for p in v.split(".") if p.isdigit()))
     for attempt in (1, 2, 3):
-        d = http_get_json("https://api.github.com/repos/jacksonchowspare/fwpanel/releases?per_page=10", timeout=20)
+        d = http_get_json("https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=10", timeout=20)
         if isinstance(d, list):
             return _pick(d)   # 列表已拿到，无 prerelease 就是确实没有
         if attempt < 3:
             time.sleep(2)
-    d = http_get_json("https://gh-proxy.com/https://api.github.com/repos/jacksonchowspare/fwpanel/releases?per_page=10", timeout=20)
+    d = http_get_json("https://gh-proxy.com/https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=10", timeout=20)
     return _pick(d)
 
 
@@ -1954,7 +1954,7 @@ def render_proxy_conf(p):
            "        proxy_set_header X-Real-IP $remote_addr;\n"
            "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
            "        proxy_set_header X-Forwarded-Proto $scheme;\n")
-    lines = [f"# FW-Panel 管理: {p['domain']}"]
+    lines = [f"# FW-Panel2 管理: {p['domain']}"]
     # HTTP server（ACME 挑战；有证书时跳转 HTTPS）
     lines.append("server {")
     lines.append("    listen 80;")
@@ -2977,7 +2977,7 @@ def ensure_nginx_default():
             except OSError:
                 pass
     conf = os.path.join(conf_dir, "fwpanel-default.conf")
-    content = ("# FW-Panel 默认兜底\n"
+    content = ("# FW-Panel2 默认兜底\n"
                "server {\n"
                "    listen 80 default_server;\n"
                "    server_name _;\n"
@@ -3166,7 +3166,7 @@ def enable_bbr():
 # ------------------------------- HTTP 服务 -------------------------------
 
 class PanelHandler(BaseHTTPRequestHandler):
-    server_version = "fwpanel/1.0"
+    server_version = f"fwpanel2/{CURRENT_VERSION}"
 
     def log_message(self, fmt, *args):   # 静默默认日志，避免刷屏
         pass
@@ -5040,7 +5040,7 @@ def ensure_proxy_entry_ports(store):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="fwpanel 简易VPS控制面板")
+    parser = argparse.ArgumentParser(description="fwpanel2 简易VPS管理面板2.0")
     parser.add_argument("cmd", nargs="?", default="serve",
                         choices=["serve", "reset-password", "apply", "open-port"])
     parser.add_argument("arg1", nargs="?", help="open-port 的端口（如 8080 或 8080/udp）")

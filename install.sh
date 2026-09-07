@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# fwpanel — 简易VPS控制面板 一键安装包（Debian/Ubuntu/Arch/Fedora 多发行版）
+# fwpanel2 — 简易VPS管理面板2.0 一键安装包（Debian/Ubuntu/Arch/Fedora 多发行版）
 # -----------------------------------------------------------------------------
 # 零第三方依赖：Python 标准库 + 系统 nftables，不装 firewalld/ufw。
 #
@@ -20,8 +20,8 @@
 set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
-readonly SCRIPT_NAME="FW-Panel VPS控制面板安装包"
-readonly SCRIPT_VERSION="1.26.3"
+readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
+readonly SCRIPT_VERSION="2.0.0"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -147,7 +147,7 @@ check_existing() {
     if [ -f "$APP_DIR/panel.py" ] || systemctl list-unit-files 2>/dev/null | grep -q "$SERVICE_NAME"; then
         if [ "${1:-}" = "check" ]; then
             log_warn "检测到 fwpanel 已安装（体检模式跳过安装）。"
-            log_info "重跑安装脚本可升级到最新版: curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel/main/install.sh | sudo bash"
+            log_info "重跑安装脚本可升级到最新版: curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash"
             exit 0
         fi
         log_info "检测到 fwpanel 已安装，执行升级（保留配置/规则/代理）..."
@@ -234,7 +234,7 @@ do_check() {
 
 usage() {
     cat <<EOF
-$SCRIPT_NAME v$SCRIPT_VERSION —— 简易VPS控制面板（Debian 13 · nftables）
+$SCRIPT_NAME v$SCRIPT_VERSION —— 简易VPS管理面板2.0（Debian 13 · nftables）
 
 用法:
   sudo bash $0                           一键安装（随机端口/用户名/密码，安装结束一并打印）
@@ -392,11 +392,11 @@ fetch_source() {
         *.png)  expect_hex="89504e47" ;;                    # \x89PNG
         *.ico)  expect_hex="00000100" ;;                    # ico 头
     esac
-    download_file "$dest" "https://raw.githubusercontent.com/jacksonchowspare/fwpanel/$tag/$path" "$expect_hex" && return 0
+    download_file "$dest" "https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/$tag/$path" "$expect_hex" && return 0
     log_warn "GitHub 直连失败，切换 jsDelivr CDN ..."
-    download_file "$dest" "https://cdn.jsdelivr.net/gh/jacksonchowspare/fwpanel@$tag/$path" "$expect_hex" && return 0
+    download_file "$dest" "https://cdn.jsdelivr.net/gh/jacksonchowspare/fwpanel2@$tag/$path" "$expect_hex" && return 0
     log_warn "jsDelivr 失败，切换 ghproxy.net 镜像 ..."
-    download_file "$dest" "https://ghproxy.net/https://raw.githubusercontent.com/jacksonchowspare/fwpanel/$tag/$path" "$expect_hex" && return 0
+    download_file "$dest" "https://ghproxy.net/https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/$tag/$path" "$expect_hex" && return 0
     return 1
 }
 
@@ -541,7 +541,7 @@ print_summary() {
 
     echo ""
     echo "=================================================================="
-    echo "${C_GREEN}  🎉 fwpanel 防火墙面板安装完成！${C_RESET}"
+    echo "${C_GREEN}  🎉 fwpanel2 简易VPS管理面板2.0 安装完成！${C_RESET}"
     echo "=================================================================="
     if [ "$PANEL_BIND" = "0.0.0.0" ]; then
         echo "  面板地址 : ${C_BOLD}http://${ip}:${PANEL_PORT}${C_RESET}"
