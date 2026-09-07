@@ -170,7 +170,12 @@ input:focus, select:focus, textarea:focus { border-color: var(--accent); }
 input::placeholder, textarea::placeholder { color: var(--muted); }
 .form-row { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; align-items: center; }
 /* 分组导航 tabs（吸顶，玻璃拟态与卡片同风格） */
-.tabs { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; margin: 20px 0; padding: 8px 10px; position: sticky; top: 0; z-index: 40; background: var(--tabs-bg); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,.10); border-radius: 12px; box-shadow: var(--shadow-card), inset 0 1px 0 rgba(255,255,255,.04); }
+.tabs { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; margin: 20px 0; padding: 8px 10px; position: sticky; top: var(--fed-tabs-top, 0px); z-index: 40; background: var(--tabs-bg); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,.10); border-radius: 12px; box-shadow: var(--shadow-card), inset 0 1px 0 rgba(255,255,255,.04); }
+/* 远程管理横幅：与导航同款吸顶玻璃条（浮动），出现时导航自动让位 */
+.fed-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 9px 14px; font-size: 13px; margin: 0 0 16px; position: sticky; top: 0; z-index: 44; background: var(--tabs-bg); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(255,255,255,.10); border-radius: 12px; box-shadow: var(--shadow-card), inset 0 1px 0 rgba(255,255,255,.04); }
+.fed-bar .fed-bar-t b { color: var(--accent); }
+.fed-bar .fed-bar-url { color: var(--muted); font-size: 12px; word-break: break-all; min-width: 0; }
+.fed-bar .btn { flex: none; }
 .tab { display: inline-flex; align-items: center; justify-content: center; height: 32px; padding: 0 14px; line-height: 1; gap: 5px; box-sizing: border-box; background: var(--hover-bg); border: 1px solid var(--hover-border); color: var(--text); border-radius: 8px; font-size: 13px; cursor: pointer; transition: all .15s ease; }
 .tab svg { display: block; flex: none; }
 .tabs .h-ico-sm { margin-right: 0; } /* 间距由 gap 统一控制 */
@@ -252,10 +257,11 @@ tr:hover td { background: var(--panel-solid); }
       </div>
     </div>
 
-    <!-- 远程管理横幅(2.0 联邦) -->
-    <div id="fed_banner" class="hidden" style="align-items:center;gap:10px;flex-wrap:wrap;background:linear-gradient(135deg,rgba(61,139,253,.16),rgba(34,197,94,.10));border:1px solid var(--border);border-radius:12px;padding:9px 14px;margin:14px 0 2px;font-size:13px">
-      <span>🌐 正在远程管理 <b id="fed_banner_name" style="color:var(--accent)">-</b></span>
-      <span style="color:var(--muted);font-size:12px;word-break:break-all" id="fed_banner_url"></span>
+    <!-- 远程管理横幅(2.0 联邦)：吸顶玻璃条，与导航同款浮动样式 -->
+    <div id="fed_banner" class="fed-bar hidden">
+      <span>🌐</span>
+      <span class="fed-bar-t">正在远程管理 <b id="fed_banner_name">-</b></span>
+      <span class="fed-bar-url" id="fed_banner_url"></span>
       <span style="flex:1"></span>
       <button class="btn mini" onclick="exitFed()">↩ 返回本机</button>
     </div>
@@ -999,6 +1005,12 @@ function fedUiReset() {
   const bb = $("btn_fed"); if (bb) bb.style.display = "";
   const tf = $("tab_fed"); if (tf) tf.style.display = "";
   fedLoaded = false;
+  setFedTabsTop();
+}
+function setFedTabsTop() {
+  const b = $("fed_banner");
+  const h = (b && !b.classList.contains("hidden") && b.offsetHeight) || 0;
+  document.documentElement.style.setProperty("--fed-tabs-top", h + "px");
 }
 function showLogin() { fedUiReset(); $("login").classList.remove("hidden"); $("main").classList.add("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "inline-block"; }
 function showMain()  { $("login").classList.add("hidden"); $("main").classList.remove("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "none"; }
@@ -1194,6 +1206,7 @@ function enterFed(n) {
   $("fed_banner_name").textContent = n.name;
   $("fed_banner_url").textContent = n.url;
   $("fed_banner").classList.remove("hidden");
+  setFedTabsTop();
   $("btn_fed").style.display = "none";
   $("tab_fed").style.display = "none";
   const saved = localStorage.getItem("fw_sec");
@@ -1204,12 +1217,14 @@ function enterFed(n) {
 function exitFed() {
   fedNode = null; API = "";
   $("fed_banner").classList.add("hidden");
+  setFedTabsTop();
   $("btn_fed").style.display = ""; $("tab_fed").style.display = "";
   switchTab("fed");
   renderFed();
   refreshAll();
   toast("已返回本机", "okk");
 }
+window.addEventListener("resize", () => { if (fedNode) setFedTabsTop(); });
 
 /* ---------- 状态 ---------- */
 async function refreshStatusCards() {
