@@ -294,8 +294,8 @@ tr:hover td { background: var(--panel-solid); }
       <div class="card"><div class="k"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8l-9-5-9 5v8l9 5 9-5z"/><path d="M3 8l9 5 9-5M12 13v8"/></svg> 面板版本 / 更新</div><div class="v" id="st_ver" style="font-size:15px">-</div>
         <div style="color:var(--muted);font-size:11px;margin-top:6px" id="st_latest">最新 -</div>
         <div style="display:flex;gap:6px;margin-top:8px;align-items:center;flex-wrap:wrap">
-          <button class="btn mini ghost" onclick="checkUpgrade()">检查更新</button>
-          <button class="btn mini" id="btn_upgrade" onclick="doUpgrade()" disabled>升级</button>
+          <button class="btn mini ghost" id="btn_check" onclick="checkUpgrade()">检查更新</button>
+          <button class="btn mini" id="btn_upgrade" onclick="doUpgrade()" disabled style="display:none">升级正式版</button>
           <button class="btn mini" id="btn_upgrade_beta" onclick="doUpgradeBeta()" disabled style="display:none;background:linear-gradient(135deg,#fbbf24,#f59e0b)">升级测试版</button>
         </div>
       </div>
@@ -2571,23 +2571,35 @@ function renderUpgradeUi(d) {
   const vEl = $("st_ver");
   const chan = d.current_channel === "beta" ? " 测试版" : (d.current_channel === "stable" ? " 正式版" : "");
   if (vEl && cur) vEl.textContent = "v" + cur + chan;
-  // 正式版(稳定)通道为主:检查更新只报正式版
+  // 正式版(稳定)通道为主
   const stableOk = !!(d.update_available && d.latest && vcmp(d.latest, cur) > 0);
   const beta = d.prerelease;
   const betaTag = (beta && beta.tag) || "";
-  // 测试版入口:比当前新,且(无正式版可升 或 比正式版还新)——测试版不比正式版新时不显示
+  // 测试版入口:比当前新,且(无正式版可升 或 比正式版还新)
   const betaOk = !!(beta && beta.update_available && betaTag && vcmp(betaTag, cur) > 0 &&
                     (!stableOk || vcmp(betaTag, d.latest || "") > 0));
-  $("st_latest").textContent = stableOk ? "发现新正式版 v" + d.latest : "已是最新正式版";
-  const btnUp = $("btn_upgrade");
-  btnUp.disabled = !stableOk;
-  btnUp.textContent = stableOk ? "一键升级正式版 v" + d.latest : "升级";
-  const btnBeta = $("btn_upgrade_beta");
-  if (betaOk) {
-    btnBeta.style.display = "inline-block";
+  // 第 2 行:状态文案(带版本号,可升级时标橙)
+  const info = [];
+  if (stableOk) info.push("新正式版 v" + d.latest);
+  if (betaOk) info.push("新测试版 v" + betaTag);
+  const latestEl = $("st_latest");
+  latestEl.textContent = info.length ? "发现 " + info.join(" · ") : "已是最新正式版";
+  latestEl.style.color = info.length ? "#f59e0b" : "";
+  // 第 3 行按钮:常态只留「检查更新」;可升级时让位给升级按钮(单通道=单按钮,行高恒定不撑卡)
+  const btnCheck = $("btn_check"), btnUp = $("btn_upgrade"), btnBeta = $("btn_upgrade_beta");
+  if (stableOk || betaOk) {
+    btnCheck.style.display = "none";
+    btnUp.style.display = stableOk ? "inline-block" : "none";
+    btnUp.disabled = false;
+    btnUp.textContent = "⬆ 升级正式版";
+    btnUp.title = "升级到正式版 v" + (d.latest || "");
+    btnBeta.style.display = betaOk ? "inline-block" : "none";
     btnBeta.disabled = false;
-    btnBeta.textContent = "⬆ 升级测试版 v" + betaTag;
+    btnBeta.textContent = "⬆ 测试版 v" + betaTag;
+    btnBeta.title = "升级到测试版 v" + betaTag + "(尝鲜通道)";
   } else {
+    btnCheck.style.display = "inline-block";
+    btnUp.style.display = "none";
     btnBeta.style.display = "none";
   }
 }
@@ -2622,8 +2634,8 @@ async function doUpgrade() {
       setTimeout(() => { location.reload(); }, 4000);
     }).catch(e => {
       toast("升级失败: " + e.message, "err");
-      btn.disabled = false; btn.textContent = "一键升级";
-      checkUpgrade();
+      btn.disabled = false;
+      checkUpgrade();   // 重查并恢复按钮状态
     });
   }, "🔄 升级确认");
 }
@@ -2638,8 +2650,8 @@ async function doUpgradeBeta() {
       setTimeout(() => { location.reload(); }, 4000);
     }).catch(e => {
       toast("升级失败: " + e.message, "err");
-      btn.disabled = false; btn.textContent = "升级测试版";
-      checkUpgrade();
+      btn.disabled = false;
+      checkUpgrade();   // 重查并恢复按钮状态
     });
   }, "🧪 测试版确认");
 }
