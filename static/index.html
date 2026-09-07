@@ -1843,7 +1843,14 @@ function zoomAuto() {
 function applyZoomForce() {
   const v = localStorage.getItem("ui_zoom");
   const z = Math.min(2, Math.max(1, (!v || v === "auto") ? zoomAuto() : (parseFloat(v) || 1)));
-  document.documentElement.style.zoom = z;
+  // 元素级缩放:只放大面板内容与自有浮层,不缩放整个 html——
+  // 浏览器插件注入的浮层(如 Bitwarden)挂在页面根,不受 zoom 影响,不会错位
+  document.documentElement.style.zoom = "1";
+  const w = document.querySelector(".wrap");
+  if (w) w.style.zoom = z;
+  document.querySelectorAll(".modal-mask > .modal").forEach(e => { e.style.zoom = z; });
+  const t = $("toast");
+  if (t) t.style.zoom = z;
   paintZoom();
 }
 function setZoom(v) {
@@ -1879,6 +1886,7 @@ window.addEventListener("resize", () => {
   _zt = setTimeout(() => { if ((localStorage.getItem("ui_zoom") || "auto") === "auto") applyZoomForce(); }, 250);
 });
 setTheme(localStorage.getItem("fw_theme") || "dark");
+applyZoomForce();
 
 /* ---------- 分组导航 tabs ---------- */
 function switchTab(sec) {
