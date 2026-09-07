@@ -1452,6 +1452,8 @@ function fedCardEl(n) {
 async function fedProbeOne(n) {
   const dot = $("fed_dot_" + n.id), met = $("fed_met_" + n.id);
   if (!dot) return;   // 卡片未渲染(静默刷新时可能被删),跳过
+  // 无论探测成功还是离线失败,先摘除可能残留的升级按钮(含"升级中…"),可升时由 fedCheckUpgrade 按需重建
+  ["fed_up_s_" + n.id, "fed_up_b_" + n.id].forEach(id => { const b = $(id); if (b) b.remove(); });
   try {
     const s = await api("GET", "/api/fed/" + n.id + "/api/status");
     dot.style.background = "#22c55e"; dot.style.boxShadow = "0 0 6px #22c55e";
@@ -1463,8 +1465,6 @@ async function fedProbeOne(n) {
       "<span>封禁：<b style=\"color:var(--text)\">" + (s.banned_count || 0) + "</b></span>" +
       "<span>SSH：<b style=\"color:var(--text)\">" + s.ssh_port + "</b></span>" +
       "<span>版本：<b id=\"fed_ver_b_" + n.id + "\" style=\"color:var(--text)\">v" + s.version + "</b></span>";
-    // 先清理可能残留的升级按钮(含“升级中…”残留),再由 fedCheckUpgrade 按新版本决定是否重建
-    ["fed_up_s_" + n.id, "fed_up_b_" + n.id].forEach(id => { const b = $(id); if (b) b.remove(); });
     fedCheckUpgrade(n);
   } catch (e) {
     dot.style.background = "#ef4444";
@@ -1516,7 +1516,7 @@ async function fedCheckUpgrade(n) {
     // 正式版按钮(蓝,稳定通道)紧跟"管理此节点"
     if (stableOk) {
       const b = mkBtn("fed_up_s_" + n.id, "⬆ 升级正式版 v" + u.latest,
-        "background:linear-gradient(135deg,#4da3ff,#2f6ff0);border:none;color:#fff;font-weight:600",
+        "background:linear-gradient(135deg,var(--btn-grad-a),var(--btn-grad-b));border:none;color:var(--btn-fg);font-weight:600",
         "stable", u.latest);
       if (b) { if (anchor) box.insertBefore(b, anchor.nextSibling); else box.appendChild(b); }
     }
