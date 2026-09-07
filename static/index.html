@@ -124,7 +124,7 @@ body[data-theme="vibes-dark"] .btn.ghost {
   background: rgba(139,92,246,.10);
   border: var(--bdw) solid rgba(167,139,250,.34);
   color: #c4b5fd;
-  border-radius: 10px;
+  border-radius: 12px;
   box-shadow: none;
 }
 body[data-theme="vibes-dark"] .btn.ghost:hover {
@@ -330,7 +330,7 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
   .sub { font-size: 11px; margin-bottom: 14px; }
   .topbar { flex-direction: column; align-items: flex-start; gap: 8px; margin-bottom: 14px; }
   .topbar .actions { width: 100%; flex-wrap: wrap; gap: 6px; }
-  .topbar .actions .btn { flex: 1; min-width: 88px; padding: 6px 8px; font-size: 13px; }
+  .topbar .actions .btn { flex: 1; min-width: 88px; padding: 4px 8px; font-size: 12px; }
   .cards { grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 14px; }
   .card { padding: 10px 12px; }
   .card .k { font-size: 11px; }
@@ -355,8 +355,6 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
   input, select { font-size: 16px; padding: 6px 9px; }
   /* 登录框 17px：避开 iOS 26 聚焦智能缩放阈值（16px 仍会触发） */
   #lg_user, #lg_pass { font-size: 17px; }
-  .btn { font-size: 13px; padding: 6px 10px; }
-  .btn.mini { font-size: 11px; padding: 3px 7px; }
 }
 /* 添加规则表单：等分布局占满全宽，IP 输入框弹性伸展 */
 #add_rule_row { display: grid; grid-template-columns: 150px 100px 130px 1fr 170px auto; gap: 8px; align-items: center; }
@@ -372,7 +370,7 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
 .cards .k .h-ico-sm, .tabs .h-ico-sm { margin-right: 4px; }
 .btn {
   background: linear-gradient(135deg, var(--btn-grad-a), var(--btn-grad-b));
-  color: var(--btn-fg); border: 0; border-radius: var(--r-btn); padding: 7px 14px; cursor: pointer; font-size: 13px;
+  color: var(--btn-fg); border: 0; border-radius: var(--r-sm); padding: 4px 10px; cursor: pointer; font-size: 12px;
   box-shadow: var(--btn-shdw), inset 0 1px 0 var(--btn-inset);
   transition: all .18s ease; text-shadow: none;
 }
