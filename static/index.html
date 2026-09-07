@@ -1211,36 +1211,63 @@ function vcmp(a, b) {
   for (let i = 0; i < n; i++) { const x = pa[i] || 0, y = pb[i] || 0; if (x !== y) return x > y ? 1 : -1; }
   return 0;
 }
-/* 检测节点是否有新版可升 → 卡片显示升级提示 + 一键升级按钮 */
+/* 检测节点是否有新版可升(正式版/测试版分开) → 卡片提示 + 对应升级按钮 */
 async function fedCheckUpgrade(n) {
   try {
     const u = await api("GET", "/api/fed/" + n.id + "/api/upgrade/check");
     if (!u) return;
-    // 目标版本:stable 最新与 beta 最新取更大者(仓库全 beta 时走 beta 通道,实时无 CDN 延迟)
-    let target = null, channel = "stable";
-    if (u.update_available && u.latest) { target = u.latest; channel = "stable"; }
-    if (u.prerelease && u.prerelease.update_available && vcmp(u.prerelease.tag, target || "") > 0) { target = u.prerelease.tag; channel = "beta"; }
-    if (!target || vcmp(target, u.current) <= 0) return;
+    const cur = u.current || "";
+    const stableOk = u.update_available && u.latest && vcmp(u.latest, cur) > 0;            // 正式版可升
+    const betaOk = u.prerelease && u.prerelease.update_available && u.prerelease.tag && vcmp(u.prerelease.tag, cur) > 0;  // 测试版可升
+    if (!stableOk && !betaOk) return;
     // 版本标签标橙提示
     const vb = $("fed_ver_b_" + n.id);
-    if (vb) { vb.style.color = "#f59e0b"; vb.textContent = "v" + u.current + " ⬆ 可升 v" + target; }
+    if (vb) {
+      const tips = [];
+      if (stableOk) tips.push("正式版 v" + u.latest);
+      if (betaOk) tips.push("测试版 v" + u.prerelease.tag);
+      vb.style.color = "#f59e0b";
+      vb.textContent = "v" + cur + " ⬆ 可升 " + tips.join(" / ");
+    }
     const box = $("fed_btns_" + n.id);
-    if (!box || $("fed_upbtn_" + n.id)) return;
-    const b = document.createElement("button");
-    b.id = "fed_upbtn_" + n.id;
-    b.className = "btn mini";
-    b.style.cssText = "background:linear-gradient(135deg,#fbbf24,#f59e0b);border:none;color:#1c1917;font-weight:600";
-    b.textContent = "⬆ 一键升级 v" + target;
-    b.onclick = () => fedUpgradeNode(n, target, channel);
-    const first = box.querySelector("button");
-    if (first) box.insertBefore(b, first.nextSibling);
-    else box.appendChild(b);
+    if (!box) return;
+    const anchor = box.querySelector("button");   // 首个按钮 = 管理此节点
+    const mkBtn = (uid, txt, style, channel, target) => {
+      if ($(uid)) return null;
+      const b = document.createElement("button");
+      b.id = uid;
+      b.className = "btn mini";
+      b.style.cssText = style;
+      b.textContent = txt;
+      b.onclick = () => fedUpgradeNode(n, target, channel);
+      return b;
+    };
+    // 正式版按钮(蓝,稳定通道)紧跟"管理此节点"
+    if (stableOk) {
+      const b = mkBtn("fed_up_s_" + n.id, "⬆ 升级正式版 v" + u.latest,
+        "background:linear-gradient(135deg,#4da3ff,#2f6ff0);border:none;color:#fff;font-weight:600",
+        "stable", u.latest);
+      if (b) { if (anchor) box.insertBefore(b, anchor.nextSibling); else box.appendChild(b); }
+    }
+    // 测试版按钮(橙,尝鲜通道)
+    if (betaOk) {
+      const b = mkBtn("fed_up_b_" + n.id, "⬆ 升级测试版 v" + u.prerelease.tag,
+        "background:linear-gradient(135deg,#fbbf24,#f59e0b);border:none;color:#1c1917;font-weight:600",
+        "beta", u.prerelease.tag);
+      if (b) {
+        const after = $("fed_up_s_" + n.id) || anchor;
+        if (after && after.nextSibling) box.insertBefore(b, after.nextSibling);
+        else box.appendChild(b);
+      }
+    }
   } catch (e) { /* 版本检测失败(网络/节点暂忙)不打扰用户,状态卡仍正常显示 */ }
 }
-/* 一键升级节点:下发指令 → 轮询等待节点重启恢复 → 刷新卡片 */
+/* 一键升级节点(正式版/测试版通道):下发指令 → 轮询等待节点重启恢复 → 刷新卡片 */
 async function fedUpgradeNode(n, latest, channel) {
-  confirmPanel("确认升级服务器节点「" + n.name + "」？\n\n将把节点面板一键升级到 v" + (latest || "最新") + "。\n升级过程节点面板会重启（约 10~30 秒），期间该节点暂时不可访问；联邦令牌与全部配置保留，升级完成后自动恢复。", async () => {
-    const btn = $("fed_upbtn_" + n.id), dot = $("fed_dot_" + n.id);
+  const cn = channel === "beta" ? "测试版" : "正式版";
+  const warn = channel === "beta" ? "\n⚠ 测试版为尝鲜通道，可能包含未充分验证的改动；生产用途建议等正式版。\n" : "";
+  confirmPanel("确认升级服务器节点「" + n.name + "」？\n\n将把节点面板升级到" + cn + " v" + (latest || "最新") + "。" + warn + "\n升级过程节点面板会重启（约 10~30 秒），期间该节点暂时不可访问；联邦令牌与全部配置保留，升级完成后自动恢复。", async () => {
+    const btn = $("fed_up_s_" + n.id) || $("fed_up_b_" + n.id), dot = $("fed_dot_" + n.id);
     if (btn) { btn.disabled = true; btn.textContent = "升级中…"; }
     if (dot) { dot.style.background = "#f59e0b"; }
     let versionBefore = n.version;
@@ -1265,7 +1292,10 @@ async function fedUpgradeNode(n, latest, channel) {
       fedProbeOne(n);
     } catch (e) {
       toast(e.message, "err");
-      if (btn) { btn.disabled = false; btn.textContent = "⬆ 一键升级 v" + (latest || ""); }
+      if (btn) {
+        btn.disabled = false;
+        btn.textContent = (channel === "beta" ? "⬆ 升级测试版 v" : "⬆ 升级正式版 v") + (latest || "");
+      }
     }
   }, "⬆ 一键升级节点");
 }

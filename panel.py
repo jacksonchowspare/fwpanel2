@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.0.4"
+CURRENT_VERSION = "2.0.5"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -559,29 +559,30 @@ def version_gt(a, b):
 
 
 def get_latest_version():
-    """查询 GitHub 最新版本号。
+    """查询 GitHub 最新正式版（prerelease=false）。仓库无正式版时返回 None。
 
-    releases/latest 只返回正式版——仓库全为 beta 时它 404,因此随后走
-    releases 列表(实时、含 prerelease、无 CDN 延迟);jsDelivr / gh-proxy 仅兜底。
+    releases/latest 只含正式版但可能 404；改走 releases 列表实时过滤，
+    避免把测试版误报为正式版；jsDelivr / gh-proxy 仅作 GitHub 网络不可达时的兜底。
     """
-    # 1) GitHub 最新正式版(全 beta 仓库 404 → None,不重试浪费时间)
+    # 1) GitHub 最新正式版
     d = http_get_json("https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest", timeout=15)
     if d and d.get("tag_name"):
         return d["tag_name"].lstrip("v")
-    # 2) releases 列表(实时,首个即最新,含 beta)
+    # 2) releases 列表实时过滤(prerelease=false 的最新;全 beta 仓库 → None)
     d = http_get_json("https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=10", timeout=15)
-    if isinstance(d, list) and d:
+    if isinstance(d, list):
         for x in d:
-            if x.get("tag_name"):
+            if x.get("tag_name") and not x.get("prerelease"):
                 return str(x["tag_name"]).lstrip("v")
-    # 3) 网络兜底:jsDelivr data API(有缓存滞后) → gh-proxy 列表
+        return None   # 列表已拿到且无正式版,不继续尝试其它源
+    # 3) 网络兜底:jsDelivr data API → gh-proxy 列表
     d = http_get_json("https://data.jsdelivr.com/v1/package/gh/jacksonchowspare/fwpanel2", timeout=15)
     if d and d.get("versions"):
         return d["versions"][0]
     d = http_get_json("https://gh-proxy.com/https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=10", timeout=15)
-    if isinstance(d, list) and d:
+    if isinstance(d, list):
         for x in d:
-            if x.get("tag_name"):
+            if x.get("tag_name") and not x.get("prerelease"):
                 return str(x["tag_name"]).lstrip("v")
     return None
 
