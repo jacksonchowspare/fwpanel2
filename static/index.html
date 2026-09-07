@@ -388,7 +388,7 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
 #btn_upgrade { min-width: 80px; } /* 升级中文字变长也不换行 */
 td .btn.mini + .btn.mini { margin-left: 6px; }
 .btn:disabled { opacity: .4; cursor: not-allowed; transform: none !important; box-shadow: none !important; filter: none !important; }
-input, select, textarea { background: var(--input-bg); border: var(--bdw) solid var(--border); color: var(--text); border-radius: var(--r-input); padding: 7px 10px; font-size: 13px; outline: none; }
+input, select, textarea { background: var(--input-bg); border: var(--bdw) solid var(--border); color: var(--text); border-radius: var(--r-input); padding: 7px 10px; font-size: 13px; outline: none; min-width: 0; }
 /* 自绘日期选择面板：日期格样式 */
 #tr_cal .cal_day { height: 28px; display: flex; align-items: center; justify-content: center; border-radius: var(--r-sm); font-size: 12px; cursor: pointer; transition: background .12s ease; }
 #tr_cal .cal_day:hover { background: rgba(61,139,253,.18); }
@@ -1457,7 +1457,13 @@ function fedCardEl(n) {
   btns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;margin-top:2px";
   const mk = (txt, cls, fn) => { const b = document.createElement("button"); b.className = "btn mini" + (cls ? " " + cls : ""); b.textContent = txt; b.onclick = fn; btns.appendChild(b); };
   mk("管理此节点", "", () => enterFed(n));
-  mk("编辑", "ghost", () => openEditFed(n.id, n.name, n.url));
+  // 编辑:与反代代理列表的编辑按钮同款样式(accent 实底 mini)
+  const eb = document.createElement("button");
+  eb.className = "btn mini";
+  eb.style.background = "var(--accent)";
+  eb.textContent = "编辑";
+  eb.onclick = () => openEditFed(n.id, n.name, n.url);
+  btns.appendChild(eb);
   mk("删除", "danger", () => delFedNode(n.id, n.name));
   card.appendChild(btns);
   return card;
