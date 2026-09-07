@@ -16,10 +16,14 @@
 ## 一键安装 / 升级
 
 ```bash
+# 安装 / 升级【最新正式版】(稳定通道,推荐)
 curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash
+
+# 安装 / 升级【最新测试版】(尝鲜通道,功能未充分验证)
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --beta
 ```
 
-> root 用户可直接去掉 `sudo`；普通用户有 sudo 时脚本自动提权。**已安装时重跑 = 自动升级**（备份旧版 → 覆盖 → 校验 → 重启，配置/规则/代理全部保留），且带**防降级保护**：服务器当前版本 ≥ 下载版本时自动跳过，绝不降级。
+> 默认安装**最新正式版**(GitHub Latest release);`--beta` 安装最新测试版(prerelease)。root 用户可直接去掉 `sudo`;普通用户有 sudo 时脚本自动提权。**已安装时重跑 = 自动升级**(备份旧版 → 覆盖 → 校验 → 重启,配置/规则/代理全部保留),且带**防降级保护**:服务器当前版本 ≥ 目标版本时自动跳过,绝不降级(已装测试版时跑默认命令会提示改用 `--beta`)。
 
 安装过程全自动：
 - 自动识别发行版并安装依赖：python3 / nftables / curl / wget / sudo，缺什么装什么
@@ -37,7 +41,8 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
 | `--user NAME` | 指定用户名（默认随机 8 位） |
 | `--password PASS` | 指定密码，≥8 位（默认随机 16 位强密码） |
 | `--open-port P` | 安装后立即放行端口（逗号分隔，如 `80,443` 或 `53/udp`） |
-| `--version V` | **指定安装/升级到某版本**（如 `v1.24.42`，自动补 v 前缀；留空 = main 最新；显式指定版本允许降级，用于回退） |
+| `--beta` | 安装/升级**最新测试版**(prerelease);默认最新正式版 | 
+| `--version V` | **指定安装/升级到某版本**（如 `v1.24.42`，自动补 v 前缀；显式指定允许降级，用于回退） |
 | `--check` | 仅体检环境 |
 | `--change-password` | 重置面板密码（交互式） |
 | `--uninstall` | 卸载（停服务 + 删文件） |
@@ -54,7 +59,7 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
 # 一键回退到指定版本（如新版有问题，回退 v1.24.42；配置/规则全保留）
 curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --version v1.24.42
 
-# 恢复最新版（去掉 --version 即可）
+# 恢复最新正式版（去掉 --version 即可）
 curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash
 ```
 
@@ -130,8 +135,8 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
 
 ## 升级 / 回退
 
-- 面板内「🔄 系统更新」→ 一键升级
-- 或 SSH 重跑一键安装命令（自动升级模式，保留全部配置，防降级）
+- 面板内「🔄 系统更新」→ 一键升级（正式版；测试版用对应按钮）
+- 或 SSH 重跑一键安装命令（默认正式版；`--beta` 升级测试版；保留全部配置，防降级）
 - **回退到指定版本**（新版有问题时一键回退）：
 
 ```bash

@@ -5,7 +5,8 @@
 # 零第三方依赖：Python 标准库 + 系统 nftables，不装 firewalld/ufw。
 #
 # 用法：
-#   sudo bash install.sh                         一键安装（随机端口/用户名/密码，一并打印）
+#   sudo bash install.sh                         一键安装/升级【最新正式版】（随机端口/用户名/密码一并打印）
+#   sudo bash install.sh --beta                  安装/升级【最新测试版】（尝鲜，未充分验证）
 #   sudo bash install.sh -p 17890                指定面板端口
 #   sudo bash install.sh --bind 127.0.0.1        仅本机访问（默认 0.0.0.0 开放远程）
 #   sudo bash install.sh --user admin --password MyPass123  指定凭据
@@ -21,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="2.1.8"
+readonly SCRIPT_VERSION="2.1.9"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -43,7 +44,9 @@ PANEL_BIND=""
 PANEL_USER=""
 PANEL_PASS=""
 OPEN_PORTS=""
-VERSION_TAG=""   # 指定安装/升级版本（如 v1.24.42；留空 = main 最新）
+VERSION_TAG=""   # 指定安装/升级版本（如 v1.24.42；留空 = 解析最新正式版）
+BETA=0           # --beta:安装/升级最新测试版(prerelease)
+SRC_TAG=""       # 解析后的下载源 tag(懒解析)
 
 # ------------------------------ 颜色 ------------------------------
 if [ -t 1 ]; then
@@ -147,7 +150,8 @@ check_existing() {
     if [ -f "$APP_DIR/panel.py" ] || systemctl list-unit-files 2>/dev/null | grep -q "$SERVICE_NAME"; then
         if [ "${1:-}" = "check" ]; then
             log_warn "检测到 fwpanel 已安装（体检模式跳过安装）。"
-            log_info "重跑安装脚本可升级到最新版: curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash"
+            log_info "重跑安装脚本可升级到最新正式版: curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash"
+            log_info "想尝鲜测试版请在命令后加 --beta"
             exit 0
         fi
         log_info "检测到 fwpanel 已安装，执行升级（保留配置/规则/代理）..."
@@ -162,8 +166,10 @@ do_upgrade() {
     tag="$(src_tag)"
     if [ -n "$VERSION_TAG" ]; then
         log_info "下载指定版本 $tag ..."
+    elif [ "$BETA" = "1" ]; then
+        log_info "下载最新测试版...（源: $tag）"
     else
-        log_info "下载最新版本...（源: $tag）"
+        log_info "下载最新正式版...（源: $tag）"
     fi
     # 三级源回退 + 内容头校验（防镜像返回 HTML 错误页）
     if ! fetch_source "$tmpdir/panel.py" "panel.py"; then
@@ -177,7 +183,12 @@ do_upgrade() {
     new_ver=$(grep -oP 'CURRENT_VERSION\s*=\s*"\K[\d.]+' "$tmpdir/panel.py" 2>/dev/null | head -1)
     if [ -z "$VERSION_TAG" ] && [ -n "$cur_ver" ] && [ -n "$new_ver" ]; then
         if [ "$(printf '%s\n' "$cur_ver" "$new_ver" | sort -V | tail -1)" = "$cur_ver" ]; then
-            log_info "当前版本 v$cur_ver ≥ 下载版本 v$new_ver，跳过升级（不降级）"
+            if [ "$BETA" = "1" ]; then
+                log_info "当前已是最新测试版 v$cur_ver，无需升级"
+            else
+                log_info "当前版本 v$cur_ver ≥ 正式版 v$new_ver，跳过（不降级）"
+                log_info "如当前是测试版并想尝鲜更新，请使用: sudo bash $0 --beta"
+            fi
             rm -rf "$tmpdir"
             exit 0
         fi
@@ -188,6 +199,12 @@ do_upgrade() {
     fetch_source "$tmpdir/index.html" "static/index.html" || log_warn "下载 index.html 失败（保留现有页面）"
     fetch_source "$tmpdir/github-logo.png" "static/github-logo.png" || true
     fetch_source "$tmpdir/install.sh" "install.sh" || true
+    # 字体(思源中文子集 + 0xProto 等宽):缺失时降级系统字体,不影响主功能
+    local f
+    mkdir -p "$tmpdir/fonts"
+    for f in fw-sans-sc-regular.woff2 fw-sans-sc-bold.woff2 0xProto-Regular.woff2 0xProto-Bold.woff2; do
+        fetch_source "$tmpdir/fonts/$f" "static/fonts/$f" || log_warn "字体 $f 下载失败(将使用系统字体)"
+    done
     # 备份当前版本（保留最近 3 份）
     local bak
     bak="$APP_DIR/panel.py.bak.$(date +%Y%m%d%H%M%S)"
@@ -205,6 +222,10 @@ do_upgrade() {
     fi
     if [ -s "$tmpdir/install.sh" ]; then
         cp "$tmpdir/install.sh" "$0" 2>/dev/null || true
+    fi
+    if [ -d "$tmpdir/fonts" ]; then
+        mkdir -p "$APP_DIR/static/fonts"
+        cp "$tmpdir/fonts/"*.woff2 "$APP_DIR/static/fonts/" 2>/dev/null || true
     fi
     rm -rf "$tmpdir"
     # 语法校验
@@ -237,7 +258,8 @@ usage() {
 $SCRIPT_NAME v$SCRIPT_VERSION —— 简易VPS管理面板2.0（Debian 13 · nftables）
 
 用法:
-  sudo bash $0                           一键安装（随机端口/用户名/密码，安装结束一并打印）
+  sudo bash $0                           一键安装/升级【最新正式版】（随机端口/用户名/密码一并打印）
+  sudo bash $0 --beta                    安装/升级【最新测试版】（尝鲜通道）
   sudo bash $0 -p 17890                  指定面板端口
   sudo bash $0 --bind 127.0.0.1          仅本机访问（默认 0.0.0.0 开放远程）
   sudo bash $0 --user admin --password x  指定登录凭据
@@ -252,7 +274,8 @@ $SCRIPT_NAME v$SCRIPT_VERSION —— 简易VPS管理面板2.0（Debian 13 · nft
       --user NAME     登录用户名（默认随机 8 位）
       --password PASS 登录密码，≥8 位（默认随机 16 位强密码）
       --open-port P   安装后立即开放端口给公网（逗号分隔，如 80,443 或 53/udp）
-      --version V     指定安装/升级到某版本（如 v1.24.42，自动补 v；留空=main 最新；可回退）
+      --beta          安装/升级最新测试版(prerelease)；默认安装最新正式版(Latest)
+      --version V     指定安装/升级到某版本（如 v1.24.42，自动补 v；可回退）
       --force         跳过系统检测
   -h, --help          帮助
 
@@ -276,6 +299,7 @@ parse_args() {
             --password)    PANEL_PASS="$2"; shift 2 ;;
             --open-port)   OPEN_PORTS="$2"; shift 2 ;;
             --version)     VERSION_TAG="$2"; shift 2 ;;
+            --beta)        BETA=1; shift ;;
             --check)       ACTION="check"; shift ;;
             --change-password) ACTION="change-password"; shift ;;
             -u|--uninstall) ACTION="uninstall"; shift ;;
@@ -373,13 +397,43 @@ download_file() {
     return 0
 }
 
-# 下载源 tag：--version 指定时用该版本（自动补 v 前缀），否则 main 最新
-src_tag() {
+# 下载源 tag：--version 指定 > --beta(最新测试版) > 最新正式版(Latest release)；API 失败回退 main
+resolve_src_tag() {
     if [ -n "$VERSION_TAG" ]; then
-        case "$VERSION_TAG" in v*) printf '%s' "$VERSION_TAG" ;; *) printf 'v%s' "$VERSION_TAG" ;; esac
-    else
-        printf '%s' "main"
+        case "$VERSION_TAG" in v*) SRC_TAG="$VERSION_TAG" ;; *) SRC_TAG="v$VERSION_TAG" ;; esac
+        return
     fi
+    local json tag
+    if [ "$BETA" = "1" ]; then
+        json="$(curl -fsSL --connect-timeout 10 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=20" 2>/dev/null || true)"
+        tag="$(printf '%s' "$json" | python3 -c 'import sys,json
+try:
+    for r in json.load(sys.stdin):
+        if r.get("prerelease") and r.get("tag_name"):
+            print(r["tag_name"]); break
+except Exception: pass' 2>/dev/null)"
+        if [ -z "$tag" ]; then
+            error "暂未找到更新的测试版(beta)；如需要请安装最新正式版"
+        fi
+        SRC_TAG="$tag"
+        log_info "目标: 最新测试版 $SRC_TAG"
+    else
+        json="$(curl -fsSL --connect-timeout 10 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest" 2>/dev/null || true)"
+        tag="$(printf '%s' "$json" | python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("tag_name") or "")
+except Exception: pass' 2>/dev/null)"
+        if [ -n "$tag" ]; then
+            SRC_TAG="$tag"
+            log_info "目标: 最新正式版 $SRC_TAG"
+        else
+            SRC_TAG="main"
+            log_warn "解析最新正式版失败（网络/限流），回退主线 main（可能包含未转正改动）"
+        fi
+    fi
+}
+src_tag() {
+    [ -z "$SRC_TAG" ] && resolve_src_tag
+    printf '%s' "$SRC_TAG"
 }
 
 fetch_source() {
@@ -391,6 +445,7 @@ fetch_source() {
         *.html) expect_hex="3c21444f43545950452068746d6c3e0a3c68746d6c206c616e673d227a682d434e223e" ;;  # <!DOCTYPE html>\n<html lang="zh-CN">
         *.png)  expect_hex="89504e47" ;;                    # \x89PNG
         *.ico)  expect_hex="00000100" ;;                    # ico 头
+        *.woff2) expect_hex="774f4632" ;;                   # wOF2
     esac
     download_file "$dest" "https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/$tag/$path" "$expect_hex" && return 0
     log_warn "GitHub 直连失败，切换 jsDelivr CDN ..."
@@ -418,6 +473,13 @@ deploy_files() {
             || error "下载 index.html 失败，请检查网络"
         fetch_source "$tmp_src/favicon.ico" "static/favicon.ico" \
             || log_warn "下载 favicon.ico 失败（不影响安装，将使用默认图标）"
+        # 字体（思源中文 + 0xProto 等宽）随管道安装一起拉取，缺失时系统字体兜底
+        mkdir -p "$tmp_src/static/fonts"
+        local _f
+        for _f in fw-sans-sc-regular.woff2 fw-sans-sc-bold.woff2 0xProto-Regular.woff2 0xProto-Bold.woff2; do
+            fetch_source "$tmp_src/static/fonts/$_f" "static/fonts/$_f" \
+                || log_warn "字体 $_f 下载失败（将使用系统字体）"
+        done
         src_py="$tmp_src/panel.py"
         src_html="$tmp_src/index.html"
         src_ico="$tmp_src/favicon.ico"
@@ -428,6 +490,13 @@ deploy_files() {
     install -m 644 "$src_html" "$APP_DIR/static/index.html"
     if [ -f "$src_ico" ]; then
         install -m 644 "$src_ico" "$APP_DIR/static/favicon.ico"
+    fi
+    # 字体目录:本地(tar/目录)安装直接复制;管道安装已下载到 tmp_src
+    local fonts_src="$script_dir/static/fonts"
+    if [ -n "$tmp_src" ]; then fonts_src="$tmp_src/static/fonts"; fi
+    if [ -d "$fonts_src" ]; then
+        mkdir -p "$APP_DIR/static/fonts"
+        cp -f "$fonts_src/"*.woff2 "$APP_DIR/static/fonts/" 2>/dev/null || true
     fi
     [ -n "$tmp_src" ] && rm -rf "$tmp_src"
     log_info "文件部署完成"
@@ -555,6 +624,7 @@ print_summary() {
     echo "------------------------------------------------------------------"
     echo "  ${C_RED}⚠ 凭据仅显示这一次，不会写入任何文件，请立即记下！${C_RESET}"
     echo "  忘记密码: sudo bash $0 --change-password"
+    echo "  升级正式版: sudo bash $0    |   尝鲜测试版: sudo bash $0 --beta"
     echo "  面板内可修改密码；SSH(22) 始终放行防锁死"
     echo "  查看日志: journalctl -u fwpanel -f"
     echo "=================================================================="
