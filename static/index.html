@@ -68,6 +68,9 @@ body[data-theme="light"] {
 .th-item { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 10px 4px; background: var(--hover-bg); border: 2px solid transparent; border-radius: 10px; cursor: pointer; font-size: 11px; color: var(--text); transition: all .15s ease; }
 .th-item:hover { background: var(--hover-bg2); }
 .th-item.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.zoom-row { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 14px; }
+.zoom-row .btn { flex: 1; min-width: 54px; padding: 4px 0; text-align: center; justify-content: center; }
+.zoom-row .btn.on { background: var(--accent); color: var(--btn-fg); border-color: transparent; }
 .th-dot { display: flex; width: 36px; height: 22px; border-radius: 6px; overflow: hidden; border: 1px solid rgba(128,128,128,.45); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
 .th-dot i { flex: 1; }
 
@@ -423,6 +426,22 @@ tr:hover td { background: var(--panel-solid); }
 .modal input[type="checkbox"] { width: auto; flex: none; }
 .modal .btnrow { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
 </style>
+<script>
+/* 界面缩放:4K/高分屏按视口宽度自动放大(html zoom,首帧前生效防闪烁);可在主题面板手动调 */
+(function () {
+  try {
+    var v = localStorage.getItem("ui_zoom");
+    var z = 1;
+    if (!v || v === "auto") {
+      var w = window.innerWidth;
+      if (w >= 3300) z = 1.5; else if (w >= 2800) z = 1.4; else if (w >= 2300) z = 1.25;
+      else if (w >= 1900) z = 1.12;
+    } else { z = parseFloat(v) || 1; }
+    z = Math.min(2, Math.max(1, z));
+    document.documentElement.style.zoom = z;
+  } catch (e) {}
+})();
+</script>
 </head>
 <body>
 <div class="wrap">
@@ -1070,8 +1089,10 @@ tr:hover td { background: var(--panel-solid); }
 <div id="thm_modal" class="modal-mask hidden">
   <div class="modal" style="width:440px">
     <h3>🎨 界面主题</h3>
-    <div style="color:var(--muted);font-size:12px;margin-bottom:4px;line-height:1.6">8 套皮肤,点击即时生效并记住选择。</div>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:4px;line-height:1.6">8 套皮肤,点击即时生效并记住。4K/高分屏可调界面缩放。</div>
     <div id="thm_grid" class="th-grid"></div>
+    <div style="margin:10px 0 6px;font-size:12px;color:var(--muted)">界面缩放</div>
+    <div id="zoom_row" class="zoom-row"></div>
     <div class="btnrow"><button class="btn ghost" onclick="closeTheme()">关闭</button></div>
   </div>
 </div>
@@ -1805,9 +1826,58 @@ function openTheme() {
     });
   }
   paintThemeBtns();
+  buildZoomRow();
   $("thm_modal").classList.remove("hidden");
 }
 function closeTheme() { $("thm_modal").classList.add("hidden"); }
+/* ---------- 界面缩放(4K/高分屏) ---------- */
+const ZOOMS = [{ v: 0, n: "自动" }, { v: 1, n: "100%" }, { v: 1.12, n: "112%" }, { v: 1.25, n: "125%" }, { v: 1.5, n: "150%" }, { v: 1.75, n: "175%" }];
+function zoomAuto() {
+  const w = window.innerWidth;
+  if (w >= 3300) return 1.5;
+  if (w >= 2800) return 1.4;
+  if (w >= 2300) return 1.25;
+  if (w >= 1900) return 1.12;
+  return 1;
+}
+function applyZoomForce() {
+  const v = localStorage.getItem("ui_zoom");
+  const z = Math.min(2, Math.max(1, (!v || v === "auto") ? zoomAuto() : (parseFloat(v) || 1)));
+  document.documentElement.style.zoom = z;
+  paintZoom();
+}
+function setZoom(v) {
+  localStorage.setItem("ui_zoom", String(v));
+  applyZoomForce();
+  toast(v ? "界面缩放已设为 " + (v * 100) + "%" : "界面缩放已设为自动", "okk");
+}
+function paintZoom() {
+  const cur = localStorage.getItem("ui_zoom");
+  const active = (!cur || cur === "auto") ? 0 : parseFloat(cur);
+  document.querySelectorAll("#zoom_row .btn").forEach(b => {
+    b.classList.toggle("on", Math.abs(parseFloat(b.dataset.z || "0") - active) < 0.001);
+  });
+}
+function buildZoomRow() {
+  const r = $("zoom_row");
+  if (!r) return;
+  if (r.dataset.ready) return;
+  r.dataset.ready = "1";
+  ZOOMS.forEach(x => {
+    const b = document.createElement("button");
+    b.className = "btn mini ghost";
+    b.dataset.z = String(x.v);
+    b.textContent = x.n;
+    b.onclick = () => setZoom(x.v);
+    r.appendChild(b);
+  });
+  paintZoom();
+}
+let _zt = null;
+window.addEventListener("resize", () => {
+  clearTimeout(_zt);
+  _zt = setTimeout(() => { if ((localStorage.getItem("ui_zoom") || "auto") === "auto") applyZoomForce(); }, 250);
+});
 setTheme(localStorage.getItem("fw_theme") || "dark");
 
 /* ---------- 分组导航 tabs ---------- */
