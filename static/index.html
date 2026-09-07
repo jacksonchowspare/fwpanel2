@@ -19,7 +19,7 @@
   unicode-range: U+4E00-9FFF, U+3000-303F, U+FF00-FFEF, U+2018-201F, U+00B7;
 }
 :root {
-  --bg: #0f1419; --card: rgba(26,33,43,.72); --border: rgba(255,255,255,.10);
+  --bg: #0f1419; --card: #18202b; --border: rgba(255,255,255,.10);
   --text: #e6ebf2; --muted: #8b98a9; --accent: #3d8bfd; --accent2: #22c55e;
   --danger: #ef4444; --warn: #f59e0b;
   /* 主题可切换（白天/黑夜）补充变量 */
@@ -28,33 +28,40 @@
   --hover-bg: rgba(255,255,255,.05);
   --hover-bg2: rgba(255,255,255,.10);
   --hover-border: rgba(255,255,255,.14);
-  --tabs-bg: rgba(26,33,43,.78);
-  --btn-grad-a: #4da3ff; --btn-grad-b: #2f6ff0;
-  --danger-grad-a: #f87171; --danger-grad-b: #dc2626;
-  --btn-inset: rgba(255,255,255,.22);
-  --shadow-card: 0 4px 20px rgba(0,0,0,.25);
-  --glow1: rgba(61,139,253,.16); --glow2: rgba(34,197,94,.10); --glow3: rgba(139,92,246,.08);
+  --tabs-bg: #151c27;
+  --btn-grad-a: #3d8bfd; --btn-grad-b: #3d8bfd;
+  --danger-grad-a: #dc2626; --danger-grad-b: #dc2626;
+  --btn-inset: transparent;
+  --shadow-card: 0 1px 3px rgba(0,0,0,.5);
+  --glow1: rgba(61,139,253,0); --glow2: rgba(34,197,94,0); --glow3: rgba(139,92,246,0);   /* 背景光晕默认关闭(克制),霓虹等主题开启 */
   /* 形状与质感(主题可调:圆角/毛玻璃/描边/按钮) */
-  --r-card: 12px; --r-panel: 12px; --r-modal: 14px; --r-nav: 12px; --r-btn: 7px; --r-input: 7px; --r-sm: 6px; --r-tag: 4px;
-  --glass: 14px; --glass-modal: 18px;
+  --r-card: 10px; --r-panel: 10px; --r-modal: 12px; --r-nav: 10px; --r-btn: 6px; --r-input: 6px; --r-sm: 5px; --r-tag: 3px;
+  --glass: 0px; --glass-modal: 0px;   /* 默认实底(现代克制),主题可开毛玻璃 */
   --bdw: 1px;
-  --btn-fg: #fff; --btn-glow: 61,139,253; --danger-glow: 239,68,68;
+  --btn-fg: #fff;
+  --btn-shdw: 0 1px 2px rgba(0,0,0,.45);
+  --btn-shdw-h: 0 2px 8px rgba(0,0,0,.4);
+  --btn-shdw-a: 0 1px 1px rgba(0,0,0,.35);
+  --btn-glow: 61,139,253; --danger-glow: 239,68,68;
   --shadow-modal: 0 8px 40px rgba(0,0,0,.4);
-  --hi: rgba(255,255,255,.04);
+  --hi: transparent;
 }
 body[data-theme="light"] {
-  --bg: #eef1f6; --card: rgba(255,255,255,.85); --border: rgba(15,30,50,.12);
+  --bg: #eef1f6; --card: #ffffff; --border: rgba(15,30,50,.12);
   --text: #1c2430; --muted: #5c6b7e; --accent: #2f6ff0; --accent2: #16a34a;
   --danger: #dc2626; --warn: #d97706;
   --panel-solid: #f0f3f8; --input-bg: #ffffff;
   --hover-bg: rgba(15,30,50,.06); --hover-bg2: rgba(15,30,50,.10); --hover-border: rgba(15,30,50,.16);
-  --tabs-bg: rgba(255,255,255,.88);
-  --btn-grad-a: #3b82f6; --btn-grad-b: #2563eb;
+  --tabs-bg: #ffffff;
+  --btn-grad-a: #2563eb; --btn-grad-b: #2563eb;
   --danger-grad-a: #ef4444; --danger-grad-b: #b91c1c;
-  --btn-inset: rgba(255,255,255,.35);
-  --shadow-card: 0 4px 16px rgba(30,50,80,.10);
-  --glow1: rgba(61,139,253,.10); --glow2: rgba(34,197,94,.06); --glow3: rgba(139,92,246,.05);
-  --shadow-modal: 0 10px 34px rgba(30,50,80,.16);
+  --btn-inset: transparent;
+  --shadow-card: 0 1px 3px rgba(16,24,40,.10);
+  --glow1: rgba(61,139,253,0); --glow2: rgba(34,197,94,0); --glow3: rgba(139,92,246,0);
+  --shadow-modal: 0 14px 40px rgba(15,23,42,.18);
+  --btn-shdw: 0 1px 2px rgba(16,24,40,.16);
+  --btn-shdw-h: 0 3px 10px rgba(16,24,40,.16);
+  --btn-shdw-a: 0 1px 1px rgba(16,24,40,.14);
 }
 
 .th-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; margin: 6px 0 16px; }
@@ -63,49 +70,116 @@ body[data-theme="light"] {
 .th-item.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 .th-dot { display: flex; width: 36px; height: 22px; border-radius: 6px; overflow: hidden; border: 1px solid rgba(128,128,128,.45); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
 .th-dot i { flex: 1; }
+
+/* 通用:细滚动条 */
+html { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border); border-radius: 8px; border: 2px solid transparent; background-clip: padding-box; }
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
+
+/* ===== 霓虹·暗 性格层(二次元完整样板:玻璃夜空+卡通厚底钮+图标彩底+胶囊标签) ===== */
+body[data-theme="vibes-dark"] {
+  --bg: #070917; --card: rgba(24,28,60,.82); --tabs-bg: rgba(22,26,54,.78);
+  --glass: 16px; --glass-modal: 22px;
+  --hi: rgba(255,255,255,.06);
+  --btn-inset: rgba(255,255,255,.18);
+  --btn-shdw: 0 3px 12px rgba(139,92,246,.3);
+  --btn-shdw-h: 0 6px 22px rgba(139,92,246,.45);
+  --btn-shdw-a: 0 1px 4px rgba(139,92,246,.25);
+  --glow1: rgba(139,92,246,.30); --glow2: rgba(45,212,238,.13); --glow3: rgba(219,39,119,.17);
+}
+body[data-theme="vibes-dark"] h2 { letter-spacing: .04em; }
+/* 卡通厚底按钮(主/危险;ghost 与 disabled 除外) */
+body[data-theme="vibes-dark"] .btn:not(.ghost) {
+  border-radius: 12px;
+  box-shadow: 0 3px 0 rgba(4,5,14,.95), 0 8px 20px rgba(var(--btn-glow),.35), inset 0 1px 0 rgba(255,255,255,.2);
+}
+body[data-theme="vibes-dark"] .btn:not(.ghost):hover {
+  filter: none; transform: translateY(-1px);
+  box-shadow: 0 4px 0 rgba(4,5,14,.95), 0 12px 26px rgba(var(--btn-glow),.5), inset 0 1px 0 rgba(255,255,255,.24);
+}
+body[data-theme="vibes-dark"] .btn:not(.ghost):active {
+  transform: translateY(2px);
+  box-shadow: 0 1px 0 rgba(4,5,14,.95), 0 4px 10px rgba(var(--btn-glow),.25), inset 0 1px 0 rgba(255,255,255,.1);
+}
+body[data-theme="vibes-dark"] .btn:disabled { box-shadow: none !important; }
+body[data-theme="vibes-dark"] .btn.ghost { box-shadow: none; }
+/* 卡片小图标 / 面板标题图标:彩色圆底衬 */
+body[data-theme="vibes-dark"] .cards .card .k .h-ico-sm,
+body[data-theme="vibes-dark"] .panel h2 .h-ico {
+  padding: 4px; box-sizing: content-box; margin-right: 8px;
+  background: linear-gradient(135deg, rgba(139,92,246,.4), rgba(219,39,119,.28));
+  border-radius: 9px; color: #dcd2ff;
+}
+body[data-theme="vibes-dark"] .card .k { color: #b9aef0; }
+/* 标签胶囊化并提亮 */
+body[data-theme="vibes-dark"] .tag { border-radius: 999px; padding: 2px 10px; font-weight: 600; }
+body[data-theme="vibes-dark"] .tag.allow { background: rgba(52,211,153,.16); color: #6ee7b7; }
+body[data-theme="vibes-dark"] .tag.deny { background: rgba(251,113,133,.16); color: #fda4af; }
+body[data-theme="vibes-dark"] .tag.ip { background: rgba(167,139,250,.2); color: #c4b5fd; }
+
+/* ===== 像素重度层:网格纹理 + 像素标题投影 + 方块圆点 ===== */
+body[data-theme="pixel-light"] {
+  --px-sh: rgba(38,38,58,.28);
+  background-image: linear-gradient(rgba(38,38,58,.055) 1px, transparent 1px), linear-gradient(90deg, rgba(38,38,58,.055) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+body[data-theme="pixel-dark"] {
+  --px-sh: rgba(0,0,0,.55);
+  background-image: linear-gradient(rgba(190,190,220,.05) 1px, transparent 1px), linear-gradient(90deg, rgba(190,190,220,.05) 1px, transparent 1px);
+  background-size: 26px 26px;
+}
+body[data-theme^="pixel"] h1, body[data-theme^="pixel"] h2 {
+  text-shadow: 2px 2px 0 var(--px-sh); letter-spacing: .06em; font-weight: 800;
+}
+body[data-theme^="pixel"] h1 .dot { border-radius: 0; }
+body[data-theme^="pixel"] span[id^="fed_dot_"] { border-radius: 0 !important; }
+body[data-theme^="pixel"] .slider, body[data-theme^="pixel"] .slider::before { border-radius: 0; }
+body[data-theme^="pixel"] .tag { border-radius: 0; }
 /* ============ 主题包（FW-Panel2 2.0.9 多皮肤） ============ */
 /* 奶油日系 · 亮（温和二次元） */
 body[data-theme="cream-light"] {
-  --bg: #fbf3ee; --card: rgba(255,255,255,.93); --border: rgba(181,122,142,.18);
+  --bg: #fbf3ee; --card: #ffffff; --border: rgba(181,122,142,.18);
   --text: #56394b; --muted: #a28897; --accent: #ec5a94; --accent2: #2ebd85;
   --danger: #e0536b; --warn: #e08a00;
   --panel-solid: #fffdfb; --input-bg: #ffffff;
   --hover-bg: rgba(236,90,148,.07); --hover-bg2: rgba(236,90,148,.13); --hover-border: rgba(236,90,148,.24);
-  --tabs-bg: rgba(255,255,255,.92);
+  --tabs-bg: #ffffff;
   --btn-grad-a: #ff9dbb; --btn-grad-b: #f25e93; --btn-glow: 242,94,147; --btn-inset: rgba(255,255,255,.5);
   --danger-grad-a: #fb7185; --danger-grad-b: #e11d48; --danger-glow: 225,29,72;
   --shadow-card: 0 6px 22px rgba(210,140,160,.16); --shadow-modal: 0 12px 34px rgba(190,120,150,.22);
-  --hi: rgba(255,255,255,.55);
+  --hi: transparent;
   --glow1: rgba(255,158,196,.14); --glow2: rgba(46,189,133,.08); --glow3: rgba(255,190,90,.08);
   --r-card:16px; --r-panel:16px; --r-modal:18px; --r-nav:16px; --r-btn:10px; --r-input:9px; --r-sm:8px; --r-tag:6px;
 }
 /* 奶油日系 · 暗（可可夜） */
 body[data-theme="cream-dark"] {
-  --bg: #241b24; --card: rgba(56,34,50,.9); --border: rgba(255,163,196,.16);
+  --bg: #241b24; --card: #3a2330; --border: rgba(255,163,196,.16);
   --text: #f7e8ef; --muted: #b394a4; --accent: #ff8fb2; --accent2: #3edca0;
   --danger: #ff7d92; --warn: #fbbf24;
   --panel-solid: #39222f; --input-bg: #1d131a;
   --hover-bg: rgba(255,143,178,.1); --hover-bg2: rgba(255,143,178,.17); --hover-border: rgba(255,143,178,.26);
-  --tabs-bg: rgba(57,34,47,.88);
+  --tabs-bg: #3a2330;
   --btn-grad-a: #ff7aa8; --btn-grad-b: #d63f7d; --btn-glow: 214,63,125; --btn-inset: rgba(255,255,255,.22);
   --danger-grad-a: #f87171; --danger-grad-b: #be123c; --danger-glow: 190,18,60;
   --shadow-card: 0 8px 26px rgba(0,0,0,.4); --shadow-modal: 0 14px 40px rgba(0,0,0,.55);
-  --hi: rgba(255,255,255,.05);
+  --hi: transparent;
   --glow1: rgba(255,143,178,.16); --glow2: rgba(62,220,160,.08); --glow3: rgba(251,191,36,.06);
   --r-card:16px; --r-panel:16px; --r-modal:18px; --r-nav:16px; --r-btn:10px; --r-input:9px; --r-sm:8px; --r-tag:6px;
 }
 /* 动感动漫 · 亮（元气紫） */
 body[data-theme="vibes-light"] {
-  --bg: #eef2ff; --card: rgba(255,255,255,.93); --border: rgba(99,102,201,.18);
+  --bg: #eef2ff; --card: #ffffff; --border: rgba(99,102,201,.18);
   --text: #282d54; --muted: #7d84b8; --accent: #6d5ef0; --accent2: #0ea5c4;
   --danger: #ef4444; --warn: #d97706;
   --panel-solid: #ffffff; --input-bg: #ffffff;
   --hover-bg: rgba(109,94,240,.07); --hover-bg2: rgba(109,94,240,.13); --hover-border: rgba(109,94,240,.22);
-  --tabs-bg: rgba(255,255,255,.9);
+  --tabs-bg: #ffffff;
   --btn-grad-a: #8b5cf6; --btn-grad-b: #0ea5c4; --btn-glow: 109,94,240; --btn-inset: rgba(255,255,255,.4);
   --danger-grad-a: #f87171; --danger-grad-b: #dc2626; --danger-glow: 239,68,68;
   --shadow-card: 0 6px 24px rgba(96,100,220,.15); --shadow-modal: 0 12px 34px rgba(90,90,200,.2);
-  --hi: rgba(255,255,255,.5);
+  --hi: transparent;
   --glow1: rgba(124,93,250,.13); --glow2: rgba(14,165,196,.08); --glow3: rgba(244,63,94,.06);
   --r-card:14px; --r-panel:14px; --r-modal:16px; --r-nav:14px; --r-btn:9px; --r-input:8px; --r-sm:7px; --r-tag:5px;
 }
@@ -190,7 +264,7 @@ body {
 }
 .wrap { max-width: 1280px; margin: 0 auto; padding: 24px 16px 60px; }
 h1 { font-size: 20px; font-weight: 700; letter-spacing: .5px; display: flex; align-items: center; gap: 10px; margin-bottom: 4px; }
-h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent2); box-shadow: 0 0 8px var(--accent2); }
+h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent2); }
 .sub { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
 .topbar { display: flex; justify-content: space-between; align-items: center; }
 .topbar .actions { display: flex; gap: 8px; }
@@ -270,17 +344,17 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
 .btn {
   background: linear-gradient(135deg, var(--btn-grad-a), var(--btn-grad-b));
   color: var(--btn-fg); border: 0; border-radius: var(--r-btn); padding: 7px 14px; cursor: pointer; font-size: 13px;
-  box-shadow: 0 2px 8px rgba(var(--btn-glow),.25), inset 0 1px 0 var(--btn-inset);
-  transition: all .18s ease; text-shadow: 0 1px 2px rgba(0,0,0,.2);
+  box-shadow: var(--btn-shdw), inset 0 1px 0 var(--btn-inset);
+  transition: all .18s ease; text-shadow: none;
 }
-.btn:hover { filter: brightness(1.08); transform: translateY(-1px); box-shadow: 0 4px 14px rgba(var(--btn-glow),.38), inset 0 1px 0 var(--btn-inset); }
-.btn:active { transform: translateY(0); box-shadow: 0 1px 4px rgba(var(--btn-glow),.28), inset 0 1px 0 var(--btn-inset); }
+.btn:hover { filter: brightness(1.06); transform: translateY(-1px); box-shadow: var(--btn-shdw-h), inset 0 1px 0 var(--btn-inset); }
+.btn:active { transform: translateY(0); box-shadow: var(--btn-shdw-a), inset 0 1px 0 var(--btn-inset); }
 .btn.ghost { background: var(--hover-bg); border: 1px solid var(--hover-border); color: var(--text); box-shadow: none; text-shadow: none; }
 .btn.ghost:hover { background: var(--hover-bg2); border-color: var(--hover-border); filter: none; transform: translateY(-1px); box-shadow: 0 2px 10px rgba(0,0,0,.2); }
 .btn.ghost:active { transform: translateY(0); }
-.btn.danger { background: linear-gradient(135deg, var(--danger-grad-a), var(--danger-grad-b)); box-shadow: 0 2px 8px rgba(var(--danger-glow),.28), inset 0 1px 0 var(--btn-inset); }
-.btn.danger:hover { box-shadow: 0 4px 14px rgba(var(--danger-glow),.42), inset 0 1px 0 var(--btn-inset); }
-.btn.danger:active { box-shadow: 0 1px 4px rgba(var(--danger-glow),.3), inset 0 1px 0 var(--btn-inset); }
+.btn.danger { background: linear-gradient(135deg, var(--danger-grad-a), var(--danger-grad-b)); box-shadow: var(--btn-shdw), inset 0 1px 0 var(--btn-inset); }
+.btn.danger:hover { box-shadow: var(--btn-shdw-h), inset 0 1px 0 var(--btn-inset); }
+.btn.danger:active { box-shadow: var(--btn-shdw-a), inset 0 1px 0 var(--btn-inset); }
 .btn.mini { padding: 4px 10px; font-size: 12px; border-radius: var(--r-sm); }
 #btn_upgrade { min-width: 80px; } /* 升级中文字变长也不换行 */
 td .btn.mini + .btn.mini { margin-left: 6px; }
@@ -306,7 +380,7 @@ input::placeholder, textarea::placeholder { color: var(--muted); }
 .tab svg { display: block; flex: none; }
 .tabs .h-ico-sm { margin-right: 0; } /* 间距由 gap 统一控制 */
 .tab:hover { background: var(--hover-bg2); transform: translateY(-1px); box-shadow: 0 2px 8px rgba(0,0,0,.2); }
-.tab.active { background: linear-gradient(135deg,var(--btn-grad-a),var(--btn-grad-b)); border-color: transparent; color: var(--btn-fg); box-shadow: 0 2px 8px rgba(var(--btn-glow),.35), inset 0 1px 0 var(--btn-inset); }
+.tab.active { background: linear-gradient(135deg,var(--btn-grad-a),var(--btn-grad-b)); border-color: transparent; color: var(--btn-fg); font-weight: 600; box-shadow: none; }
 table { width: 100%; border-collapse: collapse; }
 .table-wrap { overflow-x: auto; }
 th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
@@ -356,6 +430,7 @@ tr:hover td { background: var(--panel-solid); }
   <div id="login" class="hidden">
     <div class="panel">
       <h1><span class="dot"></span>FW-Panel2</h1>
+      <div style="text-align:center;color:var(--muted);font-size:12px;margin:-6px 0 16px">一屏管多机 · 防火墙 / 反代 / Docker 小管家</div>
       <div class="form-row"><input id="lg_user" placeholder="用户名" autocomplete="username"></div>
       <div class="form-row"><input id="lg_pass" type="password" placeholder="密码" autocomplete="current-password"></div>
       <div class="form-row"><button class="btn" style="width:100%" onclick="login()">登 录</button></div>

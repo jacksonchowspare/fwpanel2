@@ -21,7 +21,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="2.0.9"
+readonly SCRIPT_VERSION="2.1.0"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
