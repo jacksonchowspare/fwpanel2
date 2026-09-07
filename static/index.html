@@ -1175,7 +1175,7 @@ function fedCardEl(n) {
   met.innerHTML = "<span>状态探测中…</span>";
   card.appendChild(met);
   const btns = document.createElement("div");
-  btns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap";
+  btns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;margin-top:2px";
   const mk = (txt, cls, fn) => { const b = document.createElement("button"); b.className = "btn mini" + (cls ? " " + cls : ""); b.textContent = txt; b.onclick = fn; btns.appendChild(b); };
   mk("管理此节点", "", () => enterFed(n));
   mk("编辑", "ghost", () => openEditFed(n.id, n.name, n.url));
