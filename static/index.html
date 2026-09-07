@@ -1035,8 +1035,8 @@ tr:hover td { background: var(--panel-solid); }
 
 <!-- 服务器节点弹窗（添加/编辑） -->
 <!-- 流量统计:自绘日期选择浮层(随缩放) -->
-    <!-- 流量统计：自绘日期选择面板（深色主题） -->
-    <div id="tr_cal" style="display:none;position:fixed;z-index:9999;width:252px;max-width:calc(100vw - 24px);background:var(--panel-solid);border:1px solid var(--hover-border);border-radius:10px;box-shadow:0 10px 36px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);padding:10px">
+    <div id="tr_cal" style="display:none;position:fixed;z-index:9999;left:-9999px;top:-9999px">
+      <div id="tr_cal_box" style="width:252px;max-width:calc(100vw - 24px);background:var(--panel-solid);border:1px solid var(--hover-border);border-radius:10px;box-shadow:0 10px 36px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);padding:10px">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
         <button class="btn mini ghost" onclick="trCal.month(-1)">◀</button>
         <span id="tr_cal_title" style="display:flex;align-items:center;font-size:13px;font-weight:600"></span>
@@ -1049,6 +1049,7 @@ tr:hover td { background: var(--panel-solid); }
       <div style="display:flex;gap:8px;margin-top:8px">
         <button class="btn mini" style="flex:1" onclick="trCal.today()">今天</button>
         <button class="btn mini ghost" style="flex:1" onclick="trCal.clear()">清除</button>
+      </div>
       </div>
     </div>
 
@@ -1853,7 +1854,7 @@ function applyZoomForce() {
   document.querySelectorAll(".modal-mask > .modal").forEach(e => { e.style.zoom = z; });
   const t = $("toast");
   if (t) t.style.zoom = z;
-  const cal = $("tr_cal");
+  const cal = $("tr_cal_box");
   if (cal) cal.style.zoom = z;
   paintZoom();
 }
@@ -2216,8 +2217,10 @@ const trCal = {
     this.y = d.getFullYear(); this.m = d.getMonth();
     this.render();
     const r = el.getBoundingClientRect();
+    const wrap = document.querySelector(".wrap");
+    const wz = (wrap && parseFloat(wrap.style.zoom)) || 1;
     const cal = $("tr_cal");
-    const w = cal.getBoundingClientRect().width || 252;
+    const w = Math.round(252 * wz);   // 内容盒视觉宽度(zoom 后)
     cal.style.left = Math.max(4, Math.min(r.left, window.innerWidth - w - 4)) + "px";
     cal.style.top = (r.bottom + 6) + "px";
     cal.style.display = "block";
