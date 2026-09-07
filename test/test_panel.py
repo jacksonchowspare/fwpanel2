@@ -4172,5 +4172,149 @@ class TestBruteforcePermanent(unittest.TestCase):
             panel.save_bans({})
 
 
+class TestFed(unittest.TestCase):
+    """联邦多机管理端到端（2.0）：双实例 master(node 可被管) + 节点(fed 令牌)"""
+
+    @classmethod
+    def setUpClass(cls):
+        # 清掉共享目录里可能残留的联邦节点配置
+        fed_file = os.path.join(TMP, "fed_nodes.json")
+        if os.path.exists(fed_file):
+            os.remove(fed_file)
+        cls.cfgA = make_cfg(user="fedmaster", pwd="MasterPass123", mode="strict")
+        cls.cfgA.data["port"] = 17996
+        cls.storeA = panel.RuleStore()
+        cls.storeA.rules = []
+        cls.nftA = panel.NFTManager(cls.storeA, cls.cfgA)
+        cls.authA = panel.Auth(cls.cfgA)
+        cls.serverA = panel.PanelServer(("127.0.0.1", 17996), panel.PanelHandler,
+                                        cls.cfgA, cls.storeA, cls.nftA, cls.authA)
+        cls.threadA = threading.Thread(target=cls.serverA.serve_forever, daemon=True)
+        cls.threadA.start()
+        cls.baseA = "http://127.0.0.1:17996"
+
+        cls.cfgB = make_cfg(user="fednode", pwd="NodePass123", mode="strict")
+        cls.cfgB.data["port"] = 17995
+        cls.storeB = panel.RuleStore()
+        cls.storeB.rules = []
+        cls.nftB = panel.NFTManager(cls.storeB, cls.cfgB)
+        cls.authB = panel.Auth(cls.cfgB)
+        cls.serverB = panel.PanelServer(("127.0.0.1", 17995), panel.PanelHandler,
+                                        cls.cfgB, cls.storeB, cls.nftB, cls.authB)
+        cls.threadB = threading.Thread(target=cls.serverB.serve_forever, daemon=True)
+        cls.threadB.start()
+        cls.baseB = "http://127.0.0.1:17995"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.serverA.shutdown(); cls.serverA.server_close()
+        cls.serverB.shutdown(); cls.serverB.server_close()
+
+    def _req(self, base, method, path, data=None, token=None, fed=None):
+        r = urllib.request.Request(base + path, method=method)
+        if token:
+            r.add_header("Authorization", "Bearer " + token)
+        if fed:
+            r.add_header(panel.FED_HEADER, fed)
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode()
+            r.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(r, body, timeout=15) as resp:
+                return resp.status, json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read() or b"{}")
+            except Exception:
+                return e.code, {}
+        except Exception as e:
+            return -1, {"error": str(e)}
+
+    def test_fed_end_to_end(self):
+        # 1) 登录两侧
+        code, d = self._req(self.baseA, "POST", "/api/login",
+                            {"username": "fedmaster", "password": "MasterPass123"})
+        self.assertEqual(code, 200, d)
+        tokA = d["token"]
+        code, d = self._req(self.baseB, "POST", "/api/login",
+                            {"username": "fednode", "password": "NodePass123"})
+        self.assertEqual(code, 200, d)
+        tokB = d["token"]
+
+        # 2) 节点开启联邦令牌：明文一次性返回；错误令牌被拒
+        code, d = self._req(self.baseB, "POST", "/api/fed", {"action": "rotate"}, token=tokB)
+        self.assertEqual(code, 200, d)
+        node_tok = d.get("token", "")
+        self.assertTrue(len(node_tok) >= 20, "令牌长度异常")
+        code, _ = self._req(self.baseB, "GET", "/api/status", fed="bad-token")
+        self.assertEqual(code, 401, "错误联邦令牌应被拒")
+        code, _ = self._req(self.baseB, "GET", "/api/status")
+        self.assertEqual(code, 401, "无凭据应被拒")
+        # 联邦令牌可读状态（探活语义）
+        code, d = self._req(self.baseB, "GET", "/api/fed", fed=node_tok)
+        self.assertEqual(code, 200, d)
+        self.assertTrue(d.get("fed_enabled"))
+
+        # 3) 主面板添加节点（预探测）；令牌错时被拒
+        code, d = self._req(self.baseA, "POST", "/api/fed/nodes",
+                            {"name": "NodeB", "url": self.baseB, "token": node_tok}, token=tokA)
+        self.assertEqual(code, 200, d)
+        nid = d["id"]
+        code, _ = self._req(self.baseA, "POST", "/api/fed/nodes",
+                            {"name": "Bad", "url": self.baseB, "token": "wrong"}, token=tokA)
+        self.assertEqual(code, 400, "错误令牌添加节点应被拒")
+
+        # 4) 代理读/写均命中节点
+        code, d = self._req(self.baseA, "GET", "/api/fed/%s/api/status" % nid, token=tokA)
+        self.assertEqual(code, 200, d)
+        self.assertEqual(d.get("username"), "fednode", "代理 status 应来自节点")
+        code, d = self._req(self.baseA, "POST", "/api/fed/%s/api/open-port" % nid,
+                            {"port": 18777, "proto": "tcp"}, token=tokA)
+        self.assertEqual(code, 200, d)
+        code, d = self._req(self.baseA, "GET", "/api/rules", token=tokA)
+        self.assertFalse(any(r.get("port") == 18777 for r in d.get("rules", [])),
+                         "主面板本机不应有远程规则")
+        code, d = self._req(self.baseA, "GET", "/api/fed/%s/api/rules" % nid, token=tokA)
+        self.assertTrue(any(r.get("port") == 18777 for r in d.get("rules", [])),
+                        "规则应只落在节点")
+
+        # 5) 节点令牌轮换 → 旧代理 502；更新节点令牌后恢复
+        code, d = self._req(self.baseB, "POST", "/api/fed", {"action": "rotate"}, token=tokB)
+        self.assertEqual(code, 200)
+        new_tok = d["token"]
+        code, _ = self._req(self.baseA, "GET", "/api/fed/%s/api/status" % nid, token=tokA)
+        self.assertEqual(code, 502, "旧令牌应导致代理 502")
+        code, d = self._req(self.baseA, "POST", "/api/fed/nodes/%s" % nid,
+                            {"token": new_tok}, token=tokA)
+        self.assertEqual(code, 200, d)
+        code, d = self._req(self.baseA, "GET", "/api/fed/%s/api/status" % nid, token=tokA)
+        self.assertEqual(code, 200)
+        self.assertEqual(d.get("username"), "fednode")
+
+        # 6) 安全隔离：联邦令牌不能改配置/管节点；列表不带明文
+        code, _ = self._req(self.baseB, "POST", "/api/fed", {"action": "rotate"}, fed=new_tok)
+        self.assertEqual(code, 401, "联邦令牌不应允许 rotate")
+        code, _ = self._req(self.baseA, "GET", "/api/fed/nodes", fed="x")
+        self.assertEqual(code, 401, "节点列表不接受联邦令牌")
+        code, d = self._req(self.baseA, "GET", "/api/fed/nodes", token=tokA)
+        self.assertEqual(code, 200)
+        lst = d.get("nodes", [])
+        self.assertTrue(any(n.get("id") == nid for n in lst))
+        self.assertTrue(all("token" not in n for n in lst), "列表不得返回令牌明文")
+
+        # 7) 删除节点 → 代理 404
+        code, _ = self._req(self.baseA, "DELETE", "/api/fed/nodes/%s" % nid, token=tokA)
+        self.assertEqual(code, 200)
+        code, _ = self._req(self.baseA, "GET", "/api/fed/%s/api/status" % nid, token=tokA)
+        self.assertEqual(code, 404)
+
+        # 8) 关闭联邦令牌
+        code, d = self._req(self.baseB, "POST", "/api/fed", {"action": "clear"}, token=tokB)
+        self.assertEqual(code, 200)
+        code, d = self._req(self.baseB, "GET", "/api/fed", fed=new_tok)
+        self.assertEqual(code, 401, "clear 后令牌应失效")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
