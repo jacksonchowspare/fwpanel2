@@ -628,22 +628,6 @@ tr:hover td { background: var(--panel-solid); }
       </div>
     </div>
 
-    <!-- 流量统计：自绘日期选择面板（深色主题） -->
-    <div id="tr_cal" style="display:none;position:fixed;z-index:9999;width:252px;max-width:calc(100vw - 24px);background:var(--panel-solid);border:1px solid var(--hover-border);border-radius:10px;box-shadow:0 10px 36px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);padding:10px">
-      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
-        <button class="btn mini ghost" onclick="trCal.month(-1)">◀</button>
-        <span id="tr_cal_title" style="display:flex;align-items:center;font-size:13px;font-weight:600"></span>
-        <button class="btn mini ghost" onclick="trCal.month(1)">▶</button>
-      </div>
-      <div style="display:grid;grid-template-columns:repeat(7,1fr);text-align:center;color:var(--muted);font-size:11px;margin-bottom:4px">
-        <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
-      </div>
-      <div id="tr_cal_grid" style="display:grid;grid-template-columns:repeat(7,1fr);gap:2px"></div>
-      <div style="display:flex;gap:8px;margin-top:8px">
-        <button class="btn mini" style="flex:1" onclick="trCal.today()">今天</button>
-        <button class="btn mini ghost" style="flex:1" onclick="trCal.clear()">清除</button>
-      </div>
-    </div>
 
     <div class="panel" data-sec="px">
       <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"/></svg> 反向代理（Nginx）</h2>
@@ -1050,6 +1034,24 @@ tr:hover td { background: var(--panel-solid); }
 </div>
 
 <!-- 服务器节点弹窗（添加/编辑） -->
+<!-- 流量统计:自绘日期选择浮层(随缩放) -->
+    <!-- 流量统计：自绘日期选择面板（深色主题） -->
+    <div id="tr_cal" style="display:none;position:fixed;z-index:9999;width:252px;max-width:calc(100vw - 24px);background:var(--panel-solid);border:1px solid var(--hover-border);border-radius:10px;box-shadow:0 10px 36px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);padding:10px">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+        <button class="btn mini ghost" onclick="trCal.month(-1)">◀</button>
+        <span id="tr_cal_title" style="display:flex;align-items:center;font-size:13px;font-weight:600"></span>
+        <button class="btn mini ghost" onclick="trCal.month(1)">▶</button>
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(7,1fr);text-align:center;color:var(--muted);font-size:11px;margin-bottom:4px">
+        <span>一</span><span>二</span><span>三</span><span>四</span><span>五</span><span>六</span><span>日</span>
+      </div>
+      <div id="tr_cal_grid" style="display:grid;grid-template-columns:repeat(7,1fr);gap:2px"></div>
+      <div style="display:flex;gap:8px;margin-top:8px">
+        <button class="btn mini" style="flex:1" onclick="trCal.today()">今天</button>
+        <button class="btn mini ghost" style="flex:1" onclick="trCal.clear()">清除</button>
+      </div>
+    </div>
+
 <div id="fed_modal" class="modal-mask hidden">
   <div class="modal" style="width:460px">
     <h3 id="fed_modal_title">添加服务器节点</h3>
@@ -1851,6 +1853,8 @@ function applyZoomForce() {
   document.querySelectorAll(".modal-mask > .modal").forEach(e => { e.style.zoom = z; });
   const t = $("toast");
   if (t) t.style.zoom = z;
+  const cal = $("tr_cal");
+  if (cal) cal.style.zoom = z;
   paintZoom();
 }
 function setZoom(v) {
@@ -2213,7 +2217,7 @@ const trCal = {
     this.render();
     const r = el.getBoundingClientRect();
     const cal = $("tr_cal");
-    const w = cal.offsetWidth || 252;
+    const w = cal.getBoundingClientRect().width || 252;
     cal.style.left = Math.max(4, Math.min(r.left, window.innerWidth - w - 4)) + "px";
     cal.style.top = (r.bottom + 6) + "px";
     cal.style.display = "block";
