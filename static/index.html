@@ -1175,6 +1175,7 @@ function fedCardEl(n) {
   met.innerHTML = "<span>状态探测中…</span>";
   card.appendChild(met);
   const btns = document.createElement("div");
+  btns.id = "fed_btns_" + n.id;
   btns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;margin-top:2px";
   const mk = (txt, cls, fn) => { const b = document.createElement("button"); b.className = "btn mini" + (cls ? " " + cls : ""); b.textContent = txt; b.onclick = fn; btns.appendChild(b); };
   mk("管理此节点", "", () => enterFed(n));
@@ -1188,17 +1189,72 @@ async function fedProbeOne(n) {
   try {
     const s = await api("GET", "/api/fed/" + n.id + "/api/status");
     dot.style.background = "#22c55e"; dot.style.boxShadow = "0 0 6px #22c55e";
+    n.version = s.version;
     if (met) met.innerHTML =
       "<span>防火墙：<b style=\"color:var(--text)\">" + (s.loaded ? "已生效" : "未加载") + "</b></span>" +
       "<span>模式：<b style=\"color:var(--text)\">" + (s.mode === "strict" ? "严格" : "宽松") + "</b></span>" +
       "<span>规则：<b style=\"color:var(--text)\">" + s.rule_count + "</b></span>" +
       "<span>封禁：<b style=\"color:var(--text)\">" + (s.banned_count || 0) + "</b></span>" +
       "<span>SSH：<b style=\"color:var(--text)\">" + s.ssh_port + "</b></span>" +
-      "<span>版本：<b style=\"color:var(--text)\">v" + s.version + "</b></span>";
+      "<span>版本：<b id=\"fed_ver_b_" + n.id + "\" style=\"color:var(--text)\">v" + s.version + "</b></span>";
+    fedCheckUpgrade(n);
   } catch (e) {
     dot.style.background = "#ef4444";
     if (met) met.innerHTML = "<span>⛔ 离线或令牌失效：</span><span>" + esc(e.message) + "</span>";
   }
+}
+/* 检测节点是否有新版可升 → 卡片显示升级提示 + 一键升级按钮 */
+async function fedCheckUpgrade(n) {
+  try {
+    const u = await api("GET", "/api/fed/" + n.id + "/api/upgrade/check");
+    if (!u || !u.update_available) return;
+    // 版本标签标橙提示
+    const vb = $("fed_ver_b_" + n.id);
+    if (vb) { vb.style.color = "#f59e0b"; vb.textContent = "v" + u.current + " ⬆ 可升 v" + u.latest; }
+    const box = $("fed_btns_" + n.id);
+    if (!box || $("fed_upbtn_" + n.id)) return;
+    const b = document.createElement("button");
+    b.id = "fed_upbtn_" + n.id;
+    b.className = "btn mini";
+    b.style.cssText = "background:linear-gradient(135deg,#fbbf24,#f59e0b);border:none;color:#1c1917;font-weight:600";
+    b.textContent = "⬆ 一键升级 v" + u.latest;
+    b.onclick = () => fedUpgradeNode(n, u.latest);
+    const first = box.querySelector("button");
+    if (first) box.insertBefore(b, first.nextSibling);
+    else box.appendChild(b);
+  } catch (e) { /* 版本检测失败(网络/节点暂忙)不打扰用户,状态卡仍正常显示 */ }
+}
+/* 一键升级节点:下发指令 → 轮询等待节点重启恢复 → 刷新卡片 */
+async function fedUpgradeNode(n, latest) {
+  confirmPanel("确认升级服务器节点「" + n.name + "」？\n\n将把节点面板一键升级到 v" + (latest || "最新") + "。\n升级过程节点面板会重启（约 10~30 秒），期间该节点暂时不可访问；联邦令牌与全部配置保留，升级完成后自动恢复。", async () => {
+    const btn = $("fed_upbtn_" + n.id), dot = $("fed_dot_" + n.id);
+    if (btn) { btn.disabled = true; btn.textContent = "升级中…"; }
+    if (dot) { dot.style.background = "#f59e0b"; }
+    let versionBefore = n.version;
+    try {
+      try { await api("POST", "/api/fed/" + n.id + "/api/upgrade", { channel: "stable" }); }
+      catch (e) { /* 节点重启导致连接中断属正常,忽略 */ }
+      toast("升级指令已下发，等待节点重启恢复…", "okk");
+      for (let i = 0; i < 20; i++) {          // 最长 ~100s
+        await new Promise(r => setTimeout(r, 5000));
+        try {
+          const st = await api("GET", "/api/fed/" + n.id + "/api/status");
+          if (st && st.version) {
+            n.version = st.version;
+            fedProbeOne(n);
+            renderFedMe();
+            toast("节点已恢复，版本 v" + st.version + (st.version !== versionBefore ? "（升级完成 ✓）" : ""), "okk");
+            return;
+          }
+        } catch (e2) { /* 未恢复,继续等待 */ }
+      }
+      toast("节点升级指令已执行，但等待恢复超时，请稍后手动刷新状态", "err");
+      fedProbeOne(n);
+    } catch (e) {
+      toast(e.message, "err");
+      if (btn) { btn.disabled = false; btn.textContent = "⬆ 一键升级 v" + (latest || ""); }
+    }
+  }, "⬆ 一键升级节点");
 }
 function enterFed(n) {
   fedNode = { id: n.id, name: n.name, url: n.url };
