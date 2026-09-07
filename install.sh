@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="2.1.9"
+readonly SCRIPT_VERSION="2.1.10"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -56,9 +56,9 @@ else
     C_RED=""; C_GREEN=""; C_YELLOW=""; C_BOLD=""; C_RESET=""
 fi
 
-log_info()  { printf '%s[INFO ]%s %s\n' "$C_GREEN" "$C_RESET" "$1"; }
-log_warn()  { printf '%s[WARN ]%s %s\n' "$C_YELLOW" "$C_RESET" "$1"; }
-log_error() { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RESET" "$1"; }
+log_info()  { printf '%s[INFO ]%s %s\n' "$C_GREEN" "$C_RESET" "$1" >&2; }
+log_warn()  { printf '%s[WARN ]%s %s\n' "$C_YELLOW" "$C_RESET" "$1" >&2; }
+log_error() { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RESET" "$1" >&2; }
 
 error() { log_error "$1"; exit 1; }
 
@@ -173,7 +173,7 @@ do_upgrade() {
     fi
     # 三级源回退 + 内容头校验（防镜像返回 HTML 错误页）
     if ! fetch_source "$tmpdir/panel.py" "panel.py"; then
-        log_err "下载 panel.py 失败，请检查服务器网络后重试"
+        log_error "下载 panel.py 失败，请检查服务器网络后重试"
         rm -rf "$tmpdir"
         exit 1
     fi
@@ -230,7 +230,7 @@ do_upgrade() {
     rm -rf "$tmpdir"
     # 语法校验
     if ! python3 -m py_compile "$APP_DIR/panel.py" 2>/dev/null; then
-        log_err "新版本语法错误，正在回滚备份..."
+        log_error "新版本语法错误，正在回滚备份..."
         cp "$bak" "$APP_DIR/panel.py" 2>/dev/null
         exit 1
     fi
