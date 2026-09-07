@@ -120,7 +120,20 @@ body[data-theme="vibes-dark"] .btn:not(.ghost):active {
   box-shadow: 0 1px 0 rgba(4,5,14,.95), 0 4px 10px rgba(var(--btn-glow),.25), inset 0 1px 0 rgba(255,255,255,.1);
 }
 body[data-theme="vibes-dark"] .btn:disabled { box-shadow: none !important; }
-body[data-theme="vibes-dark"] .btn.ghost { box-shadow: none; }
+body[data-theme="vibes-dark"] .btn.ghost {
+  background: rgba(139,92,246,.10);
+  border: var(--bdw) solid rgba(167,139,250,.34);
+  color: #c4b5fd;
+  border-radius: 10px;
+  box-shadow: none;
+}
+body[data-theme="vibes-dark"] .btn.ghost:hover {
+  background: rgba(139,92,246,.18);
+  border-color: rgba(167,139,250,.55);
+  color: #ddd6fe;
+}
+body[data-theme="vibes-dark"] .btn.ghost:active { background: rgba(139,92,246,.24); }
+body[data-theme="vibes-dark"] .btn.ghost:disabled { opacity: .55; box-shadow: none !important; }
 /* 卡片小图标 / 面板标题图标:彩色圆底衬 */
 body[data-theme="vibes-dark"] .cards .card .k .h-ico-sm,
 body[data-theme="vibes-dark"] .panel h2 .h-ico {
