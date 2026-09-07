@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="2.1.10"
+readonly SCRIPT_VERSION="2.1.11"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -162,8 +162,9 @@ check_existing() {
 
 do_upgrade() {
     local tmpdir tag
+    resolve_src_tag          # 父 shell 解析一次,SRC_TAG 全局缓存
     tmpdir=$(mktemp -d)
-    tag="$(src_tag)"
+    tag="$SRC_TAG"
     if [ -n "$VERSION_TAG" ]; then
         log_info "下载指定版本 $tag ..."
     elif [ "$BETA" = "1" ]; then
@@ -399,6 +400,7 @@ download_file() {
 
 # 下载源 tag：--version 指定 > --beta(最新测试版) > 最新正式版(Latest release)；API 失败回退 main
 resolve_src_tag() {
+    [ -n "$SRC_TAG" ] && return 0    # 父 shell 已解析(幂等);命令替换子 shell 里 SRC_TAG 永远为空,不做缓存判断
     if [ -n "$VERSION_TAG" ]; then
         case "$VERSION_TAG" in v*) SRC_TAG="$VERSION_TAG" ;; *) SRC_TAG="v$VERSION_TAG" ;; esac
         return
@@ -432,8 +434,7 @@ except Exception: pass' 2>/dev/null)"
     fi
 }
 src_tag() {
-    [ -z "$SRC_TAG" ] && resolve_src_tag
-    printf '%s' "$SRC_TAG"
+    printf '%s' "${SRC_TAG:-main}"
 }
 
 fetch_source() {
@@ -632,6 +633,7 @@ print_summary() {
 
 do_install() {
     echo "================== $SCRIPT_NAME v$SCRIPT_VERSION =================="
+    resolve_src_tag          # 父 shell 解析一次(正式版/测试版/指定版本)
     check_os; check_root; check_arch; check_tools; check_existing
     resolve_params
     install_deps
