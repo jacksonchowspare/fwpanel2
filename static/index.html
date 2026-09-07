@@ -18,6 +18,19 @@
   font-weight: 600 700; font-style: normal; font-display: swap;
   unicode-range: U+4E00-9FFF, U+3000-303F, U+FF00-FFEF, U+2018-201F, U+00B7;
 }
+/* 0xProto:技术串(IP/端口/规则/令牌/代码)等宽字体,0/O、1/l 零歧义 */
+@font-face {
+  font-family: "0xProto";
+  src: url("/static/fonts/0xProto-Regular.woff2") format("woff2");
+  font-weight: 400; font-style: normal; font-display: swap;
+  unicode-range: U+0000-00FF, U+2000-206F, U+2190-21FF, U+2500-257F, U+00B7;
+}
+@font-face {
+  font-family: "0xProto";
+  src: url("/static/fonts/0xProto-Bold.woff2") format("woff2");
+  font-weight: 600 700; font-style: normal; font-display: swap;
+  unicode-range: U+0000-00FF, U+2000-206F, U+2190-21FF, U+2500-257F, U+00B7;
+}
 :root {
   --bg: #0f1419; --card: #18202b; --border: rgba(255,255,255,.10);
   --text: #e6ebf2; --muted: #8b98a9; --accent: #3d8bfd; --accent2: #22c55e;
@@ -768,7 +781,7 @@ tr:hover td { background: var(--panel-solid); }
       </div>
       <div style="border-top:1px dashed var(--border);margin:0 0 10px"></div>
       <div style="display:flex;align-items:center;font-size:13px;font-weight:600;margin-bottom:8px"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V2h6v2M9 10h6M9 14h6M9 18h4"/></svg> Docker Compose</div>
-      <textarea id="dk_compose" placeholder="粘贴 docker-compose.yml 内容..." style="width:100%;min-height:120px;font-family:monospace;font-size:12px;box-sizing:border-box;margin-bottom:8px"></textarea>
+      <textarea id="dk_compose" placeholder="粘贴 docker-compose.yml 内容..." style="width:100%;min-height:120px;font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;box-sizing:border-box;margin-bottom:8px"></textarea>
       <div class="form-row" style="margin-bottom:8px">
         <input id="dk_compose_folder" placeholder="文件夹名称（留空自动取第一个镜像名，多镜像时建议填写）" style="flex:1;min-width:200px">
         <button class="btn" onclick="composeUp()">Compose 启动</button>
@@ -1058,8 +1071,8 @@ tr:hover td { background: var(--panel-solid); }
     <h3 id="fed_modal_title">添加服务器节点</h3>
     <input type="hidden" id="fed_eid">
     <div class="form-row"><input id="fed_name" placeholder="名称（如：London / 新加坡1）" maxlength="40"></div>
-    <div class="form-row"><input id="fed_url" placeholder="节点面板地址 https://node.example.com" style="font-family:monospace"></div>
-    <div class="form-row"><input id="fed_token" placeholder="节点联邦令牌" style="font-family:monospace"></div>
+    <div class="form-row"><input id="fed_url" placeholder="节点面板地址 https://node.example.com" style="font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"></div>
+    <div class="form-row"><input id="fed_token" placeholder="节点联邦令牌" style="font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"></div>
     <div style="color:var(--muted);font-size:12px;margin-bottom:12px;line-height:1.7" id="fed_modal_hint">
       令牌在节点面板「服务器 → 本机联邦令牌 → 开启并生成令牌」获取。<b>编辑时令牌留空 = 保持不变</b>。
     </div>
@@ -1074,7 +1087,7 @@ tr:hover td { background: var(--panel-solid); }
 <div id="fedtok_modal" class="modal-mask hidden">
   <div class="modal" style="width:520px">
     <h3>🔑 联邦令牌已生成</h3>
-    <div style="background:var(--input-bg,#123);border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-family:monospace;font-size:13px;word-break:break-all;margin-bottom:6px;color:var(--accent);line-height:1.6" id="fed_tok_text">-</div>
+    <div style="background:var(--input-bg,#123);border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;word-break:break-all;margin-bottom:6px;color:var(--accent);line-height:1.6" id="fed_tok_text">-</div>
     <div style="color:#eab308;font-size:12px;line-height:1.7;margin-bottom:12px">⚠ 令牌仅显示这一次，关闭后无法再查看；丢失只能重置（旧令牌即刻失效）。</div>
     <div style="display:flex;justify-content:space-between;align-items:center">
       <span style="color:var(--muted);font-size:12px">其他主面板添加本机时粘贴此令牌</span>
@@ -2737,7 +2750,7 @@ async function loadSshKeys() {
       `<div style="display:flex;align-items:center;gap:8px;padding:7px 0;border-bottom:1px dashed var(--border);font-size:12px">
         <span style="color:var(--accent);font-weight:600;white-space:nowrap">${esc(k.type)}</span>
         <span style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">
-          ${k.fp ? '<span style="font-family:monospace">' + esc(k.fp) + '</span> ' : ""}${esc(k.comment) || '<span style="color:var(--muted)">（无备注）</span>'}
+          ${k.fp ? '<span style="font-family:\'0xProto\',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace">' + esc(k.fp) + '</span> ' : ""}${esc(k.comment) || '<span style="color:var(--muted)">（无备注）</span>'}
         </span>
         <button class="btn mini danger" onclick="delSshKey(${i})">删除</button>
       </div>`).join("");
@@ -2776,7 +2789,7 @@ function showKeyResult(d) {
   const ta = document.createElement("textarea");
   ta.id = "priv_key_box";
   ta.readOnly = true;
-  ta.style.cssText = "width:100%;height:150px;font-family:monospace;font-size:11px;box-sizing:border-box;resize:vertical";
+  ta.style.cssText = "width:100%;height:150px;font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:11px;box-sizing:border-box;resize:vertical";
   ta.value = d.private_key;
   const bar = document.createElement("div");
   bar.style.cssText = "margin-top:8px;display:flex;gap:8px;align-items:center;flex-wrap:wrap";
@@ -3391,7 +3404,7 @@ async function dkLogs(id) {
   try {
     const d = await api("GET", "/api/docker/logs/" + id);
     const el = document.createElement("div");
-    el.style.cssText = "max-height:400px;overflow:auto;background:var(--input-bg);border:1px solid var(--border);border-radius:var(--r-sm);padding:10px;font-family:monospace;font-size:12px;white-space:pre-wrap;word-break:break-all";
+    el.style.cssText = "max-height:400px;overflow:auto;background:var(--input-bg);border:1px solid var(--border);border-radius:var(--r-sm);padding:10px;font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12px;white-space:pre-wrap;word-break:break-all";
     el.textContent = d.logs || "（无日志）";
     confirmPanel("", () => { closeCfm(); }, "📜 容器日志", el);
   } catch (e) { toast(e.message, "err"); }
