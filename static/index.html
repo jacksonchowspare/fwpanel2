@@ -2853,12 +2853,21 @@ function renderUpgradeUi(d) {
     btnCheck.style.display = "none";
     btnUp.style.display = stableOk ? "inline-block" : "none";
     btnUp.disabled = false;
-    // 双通道并存时按钮缩为短词防换行撑卡(版本号已在上方文案行)
-    btnUp.textContent = (stableOk && betaOk) ? "⬆ 升正式版" : "⬆ 升级正式版";
-    btnUp.title = "升级到正式版 v" + (d.latest || "");
     btnBeta.style.display = betaOk ? "inline-block" : "none";
     btnBeta.disabled = false;
-    btnBeta.textContent = (stableOk && betaOk) ? "升测试版" : "⬆ 升级测试版 v" + betaTag;
+    if (stableOk && betaOk) {
+      // 双通道:先按完整文案渲染,若实测单行放不下(换行)则自动降级短词,保证不撑卡
+      btnUp.textContent = "⬆ 升级正式版";
+      btnBeta.textContent = "⬆ 升级测试版";
+      if (btnBeta.offsetTop > btnUp.offsetTop) {
+        btnUp.textContent = "⬆ 升正式版";
+        btnBeta.textContent = "升测试版";
+      }
+    } else {
+      btnUp.textContent = stableOk ? "⬆ 升级正式版" : "";
+      btnBeta.textContent = betaOk ? "⬆ 升级测试版 v" + betaTag : "";
+    }
+    btnUp.title = "升级到正式版 v" + (d.latest || "");
     btnBeta.title = "升级到测试版 v" + betaTag + "(尝鲜通道)";
   } else {
     btnCheck.style.display = "inline-block";
