@@ -15,11 +15,15 @@
 
 ## 一键安装 / 升级
 
-```bash
-# 安装 / 升级【最新正式版】(稳定通道,推荐)
-curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash
+**安装 / 升级【最新正式版】(稳定通道,推荐):**
 
-# 安装 / 升级【最新测试版】(尝鲜通道,功能未充分验证)
+```bash
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash
+```
+
+**安装 / 升级【最新测试版】(尝鲜通道,功能未充分验证):**
+
+```bash
 curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --beta
 ```
 
