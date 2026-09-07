@@ -1206,11 +1206,16 @@ class TestAPI(unittest.TestCase):
                             {"username": TEST_USER, "password": "NewPass123"})
         self.assertEqual(code, 200)
         token = d["token"]
-        real_pre, real_latest, real_perform = panel.get_latest_prerelease, panel.get_latest_version, panel.perform_upgrade
+        real_pre, real_perform = panel.get_latest_prerelease, panel.perform_upgrade
+        real_http = panel.http_get_json
         cur = [int(x) for x in panel.CURRENT_VERSION.split(".")]
         nxt = "%d.%d.%d" % (cur[0], cur[1], cur[2] + 1)   # 始终高于当前版本，升版免维护
-        panel.get_latest_version = lambda: "1.25.1"
         panel.get_latest_prerelease = lambda: nxt
+        # _api_upgrade_check 现直接请求 releases 列表:mock 返回 [最新 beta nxt, 最新正式 1.25.1]
+        panel.http_get_json = lambda url, timeout=15: [
+            {"tag_name": "v" + nxt, "prerelease": True},
+            {"tag_name": "v1.25.1", "prerelease": False},
+        ]
         called = {}
 
         def fake_perform(tag=None):
@@ -1236,7 +1241,8 @@ class TestAPI(unittest.TestCase):
             code, d = self._req("POST", "/api/upgrade", {"channel": "beta"}, token=token)
             self.assertEqual(code, 400)
         finally:
-            panel.get_latest_prerelease, panel.get_latest_version, panel.perform_upgrade = real_pre, real_latest, real_perform
+            panel.get_latest_prerelease, panel.perform_upgrade = real_pre, real_perform
+            panel.http_get_json = real_http
 
     def test_ipv6_mode(self):
         """IPv6 模式设置：sysctl.d + gai.conf 写入（隔离路径）"""
@@ -1418,8 +1424,8 @@ class TestAPI(unittest.TestCase):
                             {"username": TEST_USER, "password": "NewPass123"})
         self.assertEqual(code, 200)
         token = d["token"]
-        real = panel.get_latest_version
-        panel.get_latest_version = lambda: "9.9.9"
+        real = panel.http_get_json
+        panel.http_get_json = lambda url, timeout=15: [{"tag_name": "v9.9.9", "prerelease": False}]
         try:
             code, d = self._req("GET", "/api/upgrade/check", token=token)
             self.assertEqual(code, 200)
@@ -1430,7 +1436,7 @@ class TestAPI(unittest.TestCase):
             code, _ = self._req("GET", "/api/upgrade/check")
             self.assertEqual(code, 401)
         finally:
-            panel.get_latest_version = real
+            panel.http_get_json = real
 
     def test_full_flow(self):
         # 未登录访问被拒

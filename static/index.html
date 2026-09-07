@@ -1218,7 +1218,10 @@ async function fedCheckUpgrade(n) {
     if (!u) return;
     const cur = u.current || "";
     const stableOk = u.update_available && u.latest && vcmp(u.latest, cur) > 0;            // 正式版可升
-    const betaOk = u.prerelease && u.prerelease.update_available && u.prerelease.tag && vcmp(u.prerelease.tag, cur) > 0;  // 测试版可升
+    const betaTag = (u.prerelease && u.prerelease.tag) || "";
+    // 测试版可升:比当前新,且比正式版还新(或无正式版可升)——测试版不比正式版新时不显示
+    const betaOk = !!(u.prerelease && u.prerelease.update_available && betaTag && vcmp(betaTag, cur) > 0 &&
+                      (!stableOk || vcmp(betaTag, u.latest || "") > 0));
     if (!stableOk && !betaOk) return;
     // 版本标签标橙提示
     const vb = $("fed_ver_b_" + n.id);
@@ -1302,6 +1305,7 @@ async function fedUpgradeNode(n, latest, channel) {
 function enterFed(n) {
   fedNode = { id: n.id, name: n.name, url: n.url };
   API = "/api/fed/" + n.id;
+  upgradeInfo = null; lastUpgradeCheck = 0;   // 升级信息切到节点,丢弃本机缓存
   $("fed_banner_name").textContent = n.name;
   $("fed_banner_url").textContent = n.url;
   $("fed_banner").classList.remove("hidden");
@@ -1315,6 +1319,7 @@ function enterFed(n) {
 }
 function exitFed() {
   fedNode = null; API = "";
+  upgradeInfo = null; lastUpgradeCheck = 0;   // 回本机,升级信息重新按本机检测
   $("fed_banner").classList.add("hidden");
   setFedTabsTop();
   $("btn_fed").style.display = ""; $("tab_fed").style.display = "";
@@ -1339,7 +1344,11 @@ async function refreshStatusCards() {
     $("st_banned").textContent = status.banned_count || 0;
     $("st_ssh").textContent = status.ssh_port;
     $("st_srvip").textContent = status.server_ip || "未获取";
-    $("st_ver").textContent = "v" + status.version;
+  const _ui = (typeof upgradeInfo !== "undefined") ? upgradeInfo : null;
+  let _chan = "";
+  if (_ui && _ui.current_channel === "beta") _chan = " 测试版";
+  else if (_ui && _ui.current_channel === "stable") _chan = " 正式版";
+  $("st_ver").textContent = "v" + status.version + _chan;
     $("panel_port_input").value = status.panel_port || "";
   } catch (e) { if (e.message !== "未登录") toast(e.message, "err"); }
 }
@@ -2557,14 +2566,27 @@ async function setFw(on) {
 let upgradeInfo = null;
 let lastUpgradeCheck = 0;
 function renderUpgradeUi(d) {
-  $("st_latest").textContent = d.update_available ? `新版 v${d.latest}` : "已是最新";
-  $("btn_upgrade").disabled = !d.update_available;
+  const cur = d.current || "";
+  // 当前版本通道标签(正式版/测试版)
+  const vEl = $("st_ver");
+  const chan = d.current_channel === "beta" ? " 测试版" : (d.current_channel === "stable" ? " 正式版" : "");
+  if (vEl && cur) vEl.textContent = "v" + cur + chan;
+  // 正式版(稳定)通道为主:检查更新只报正式版
+  const stableOk = !!(d.update_available && d.latest && vcmp(d.latest, cur) > 0);
   const beta = d.prerelease;
+  const betaTag = (beta && beta.tag) || "";
+  // 测试版入口:比当前新,且(无正式版可升 或 比正式版还新)——测试版不比正式版新时不显示
+  const betaOk = !!(beta && beta.update_available && betaTag && vcmp(betaTag, cur) > 0 &&
+                    (!stableOk || vcmp(betaTag, d.latest || "") > 0));
+  $("st_latest").textContent = stableOk ? "发现新正式版 v" + d.latest : "已是最新正式版";
+  const btnUp = $("btn_upgrade");
+  btnUp.disabled = !stableOk;
+  btnUp.textContent = stableOk ? "一键升级正式版 v" + d.latest : "升级";
   const btnBeta = $("btn_upgrade_beta");
-  if (beta) {
+  if (betaOk) {
     btnBeta.style.display = "inline-block";
-    btnBeta.disabled = !beta.update_available;
-    btnBeta.textContent = beta.update_available ? `升级测试版 v${beta.tag}` : `测试版 v${beta.tag}（已是最新）`;
+    btnBeta.disabled = false;
+    btnBeta.textContent = "⬆ 升级测试版 v" + betaTag;
   } else {
     btnBeta.style.display = "none";
   }
@@ -2577,17 +2599,17 @@ async function checkUpgrade() {
     const d = await api("GET", "/api/upgrade/check");
     upgradeInfo = d;
     renderUpgradeUi(d);
-    if (d.update_available) toast(`发现新版本 v${d.latest}，可一键升级`, "okk");
+    if (d.update_available) toast("发现新正式版 v" + d.latest + "，可一键升级", "okk");
   } catch (e) { toast("检查更新失败: " + e.message, "err"); }
 }
-/* 登录后自动检测（带 60 秒节流，不阻塞页面） */
+/* 登录后自动检测（带 60 秒节流，不阻塞页面）；只报告正式版，测试版由橙色按钮自行呈现 */
 async function autoCheckUpgrade() {
   if (!upgradeInfo && Date.now() - lastUpgradeCheck < 60000) return;
   try {
     const d = await api("GET", "/api/upgrade/check");
     upgradeInfo = d;
     renderUpgradeUi(d);
-    if (d.update_available) toast(`发现新版本 v${d.latest}，可一键升级`, "okk");
+    if (d.update_available) toast("发现新正式版 v" + d.latest + "，可一键升级", "okk");
   } catch (e) { /* 网络失败静默，手动可重试 */ }
 }
 async function doUpgrade() {

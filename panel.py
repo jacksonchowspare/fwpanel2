@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.0.5"
+CURRENT_VERSION = "2.0.6"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -3709,21 +3709,42 @@ class PanelHandler(BaseHTTPRequestHandler):
         token = self._require_auth()
         if token is None:
             return
-        latest = get_latest_version()
-        if latest is None:
+        cur = CURRENT_VERSION
+        rels = http_get_json(
+            "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=15", timeout=15)
+        stable_latest = beta_latest = current_channel = None
+        if isinstance(rels, list):
+            beta_tags = []
+            for r in rels:
+                tag = str(r.get("tag_name", "")).lstrip("v")
+                if not tag:
+                    continue
+                if current_channel is None and tag == cur:
+                    current_channel = "beta" if r.get("prerelease") else "stable"
+                if r.get("prerelease"):
+                    beta_tags.append(tag)
+                elif stable_latest is None:
+                    stable_latest = tag
+            if beta_tags:
+                beta_latest = max(beta_tags, key=lambda v: tuple(int(p) for p in v.split(".") if p.isdigit()))
+        else:
+            # GitHub 列表不可达时退到旧双接口(此时无法判定 current 通道)
+            stable_latest = get_latest_version()
+            beta_latest = get_latest_prerelease()
+        if stable_latest is None and beta_latest is None:
             self._send(502, {"error": "无法连接版本服务器，请稍后再试"})
             return
-        pre = get_latest_prerelease()
         prerelease_info = None
-        if pre:
+        if beta_latest:
             prerelease_info = {
-                "tag": pre,
-                "update_available": version_gt(pre, CURRENT_VERSION),
+                "tag": beta_latest,
+                "update_available": version_gt(beta_latest, cur),
             }
         self._send(200, {
-            "current": CURRENT_VERSION,
-            "latest": latest,
-            "update_available": version_gt(latest, CURRENT_VERSION),
+            "current": cur,
+            "current_channel": current_channel,   # stable=正式版 / beta=测试版 / None=未知
+            "latest": stable_latest,
+            "update_available": bool(stable_latest) and version_gt(stable_latest, cur),
             "prerelease": prerelease_info,
         })
 
