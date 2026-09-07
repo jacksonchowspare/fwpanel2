@@ -245,10 +245,19 @@ tr:hover td { background: var(--panel-solid); }
       </div>
       <div class="actions">
         <button class="btn ghost" id="btn_theme" onclick="toggleTheme()">白天模式</button>
+        <button class="btn ghost" id="btn_fed" onclick="switchTab('fed')">🌐 服务器</button>
         <button class="btn ghost" onclick="openPwd()">修改密码</button>
         <button class="btn ghost" id="btn_restart" onclick="restartPanel()">重启面板</button>
         <button class="btn ghost" onclick="logout()">退出</button>
       </div>
+    </div>
+
+    <!-- 远程管理横幅(2.0 联邦) -->
+    <div id="fed_banner" class="hidden" style="align-items:center;gap:10px;flex-wrap:wrap;background:linear-gradient(135deg,rgba(61,139,253,.16),rgba(34,197,94,.10));border:1px solid var(--border);border-radius:12px;padding:9px 14px;margin:14px 0 2px;font-size:13px">
+      <span>🌐 正在远程管理 <b id="fed_banner_name" style="color:var(--accent)">-</b></span>
+      <span style="color:var(--muted);font-size:12px;word-break:break-all" id="fed_banner_url"></span>
+      <span style="flex:1"></span>
+      <button class="btn mini" onclick="exitFed()">↩ 返回本机</button>
     </div>
 
     <div class="cards">
@@ -292,6 +301,7 @@ tr:hover td { background: var(--panel-solid); }
       <button class="tab" data-tab="ssh" onclick="switchTab('ssh')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg> SSH 安全</button>
       <button class="tab" data-tab="px" onclick="switchTab('px')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"/></svg> 反代证书</button>
       <button class="tab" data-tab="dk" onclick="switchTab('dk')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg> Docker</button>
+      <button class="tab" id="tab_fed" data-tab="fed" onclick="switchTab('fed')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 18v3M7 8h.01M11 8h.01M15 8h.01"/></svg> 服务器</button>
     </div>
     <div class="panel" data-sec="overview">
       <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 20h18M7 20v-6M12 20V7M17 20v-9"/></svg> 网卡流量统计</h2>
@@ -786,6 +796,64 @@ tr:hover td { background: var(--panel-solid); }
         <button class="btn mini ghost" onclick="rulePageGo(1)" id="rule_next">下一页</button>
       </div>
     </div>
+
+    <!-- 服务器管理（2.0 联邦） -->
+    <div class="panel" data-sec="fed">
+      <h2 style="margin-bottom:4px"><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg> 服务器管理</h2>
+      <div style="color:var(--muted);font-size:12px;margin:0 0 14px;line-height:1.7">
+        在主面板登录一次，即可 HTTPS 管理所有已接入的服务器节点（全功能）。被管节点需 2.0+，并在其「服务器 → 本机联邦令牌」处开启；添加时主面板会立即校验地址与令牌。
+      </div>
+      <div class="form-row" style="flex-wrap:wrap;gap:8px;margin-bottom:8px">
+        <button class="btn" onclick="openAddFed()">＋ 添加服务器节点</button>
+        <button class="btn ghost" onclick="fedForceRefresh()">刷新状态</button>
+      </div>
+      <div id="fed_cards" style="display:flex;flex-direction:column;gap:10px"></div>
+
+      <div style="border-top:1px dashed var(--border);margin:18px 0 12px"></div>
+      <div style="display:flex;align-items:center;font-size:13px;font-weight:600;margin-bottom:6px"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> 本机联邦令牌（本机作为节点被其他面板管理）</div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
+        <span style="color:var(--muted);font-size:12px">状态：</span>
+        <span id="fed_me_state" style="font-size:13px;font-weight:600">-</span>
+        <button class="btn mini" id="btn_fed_on" style="display:none" onclick="rotateFedToken()">开启并生成令牌</button>
+        <button class="btn mini" id="btn_fed_reset" style="display:none" onclick="rotateFedToken()">重置令牌</button>
+        <button class="btn mini danger" id="btn_fed_off" style="display:none" onclick="clearFedToken()">关闭令牌</button>
+      </div>
+      <div id="fed_me_hint" style="color:var(--muted);font-size:12px;margin-top:6px;line-height:1.7">其他主面板添加本机时，填本机面板的 https 访问地址 + 上面生成的令牌。令牌只显示一次，丢失请重置。</div>
+    </div>
+  </div>
+</div>
+
+<!-- 服务器节点弹窗（添加/编辑） -->
+<div id="fed_modal" class="modal-mask hidden">
+  <div class="modal" style="width:460px">
+    <h3 id="fed_modal_title">添加服务器节点</h3>
+    <input type="hidden" id="fed_eid">
+    <div class="form-row"><input id="fed_name" placeholder="名称（如：London / 新加坡1）" maxlength="40"></div>
+    <div class="form-row"><input id="fed_url" placeholder="节点面板地址 https://node.example.com" style="font-family:monospace"></div>
+    <div class="form-row"><input id="fed_token" placeholder="节点联邦令牌" style="font-family:monospace"></div>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:12px;line-height:1.7" id="fed_modal_hint">
+      令牌在节点面板「服务器 → 本机联邦令牌 → 开启并生成令牌」获取。<b>编辑时令牌留空 = 保持不变</b>。
+    </div>
+    <div class="btnrow">
+      <button class="btn ghost" onclick="closeFedModal()">取消</button>
+      <button class="btn" onclick="saveFedNode()">校验并保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 联邦令牌一次性展示 -->
+<div id="fedtok_modal" class="modal-mask hidden">
+  <div class="modal" style="width:520px">
+    <h3>🔑 联邦令牌已生成</h3>
+    <div style="background:var(--input-bg,#123);border:1px solid var(--border);border-radius:8px;padding:12px 14px;font-family:monospace;font-size:13px;word-break:break-all;margin-bottom:6px;color:var(--accent);line-height:1.6" id="fed_tok_text">-</div>
+    <div style="color:#eab308;font-size:12px;line-height:1.7;margin-bottom:12px">⚠ 令牌仅显示这一次，关闭后无法再查看；丢失只能重置（旧令牌即刻失效）。</div>
+    <div style="display:flex;justify-content:space-between;align-items:center">
+      <span style="color:var(--muted);font-size:12px">其他主面板添加本机时粘贴此令牌</span>
+      <span>
+        <button class="btn mini ghost" onclick="closeFedTok()">关闭</button>
+        <button class="btn mini" onclick="copyFedTok()">复制令牌</button>
+      </span>
+    </div>
   </div>
 </div>
 
@@ -881,9 +949,11 @@ tr:hover td { background: var(--panel-solid); }
 </div>
 
 <script>
-const API = "";
+let API = "";
 let token = localStorage.getItem("fw_token") || "";
 let status = {};
+let fedNode = null;          // 当前远程管理节点 {id,name,url}
+let fedLoaded = false;       // 服务器 tab 是否已渲染
 
 function $(id) { return document.getElementById(id); }
 function toast(msg, type) {
@@ -923,7 +993,14 @@ async function api(method, path, body) {
 }
 
 /* ---------- 登录 ---------- */
-function showLogin() { $("login").classList.remove("hidden"); $("main").classList.add("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "inline-block"; }
+function fedUiReset() {
+  fedNode = null; API = "";
+  const b = $("fed_banner"); if (b) b.classList.add("hidden");
+  const bb = $("btn_fed"); if (bb) bb.style.display = "";
+  const tf = $("tab_fed"); if (tf) tf.style.display = "";
+  fedLoaded = false;
+}
+function showLogin() { fedUiReset(); $("login").classList.remove("hidden"); $("main").classList.add("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "inline-block"; }
 function showMain()  { $("login").classList.add("hidden"); $("main").classList.remove("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "none"; }
 async function login() {
   try {
@@ -975,11 +1052,170 @@ async function restartPanel() {
   }, "🔄 重启面板");
 }
 
+/* ---------- 服务器管理（2.0 联邦） ---------- */
+function openAddFed() {
+  $("fed_modal_title").textContent = "添加服务器节点";
+  $("fed_eid").value = "";
+  $("fed_name").value = ""; $("fed_url").value = ""; $("fed_token").value = "";
+  $("fed_modal_hint").innerHTML = "令牌在节点面板「服务器 → 本机联邦令牌 → 开启并生成令牌」获取，只显示一次。";
+  $("fed_modal").classList.remove("hidden");
+}
+function openEditFed(id, name, url) {
+  $("fed_modal_title").textContent = "编辑服务器节点";
+  $("fed_eid").value = id;
+  $("fed_name").value = name; $("fed_url").value = url; $("fed_token").value = "";
+  $("fed_modal_hint").innerHTML = "令牌留空 = 保持不变；填入新令牌会立即校验并替换（节点重置令牌后在这里更新）。";
+  $("fed_modal").classList.remove("hidden");
+}
+function closeFedModal() { $("fed_modal").classList.add("hidden"); }
+async function saveFedNode() {
+  const name = $("fed_name").value.trim(), url = $("fed_url").value.trim(), tok = $("fed_token").value.trim();
+  const eid = $("fed_eid").value;
+  if (!name || !url || (!eid && !tok)) { toast("请填写完整：名称、地址；新增时还需令牌", "err"); return; }
+  try {
+    if (eid) {
+      await api("POST", "/api/fed/nodes/" + eid, { name, url, token: tok || undefined });
+      toast("节点已更新 ✓", "okk");
+    } else {
+      await api("POST", "/api/fed/nodes", { name, url, token: tok });
+      toast("节点已接入 ✓", "okk");
+    }
+    closeFedModal(); renderFed();
+  } catch (e) { toast(e.message, "err"); }
+}
+function delFedNode(id, name) {
+  confirmPanel("确认删除服务器节点「" + name + "」？\n\n仅移除主面板上的接入配置，不影响节点本身。", async () => {
+    try { await api("DELETE", "/api/fed/nodes/" + id); toast("已删除节点", "okk"); renderFed(); }
+    catch (e) { toast(e.message, "err"); }
+  }, "🗑 删除节点");
+}
+function rotateFedToken() {
+  confirmPanel("开启 / 重置本机联邦令牌？\n\n旧令牌（如有）立即失效——若已被其他主面板接入，需去那边同步更新令牌。", async () => {
+    try {
+      const d = await api("POST", "/api/fed", { action: "rotate" });
+      $("fed_tok_text").textContent = d.token;
+      $("fedtok_modal").classList.remove("hidden");
+      renderFedMe();
+    } catch (e) { toast(e.message, "err"); }
+  }, "🔑 生成联邦令牌");
+}
+function clearFedToken() {
+  confirmPanel("确认关闭本机联邦令牌？\n\n关闭后其他主面板将无法管理本机（已接入的也会立即失效）。", async () => {
+    try { await api("POST", "/api/fed", { action: "clear" }); toast("联邦令牌已关闭", "okk"); renderFedMe(); }
+    catch (e) { toast(e.message, "err"); }
+  }, "⛔ 关闭联邦令牌");
+}
+function closeFedTok() { $("fedtok_modal").classList.add("hidden"); }
+function copyFedTok() {
+  const t = $("fed_tok_text").textContent.trim();
+  if (!t || t === "-") return;
+  const done = () => toast("令牌已复制", "okk");
+  const fail = () => toast("复制失败，请手动选择复制", "err");
+  if (navigator.clipboard && window.isSecureContext) navigator.clipboard.writeText(t).then(done).catch(() => fallbackCopy(t, done, fail));
+  else fallbackCopy(t, done, fail);
+}
+async function renderFedMe() {
+  try {
+    const d = await api("GET", "/api/fed");
+    const st = $("fed_me_state");
+    st.textContent = d.fed_enabled ? "🟢 已开启" : "⚪ 未开启";
+    st.className = d.fed_enabled ? "v ok" : "v off";
+    $("btn_fed_on").style.display = d.fed_enabled ? "none" : "inline-block";
+    $("btn_fed_reset").style.display = d.fed_enabled ? "inline-block" : "none";
+    $("btn_fed_off").style.display = d.fed_enabled ? "inline-block" : "none";
+  } catch (e) { if (e.message !== "未登录") toast(e.message, "err"); }
+}
+async function renderFed() {
+  fedLoaded = true;
+  try {
+    renderFedMe();
+    const d = await api("GET", "/api/fed/nodes");
+    const box = $("fed_cards");
+    box.innerHTML = "";
+    if (!d.nodes.length) {
+      box.innerHTML = '<div class="empty" style="padding:26px 0">尚未接入任何节点 —— 点「添加服务器节点」，填另一台机器面板的 https 地址和它的联邦令牌</div>';
+      return;
+    }
+    d.nodes.forEach(n => box.appendChild(fedCardEl(n)));
+    d.nodes.forEach(n => fedProbeOne(n));
+  } catch (e) { if (e.message !== "未登录") toast(e.message, "err"); }
+}
+function fedForceRefresh() { renderFed(); }
+function fedCardEl(n) {
+  const card = document.createElement("div");
+  card.className = "card";
+  card.style.padding = "12px 14px";
+  const top = document.createElement("div");
+  top.style.cssText = "display:flex;align-items:center;gap:8px;flex-wrap:wrap";
+  const dot = document.createElement("span");
+  dot.id = "fed_dot_" + n.id;
+  dot.style.cssText = "width:8px;height:8px;border-radius:50%;background:#64748b;flex:none";
+  top.appendChild(dot);
+  const nm = document.createElement("b"); nm.style.fontSize = "14px"; nm.textContent = n.name; top.appendChild(nm);
+  const ur = document.createElement("span");
+  ur.style.cssText = "color:var(--muted);font-size:12px;word-break:break-all;min-width:0"; ur.textContent = n.url;
+  top.appendChild(ur);
+  const sp = document.createElement("span"); sp.style.flex = "1"; top.appendChild(sp);
+  card.appendChild(top);
+  const met = document.createElement("div");
+  met.id = "fed_met_" + n.id;
+  met.style.cssText = "display:flex;gap:16px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin:9px 0 10px;line-height:1.6";
+  met.innerHTML = "<span>状态探测中…</span>";
+  card.appendChild(met);
+  const btns = document.createElement("div");
+  btns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap";
+  const mk = (txt, cls, fn) => { const b = document.createElement("button"); b.className = "btn mini" + (cls ? " " + cls : ""); b.textContent = txt; b.onclick = fn; btns.appendChild(b); };
+  mk("管理此节点", "", () => enterFed(n));
+  mk("编辑", "ghost", () => openEditFed(n.id, n.name, n.url));
+  mk("删除", "danger", () => delFedNode(n.id, n.name));
+  card.appendChild(btns);
+  return card;
+}
+async function fedProbeOne(n) {
+  const dot = $("fed_dot_" + n.id), met = $("fed_met_" + n.id);
+  try {
+    const s = await api("GET", "/api/fed/" + n.id + "/api/status");
+    dot.style.background = "#22c55e"; dot.style.boxShadow = "0 0 6px #22c55e";
+    if (met) met.innerHTML =
+      "<span>防火墙：<b style=\"color:var(--text)\">" + (s.loaded ? "已生效" : "未加载") + "</b></span>" +
+      "<span>模式：<b style=\"color:var(--text)\">" + (s.mode === "strict" ? "严格" : "宽松") + "</b></span>" +
+      "<span>规则：<b style=\"color:var(--text)\">" + s.rule_count + "</b></span>" +
+      "<span>封禁：<b style=\"color:var(--text)\">" + (s.banned_count || 0) + "</b></span>" +
+      "<span>SSH：<b style=\"color:var(--text)\">" + s.ssh_port + "</b></span>" +
+      "<span>版本：<b style=\"color:var(--text)\">v" + s.version + "</b></span>";
+  } catch (e) {
+    dot.style.background = "#ef4444";
+    if (met) met.innerHTML = "<span>⛔ 离线或令牌失效：</span><span>" + esc(e.message) + "</span>";
+  }
+}
+function enterFed(n) {
+  fedNode = { id: n.id, name: n.name, url: n.url };
+  API = "/api/fed/" + n.id;
+  $("fed_banner_name").textContent = n.name;
+  $("fed_banner_url").textContent = n.url;
+  $("fed_banner").classList.remove("hidden");
+  $("btn_fed").style.display = "none";
+  $("tab_fed").style.display = "none";
+  const saved = localStorage.getItem("fw_sec");
+  switchTab(saved && ["overview", "fw", "ssh", "px", "dk"].indexOf(saved) >= 0 ? saved : "overview");
+  refreshAll();
+  toast("已进入远程管理：" + n.name, "okk");
+}
+function exitFed() {
+  fedNode = null; API = "";
+  $("fed_banner").classList.add("hidden");
+  $("btn_fed").style.display = ""; $("tab_fed").style.display = "";
+  switchTab("fed");
+  renderFed();
+  refreshAll();
+  toast("已返回本机", "okk");
+}
+
 /* ---------- 状态 ---------- */
 async function refreshStatusCards() {
   try {
     status = await api("GET", "/api/status");
-    $("sub_title").textContent = (status.distro || "Linux") + " · nftables 简易VPS管理面板2.0";
+    $("sub_title").textContent = (fedNode ? "🌐 " + fedNode.name + " · " : "") + (status.distro || "Linux") + " · nftables 简易VPS管理面板2.0";
     $("st_fw").textContent = status.loaded ? "已生效" : "未加载";
     $("st_fw").className = "v " + (status.loaded ? "ok" : "off");
     $("btn_fw_on").style.display = status.loaded ? "none" : "inline-block";
@@ -1194,6 +1430,7 @@ setTheme(localStorage.getItem("fw_theme") === "light" ? "light" : "dark");
 
 /* ---------- 分组导航 tabs ---------- */
 function switchTab(sec) {
+  if (fedNode && sec === "fed") { toast("远程模式下请先返回本机", "err"); return; }
   localStorage.setItem("fw_sec", sec);
   document.querySelectorAll("#main [data-sec]").forEach(el => {
     el.style.display = el.dataset.sec === sec ? "" : "none";
@@ -1201,10 +1438,11 @@ function switchTab(sec) {
   document.querySelectorAll("#sec_tabs .tab").forEach(b => {
     b.classList.toggle("active", b.dataset.tab === sec);
   });
+  if (sec === "fed" && !fedLoaded) renderFed();
 }
 (function initSec() {
   const saved = localStorage.getItem("fw_sec");
-  switchTab(saved && ["overview", "fw", "ssh", "px", "dk"].indexOf(saved) >= 0 ? saved : "overview");
+  switchTab(saved && ["overview", "fw", "ssh", "px", "dk", "fed"].indexOf(saved) >= 0 ? saved : "overview");
 })();
 
 /* ---------- 网卡流量统计 ---------- */

@@ -446,6 +446,63 @@ class Auth:
     def logout(self, token):
         self.tokens.pop(token, None)
 
+    # ---------- 联邦令牌（2.0 多机管理：节点接受 X-Fwpanel-Token） ----------
+    def fed_enabled(self):
+        return bool(self.config.get("fed_hash"))
+
+    def check_fed(self, fed_token):
+        stored = self.config.get("fed_hash")
+        if not stored or not fed_token:
+            return False
+        return hmac.compare_digest(sha256_hex(fed_token), stored)
+
+    def set_fed_token(self, raw_token):
+        """开启/更新联邦令牌（存哈希，明文仅生成时返回一次）"""
+        self.config.set("fed_hash", sha256_hex(raw_token))
+
+    def clear_fed_token(self):
+        self.config.set("fed_hash", "")
+
+
+# ------------------------------- 联邦存储（主面板侧节点配置） -------------------------------
+
+FED_NODES_FILE = os.path.join(BASE_DIR, "fed_nodes.json")
+FED_HEADER = "X-Fwpanel-Token"
+
+
+def _load_fed_nodes():
+    try:
+        with open(FED_NODES_FILE) as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_fed_nodes(nodes):
+    os.makedirs(BASE_DIR, exist_ok=True)
+    tmp = FED_NODES_FILE + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(nodes, f, indent=2, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, FED_NODES_FILE)
+
+
+def _gen_fed_token():
+    return secrets.token_urlsafe(24)
+
+
+def _http_fed_probe(url, tok):
+    """主面板 → 节点探活：请求节点 /api/fed，令牌有效返回节点信息 dict，否则 None"""
+    try:
+        req = urllib.request.Request(url.rstrip("/") + "/api/fed", method="GET")
+        req.add_header(FED_HEADER, tok)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            raw = resp.read()
+            return json.loads(raw) if raw else {}
+    except Exception:
+        return None
+
 
 # ------------------------------- 升级功能 -------------------------------
 
@@ -3200,11 +3257,23 @@ class PanelHandler(BaseHTTPRequestHandler):
         return ""
 
     def _require_auth(self):
+        """会话 Bearer 或联邦 X-Fwpanel-Token 均可（返回 'fed' 标记联邦会话）"""
+        fed = self.headers.get(FED_HEADER, "")
+        if fed and self.server.auth.check_fed(fed):
+            return "fed"
         token = self._token()
         if not token or not self.server.auth.check(token):
             self._send(401, {"error": "未登录或登录已过期"})
             return None
         return token
+
+    def _require_local(self):
+        """仅允许本机 Web 登录会话（拒绝联邦令牌）——联邦配置/节点管理等高危操作"""
+        token = self._token()
+        if token and self.server.auth.check(token):
+            return token
+        self._send(401, {"error": "需要本机面板登录"})
+        return None
 
     # ---------- 路由 ----------
     def do_GET(self):
@@ -3265,8 +3334,186 @@ class PanelHandler(BaseHTTPRequestHandler):
             if token:
                 self.server.auth.logout(token)
             self._send(200, {"ok": True})
+        elif path == "/api/fed":
+            self._api_fed_status()
+        elif path == "/api/fed/nodes":
+            self._api_fed_nodes_list()
+        elif path.startswith("/api/fed/"):
+            self._api_fed_proxy()
         else:
             self._send(404, {"error": "Not Found"})
+
+    # ---------- 联邦 API（2.0 多机管理） ----------
+    def _api_fed_status(self):
+        """本机联邦状态 / 探活（主面板添加节点时探测；本机登录或联邦令牌均可访问）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        self._send(200, {
+            "fed_enabled": self.server.auth.fed_enabled(),
+            "is_fed": token == "fed",
+            "hostname": os.uname().nodename,
+            "version": CURRENT_VERSION,
+            "panel_port": int(self.server.config.get("port", DEFAULT_PORT)),
+        })
+
+    def _api_fed_manage(self):
+        """开启/重置/关闭本机联邦令牌（仅本机登录）"""
+        if self._require_local() is None:
+            return
+        data = self._read_json()
+        action = data.get("action", "")
+        if action == "rotate":
+            raw = _gen_fed_token()
+            self.server.auth.set_fed_token(raw)
+            self._send(200, {"ok": True, "enabled": True,
+                             "token": raw,
+                             "warn": "令牌仅显示这一次，请立即复制保存"})
+        elif action == "clear":
+            self.server.auth.clear_fed_token()
+            self._send(200, {"ok": True, "enabled": False})
+        else:
+            self._send(400, {"error": "未知操作（rotate / clear）"})
+
+    def _api_fed_nodes_list(self):
+        """节点列表（不含令牌明文）"""
+        if self._require_local() is None:
+            return
+        nodes = _load_fed_nodes()
+        lst = [{"id": nid, "name": n.get("name", ""), "url": n.get("url", ""),
+                "token_set": bool(n.get("token"))}
+               for nid, n in nodes.items()]
+        self._send(200, {"nodes": lst})
+
+    def _api_fed_node_add(self):
+        """添加节点：预探测连通+令牌，成功后落盘"""
+        if self._require_local() is None:
+            return
+        data = self._read_json()
+        name = (data.get("name") or "").strip()
+        url = (data.get("url") or "").strip().rstrip("/")
+        tok = (data.get("token") or "").strip()
+        if not name or not url or not tok:
+            self._send(400, {"error": "名称 / 地址 / 令牌均必填"})
+            return
+        if not (url.startswith("https://") or url.startswith("http://")):
+            self._send(400, {"error": "地址需以 http:// 或 https:// 开头"})
+            return
+        probe = _http_fed_probe(url, tok)
+        if not probe:
+            self._send(400, {"error": "无法连接节点或令牌无效——请检查地址、令牌，并确认节点已开启联邦令牌（版本需 2.0+）"})
+            return
+        nodes = _load_fed_nodes()
+        nid = secrets.token_hex(6)
+        nodes[nid] = {"name": name, "url": url, "token": tok}
+        _save_fed_nodes(nodes)
+        self._send(200, {"ok": True, "id": nid, "node": {
+            "name": name, "url": url,
+            "hostname": probe.get("hostname", ""), "version": probe.get("version", "")}})
+
+    def _api_fed_node_update(self, nid):
+        """更新节点（改 url/token 时重新探测）"""
+        if self._require_local() is None:
+            return
+        nodes = _load_fed_nodes()
+        node = nodes.get(nid)
+        if not node:
+            self._send(404, {"error": "节点不存在"})
+            return
+        data = self._read_json()
+        new_name = (data.get("name") or node.get("name", "")).strip()
+        new_url = (data.get("url") or node.get("url", "")).strip().rstrip("/")
+        new_tok = (data.get("token") or node.get("token", "")).strip()
+        if data.get("url") is not None and new_url != node.get("url"):
+            if not (new_url.startswith("https://") or new_url.startswith("http://")):
+                self._send(400, {"error": "地址需以 http:// 或 https:// 开头"})
+                return
+        if data.get("token") is not None and new_tok != node.get("token"):
+            pass
+        # url 或 token 变更时重新探测
+        if new_url != node.get("url") or new_tok != node.get("token"):
+            probe = _http_fed_probe(new_url, new_tok)
+            if not probe:
+                self._send(400, {"error": "更新后无法连接节点或令牌无效，请检查后重试"})
+                return
+        node["name"], node["url"], node["token"] = new_name, new_url, new_tok
+        _save_fed_nodes(nodes)
+        self._send(200, {"ok": True})
+
+    def _api_fed_node_delete(self, nid):
+        """删除节点"""
+        if self._require_local() is None:
+            return
+        nodes = _load_fed_nodes()
+        if nid not in nodes:
+            self._send(404, {"error": "节点不存在"})
+            return
+        nodes.pop(nid, None)
+        _save_fed_nodes(nodes)
+        self._send(200, {"ok": True})
+
+    def _api_fed_proxy(self):
+        """核心代理：把 /api/fed/<node_id>/api/... 原样转发到节点（带节点联邦令牌）"""
+        if self._require_local() is None:
+            return
+        parsed = urlparse(self.path)
+        parts = parsed.path.split("/")
+        # ['', 'api', 'fed', '<node_id>', 'api', ...]
+        if len(parts) < 6 or parts[4] != "api":
+            self._send(404, {"error": "Not Found"})
+            return
+        node_id = parts[3]
+        rest = "/" + "/".join(parts[4:])
+        if parsed.query:
+            rest += "?" + parsed.query
+        nodes = _load_fed_nodes()
+        node = nodes.get(node_id)
+        if not node:
+            self._send(404, {"error": "节点不存在"})
+            return
+        base = (node.get("url") or "").rstrip("/")
+        if not base:
+            self._send(400, {"error": "节点未配置地址"})
+            return
+        body = None
+        if self.command in ("POST", "PUT", "PATCH"):
+            try:
+                length = int(self.headers.get("Content-Length", 0) or 0)
+                if length > 0:
+                    body = self.rfile.read(length)
+            except Exception:
+                body = None
+        req = urllib.request.Request(base + rest, data=body, method=self.command)
+        req.add_header(FED_HEADER, node.get("token", ""))
+        req.add_header("Content-Type", self.headers.get("Content-Type", "application/json"))
+        try:
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                raw = resp.read()
+                self.send_response(resp.status)
+                self.send_header("Content-Type", resp.headers.get(
+                    "Content-Type", "application/json; charset=utf-8"))
+                self.send_header("Content-Length", str(len(raw)))
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.end_headers()
+                self.wfile.write(raw)
+        except urllib.error.HTTPError as e:
+            try:
+                raw = e.read()
+            except Exception:
+                raw = b""
+            if e.code == 401:
+                self._send(502, {"error": "节点拒绝访问：联邦令牌可能已失效，请在服务器管理里更新节点令牌"})
+                return
+            self.send_response(e.code)
+            self.send_header("Content-Type",
+                             (e.headers or {}).get("Content-Type", "application/json; charset=utf-8"))
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            if raw:
+                self.wfile.write(raw)
+        except Exception as e:
+            self._send(502, {"error": "节点不可达（%s）：请检查节点地址与网络" % type(e).__name__})
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -3363,6 +3610,14 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_docker_compose_down()
         elif path == "/api/docker/dirs":
             self._api_docker_dirs_create()
+        elif path == "/api/fed":
+            self._api_fed_manage()
+        elif path == "/api/fed/nodes":
+            self._api_fed_node_add()
+        elif path.startswith("/api/fed/nodes/"):
+            self._api_fed_node_update(path.rsplit("/", 1)[1])
+        elif path.startswith("/api/fed/"):
+            self._api_fed_proxy()
         else:
             self._send(404, {"error": "Not Found"})
 
@@ -3375,6 +3630,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_bruteforce_unban(path.rsplit("/", 1)[1])
         elif path.startswith("/api/proxy/"):
             self._api_proxy_delete(path.rsplit("/", 1)[1])
+        elif path.startswith("/api/fed/nodes/"):
+            self._api_fed_node_delete(path.rsplit("/", 1)[1])
+        elif path.startswith("/api/fed/"):
+            self._api_fed_proxy()
         else:
             self._send(404, {"error": "Not Found"})
 
