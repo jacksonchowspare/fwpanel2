@@ -1463,6 +1463,8 @@ async function fedProbeOne(n) {
       "<span>封禁：<b style=\"color:var(--text)\">" + (s.banned_count || 0) + "</b></span>" +
       "<span>SSH：<b style=\"color:var(--text)\">" + s.ssh_port + "</b></span>" +
       "<span>版本：<b id=\"fed_ver_b_" + n.id + "\" style=\"color:var(--text)\">v" + s.version + "</b></span>";
+    // 先清理可能残留的升级按钮(含“升级中…”残留),再由 fedCheckUpgrade 按新版本决定是否重建
+    ["fed_up_s_" + n.id, "fed_up_b_" + n.id].forEach(id => { const b = $(id); if (b) b.remove(); });
     fedCheckUpgrade(n);
   } catch (e) {
     dot.style.background = "#ef4444";
@@ -1548,7 +1550,7 @@ async function fedUpgradeNode(n, latest, channel) {
         await new Promise(r => setTimeout(r, 5000));
         try {
           const st = await api("GET", "/api/fed/" + n.id + "/api/status");
-          if (st && st.version) {
+          if (st && st.version && vcmp(st.version, versionBefore) > 0) {
             n.version = st.version;
             fedProbeOne(n);
             renderFedMe();
