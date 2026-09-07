@@ -1012,6 +1012,11 @@ function setFedTabsTop() {
   const h = (b && !b.classList.contains("hidden") && b.offsetHeight) || 0;
   document.documentElement.style.setProperty("--fed-tabs-top", h + "px");
 }
+function ensureFedTab() {
+  if (!token) return;
+  fedLoaded = false;   // 登录后重置渲染标记,防止残留失败状态导致服务器页空白
+  if ((localStorage.getItem("fw_sec") || "") === "fed") renderFed();
+}
 function showLogin() { fedUiReset(); $("login").classList.remove("hidden"); $("main").classList.add("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "inline-block"; }
 function showMain()  { $("login").classList.add("hidden"); $("main").classList.remove("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "none"; }
 async function login() {
@@ -1031,10 +1036,10 @@ async function login() {
           setTimeout(() => { vp.setAttribute("content", "width=device-width, initial-scale=1.0"); }, 300);
         }
       }
-      showMain(); refreshAll(); toast("登录成功", "okk");
+      showMain(); ensureFedTab(); refreshAll(); toast("登录成功", "okk");
       return;
     }
-    showMain(); refreshAll(); toast("登录成功", "okk");
+    showMain(); ensureFedTab(); refreshAll(); toast("登录成功", "okk");
   } catch (e) { toast(e.message, "err"); }
 }
 function resetIOSZoom() {
@@ -1138,7 +1143,6 @@ async function renderFedMe() {
   } catch (e) { if (e.message !== "未登录") toast(e.message, "err"); }
 }
 async function renderFed() {
-  fedLoaded = true;
   try {
     renderFedMe();
     const d = await api("GET", "/api/fed/nodes");
@@ -1146,11 +1150,24 @@ async function renderFed() {
     box.innerHTML = "";
     if (!d.nodes.length) {
       box.innerHTML = '<div class="empty" style="padding:26px 0">尚未接入任何节点 —— 点「添加服务器节点」，填另一台机器面板的 https 地址和它的联邦令牌</div>';
+      fedLoaded = true;
       return;
     }
     d.nodes.forEach(n => box.appendChild(fedCardEl(n)));
     d.nodes.forEach(n => fedProbeOne(n));
-  } catch (e) { if (e.message !== "未登录") toast(e.message, "err"); }
+    fedLoaded = true;
+  } catch (e) {
+    fedLoaded = false;   // 渲染失败(如登录态过期/网络)可重试,不残留"已渲染"标记
+    if (e.message !== "未登录") toast(e.message, "err");
+  }
+}
+/* 静默刷新已渲染卡片的状态(不重建 DOM、不闪烁)——切回本 tab 与定时刷新用 */
+async function refreshFedStatus() {
+  try {
+    const d = await api("GET", "/api/fed/nodes");
+    if (!d.nodes.length) { renderFed(); return; }   // 列表空了(节点被删)走全量渲染
+    d.nodes.forEach(n => fedProbeOne(n));
+  } catch (e) { if (e.message !== "未登录") renderFed(); }   // 列表拉取失败退回全量渲染
 }
 function fedForceRefresh() { renderFed(); }
 function fedCardEl(n) {
@@ -1186,6 +1203,7 @@ function fedCardEl(n) {
 }
 async function fedProbeOne(n) {
   const dot = $("fed_dot_" + n.id), met = $("fed_met_" + n.id);
+  if (!dot) return;   // 卡片未渲染(静默刷新时可能被删),跳过
   try {
     const s = await api("GET", "/api/fed/" + n.id + "/api/status");
     dot.style.background = "#22c55e"; dot.style.boxShadow = "0 0 6px #22c55e";
@@ -1323,8 +1341,7 @@ function exitFed() {
   $("fed_banner").classList.add("hidden");
   setFedTabsTop();
   $("btn_fed").style.display = ""; $("tab_fed").style.display = "";
-  switchTab("fed");
-  renderFed();
+  switchTab("fed");   // 钩子自动:未渲染则渲染,已渲染则静默刷新节点状态
   refreshAll();
   toast("已返回本机", "okk");
 }
@@ -1561,7 +1578,10 @@ function switchTab(sec) {
   document.querySelectorAll("#sec_tabs .tab").forEach(b => {
     b.classList.toggle("active", b.dataset.tab === sec);
   });
-  if (sec === "fed" && !fedLoaded) renderFed();
+  if (sec === "fed" && token) {
+    if (!fedLoaded) renderFed();
+    else refreshFedStatus();   // 已渲染过:静默重新探测各节点状态,不重建卡片
+  }
 }
 (function initSec() {
   const saved = localStorage.getItem("fw_sec");
