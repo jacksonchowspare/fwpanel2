@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.1.21"
+CURRENT_VERSION = "2.1.22"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -2165,7 +2165,11 @@ def render_proxy_conf(p):
     guard = host_guard(p["domain"]) if block_ip else ""
     ws_extra = ("        proxy_http_version 1.1;\n"
                 "        proxy_set_header Upgrade $http_upgrade;\n"
-                '        proxy_set_header Connection "upgrade";\n')
+                '        proxy_set_header Connection "upgrade";\n'
+                # v2.1.22：WebSocket 长连接（面板终端/流式推送）空闲会被默认
+                # proxy_read_timeout 60s 掐断 → 终端打开一会就"连接已关闭"
+                "        proxy_read_timeout 3600s;\n"
+                "        proxy_send_timeout 3600s;\n")
     hdr = ("        proxy_set_header Host $host;\n"
            "        proxy_set_header X-Real-IP $remote_addr;\n"
            "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
@@ -2635,6 +2639,28 @@ def _term_spawn_pty():
 def _term_audit(event, peer=""):
     """终端审计日志"""
     log(f"[term] {event} {peer}")
+
+
+def _cleanup_stale_term_keys():
+    """启动时清理残留的临时私钥（>6h 或上次崩溃遗留）。防私钥滞留面板机。"""
+    try:
+        import pwd
+        ssh_dir = os.path.join(pwd.getpwnam(TERM_USER).pw_dir, ".ssh")
+    except Exception:
+        ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
+    try:
+        cutoff = time.time() - 6 * 3600
+        for fn in os.listdir(ssh_dir):
+            if fn.startswith("fwterm_") and fn.endswith(".pem"):
+                fp = os.path.join(ssh_dir, fn)
+                try:
+                    if os.path.getmtime(fp) < cutoff:
+                        os.remove(fp)
+                        _term_audit("key_stale_clean", fn)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 # ---------- Docker 模块（v1.24.0）----------
@@ -3708,8 +3734,6 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_task_status(path[len("/api/tasks/"):])
         elif path == "/api/term/ws":
             self._api_term_ws()
-        elif path == "/api/term/keys":
-            self._api_term_keys()
         elif path == "/api/term/info":
             self._api_term_info()
         else:
@@ -3757,45 +3781,79 @@ class PanelHandler(BaseHTTPRequestHandler):
             "user": TERM_USER,
         })
 
-    def _api_term_keys(self):
-        """GET /api/term/keys → 列出可选的 SSH 私钥路径（只列名不读内容）"""
+    def _api_term_key_upload(self):
+        """POST /api/term/key {content, filename?} → 把操作电脑上的私钥临时上传到
+        term 用户 ~/.ssh/fwterm_*.pem（600），返回面板机路径供 ssh -i 使用。
+        面板不持久保存：终端关闭时前端调 DELETE 删除；服务重启也会清残留。
+        支持经联邦代理转发（远程节点开终端时密钥落在节点）。"""
         token = self._require_auth()
         if token is None:
             return
-        keys = []
-        # term 用户 ~/.ssh 下 + 常见位置（存在且为私钥特征：非 .pub）
-        candidates = []
+        data = self._read_json()
+        content = data.get("content", "")
+        if not isinstance(content, str) or not content.strip():
+            self._send(400, {"error": "内容为空"})
+            return
+        # 安全校验：必须是 PEM 私钥（拒绝任意文件写入）
+        head = content.lstrip().encode()[:60]
+        if b"PRIVATE KEY" not in head and not content.lstrip().startswith("-----BEGIN"):
+            self._send(400, {"error": "不是有效的私钥文件（需 PEM 格式）"})
+            return
         try:
             import pwd
-            term_home = pwd.getpwnam(TERM_USER).pw_dir
-            ssh_dir = os.path.join(term_home, ".ssh")
-            if os.path.isdir(ssh_dir):
-                candidates += [os.path.join(ssh_dir, f) for f in os.listdir(ssh_dir)]
+            pw = pwd.getpwnam(TERM_USER)
+            ssh_dir = os.path.join(pw.pw_dir, ".ssh")
+            uid, gid = pw.pw_uid, pw.pw_gid
+        except KeyError:
+            ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
+            uid = gid = os.geteuid()
+        try:
+            os.makedirs(ssh_dir, mode=0o700, exist_ok=True)
+            if uid != os.geteuid():
+                os.chown(ssh_dir, uid, gid)
         except Exception:
             pass
-        for d in ("/root/.ssh", os.path.expanduser("~/.ssh")):
+        fname = "fwterm_" + secrets.token_hex(8) + ".pem"
+        fpath = os.path.join(ssh_dir, fname)
+        try:
+            with open(fpath, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.chmod(fpath, 0o600)
+            if uid != os.geteuid():
+                os.chown(fpath, uid, gid)
+        except Exception as e:
+            self._send(500, {"error": f"写入失败: {e}"})
+            return
+        _term_audit("key_upload", fname)
+        self._send(200, {"path": fpath})
+
+    def _api_term_key_delete(self):
+        """DELETE /api/term/key {path} → 删除临时上传的私钥（仅限 fwterm_ 前缀，防穿越）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        data = self._read_json()
+        fpath = str(data.get("path", ""))
+        base = os.path.basename(fpath)
+        if not base.startswith("fwterm_") or not base.endswith(".pem"):
+            self._send(400, {"error": "非法路径"})
+            return
+        # 只允许删 .ssh 目录下 fwterm_ 前缀（路径穿越防护：忽略目录部分只删 .ssh 内的）
+        try:
+            import pwd
+            ssh_dir = os.path.join(pwd.getpwnam(TERM_USER).pw_dir, ".ssh")
+        except (KeyError, Exception):
+            ssh_dir = os.path.join(os.path.expanduser("~"), ".ssh")
+        target = os.path.join(ssh_dir, base)
+        if os.path.isfile(target):
             try:
-                if os.path.isdir(d):
-                    candidates += [os.path.join(d, f) for f in os.listdir(d)]
-            except Exception:
-                pass
-        seen = set()
-        for p in candidates:
-            try:
-                base = os.path.basename(p)
-                if base.endswith(".pub") or "known_hosts" in base or "config" in base or "authorized" in base:
-                    continue
-                with open(p, "rb") as f:
-                    head = f.read(32)
-                if b"PRIVATE KEY" not in head:
-                    continue
-                rp = os.path.realpath(p)
-                if rp not in seen:
-                    seen.add(rp)
-                    keys.append(rp)
-            except Exception:
-                continue
-        self._send(200, {"keys": keys})
+                os.remove(target)
+                _term_audit("key_delete", base)
+            except Exception as e:
+                self._send(500, {"error": f"删除失败: {e}"})
+                return
+        self._send(200, {"ok": True})
+
 
     def _ws_token_ok(self):
         """WS 升级鉴权：query token = 本机登录会话，或 X-Fwpanel-Token = 有效联邦令牌（节点被主控中继）。"""
@@ -3861,7 +3919,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             stop = threading.Event()
 
             def _pty_to_ws():
-                """PTY 输出 → WS 帧"""
+                """PTY 输出 → WS 帧；空闲 25s 发 ping 保活（防 nginx proxy_read_timeout 60s 掐断）"""
+                idle = 0
                 try:
                     while not stop.is_set():
                         r, _, _ = select.select([master_fd], [], [], 0.3)
@@ -3872,8 +3931,15 @@ class PanelHandler(BaseHTTPRequestHandler):
                                 break
                             if not data:
                                 break
+                            idle = 0
                             if not self._ws_send(data, 0x1):
                                 break
+                        else:
+                            idle += 1
+                            if idle >= 83:      # ≈ 25s（0.3s × 83）
+                                idle = 0
+                                if not self._ws_send(b"", 0x9):   # ping
+                                    break
                 except Exception:
                     pass
                 stop.set()
@@ -4177,11 +4243,12 @@ class PanelHandler(BaseHTTPRequestHandler):
                     if op == 0x8:      # 节点关闭
                         self._ws_send(b"", 0x8)
                         break
-                    if op == 0x9:      # 节点 ping → 回 pong（节点是 server 不会发 ping，防御）
+                    if op == 0x9:      # 节点 ping → 转发浏览器（浏览器自动回 pong，全链路保活）
                         try:
-                            nsock.sendall(ws_encode_frame_client(payload or b"", 0xA))
+                            self.wfile.write(ws_encode_frame(payload or b"", 0x9))
+                            self.wfile.flush()
                         except Exception:
-                            pass
+                            break
                         continue
                     try:
                         self.wfile.write(ws_encode_frame(payload or b"", op))
@@ -4303,6 +4370,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_docker_dirs_create()
         elif path == "/api/fed":
             self._api_fed_manage()
+        elif path == "/api/term/key":
+            self._api_term_key_upload()
         elif path == "/api/fed/nodes":
             self._api_fed_node_add()
         elif path.startswith("/api/fed/nodes/"):
@@ -4321,6 +4390,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_bruteforce_unban(path.rsplit("/", 1)[1])
         elif path.startswith("/api/proxy/"):
             self._api_proxy_delete(path.rsplit("/", 1)[1])
+        elif path == "/api/term/key":
+            self._api_term_key_delete()
         elif path.startswith("/api/fed/nodes/"):
             self._api_fed_node_delete(path.rsplit("/", 1)[1])
         elif path.startswith("/api/fed/"):
@@ -6072,6 +6143,7 @@ def main():
     nft = NFTManager(store, config)
     auth = Auth(config)
     server = PanelServer((bind, port), PanelHandler, config, store, nft, auth)
+    _cleanup_stale_term_keys()   # v2.1.22：清理残留的临时终端私钥（重启不滞留）
     # SSH 防爆破后台监控（配置启用后生效）
     threading.Thread(target=bruteforce_loop, args=(config, store), daemon=True).start()
     log("SSH 防爆破监控线程已启动")

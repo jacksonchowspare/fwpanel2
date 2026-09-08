@@ -4701,5 +4701,96 @@ class TestWsFrames(unittest.TestCase):
             self.assertEqual(got_payload, payload)
 
 
+class TestTermKeyApi(unittest.TestCase):
+    """终端临时私钥上传/删除端点（v2.1.22）：校验 PEM、路径防穿越、删除后文件消失"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cfg = make_cfg()
+        cls.store = panel.RuleStore()
+        cls.store.rules = []
+        cls.nft = panel.NFTManager(cls.store, cls.cfg)
+        cls.auth = panel.Auth(cls.cfg)
+        cls.server = panel.PanelServer(("127.0.0.1", 17998), panel.PanelHandler,
+                                       cls.cfg, cls.store, cls.nft, cls.auth)
+        cls.thread = threading.Thread(target=cls.server.serve_forever, daemon=True)
+        cls.thread.start()
+        cls.base = "http://127.0.0.1:17998"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+
+    def _req(self, method, path, data=None, token=None):
+        req = urllib.request.Request(self.base + path, method=method)
+        if token:
+            req.add_header("Authorization", "Bearer " + token)
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode()
+            req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, body) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read())
+            except Exception:
+                return e.code, {}
+
+    def _login(self):
+        code, d = self._req("POST", "/api/login",
+                            {"username": TEST_USER, "password": TEST_PASS})
+        self.assertEqual(code, 200)
+        return d["token"]
+
+    def _ssh_dir(self):
+        # 测试环境（无 term 用户）→ 上传 fallback 到当前用户 ~/.ssh，与实现一致
+        return os.path.join(os.path.expanduser("~"), ".ssh")
+
+    def test_upload_and_delete(self):
+        tok = self._login()
+        pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNzaC1rZXktdjEAAAAA\n-----END OPENSSH PRIVATE KEY-----\n"
+        code, d = self._req("POST", "/api/term/key", {"content": pem}, token=tok)
+        self.assertEqual(code, 200, d)
+        self.assertIn("fwterm_", d["path"])
+        self.assertTrue(d["path"].endswith(".pem"))
+        fpath = d["path"]
+        # 文件确实落盘、权限 600
+        self.assertTrue(os.path.exists(fpath))
+        self.assertEqual(os.stat(fpath).st_mode & 0o777, 0o600)
+        with open(fpath, encoding="utf-8") as f:
+            self.assertIn("PRIVATE KEY", f.read())
+        # 删除
+        code, d = self._req("DELETE", "/api/term/key", {"path": fpath}, token=tok)
+        self.assertEqual(code, 200, d)
+        self.assertFalse(os.path.exists(fpath), "删除后文件应消失")
+
+    def test_reject_non_pem(self):
+        tok = self._login()
+        code, d = self._req("POST", "/api/term/key",
+                            {"content": "随便的内容不是密钥"}, token=tok)
+        self.assertEqual(code, 400, d)
+        self.assertIn("私钥", d["error"])
+
+    def test_delete_traversal_guarded(self):
+        tok = self._login()
+        # 任意路径（非 fwterm_ 前缀）→ 拒绝
+        code, d = self._req("DELETE", "/api/term/key",
+                            {"path": "/etc/passwd"}, token=tok)
+        self.assertEqual(code, 400, d)
+        # 路径穿越：../ 被 basename 剥掉 → 只会在 .ssh 内找 fwterm_x.pem（不存在），
+        # 不会删除 .ssh 之外任何文件——目标文件不存在时 ok:true 无害
+        victim = os.path.join(self._ssh_dir(), "..", "fwterm_x.pem")
+        code, d = self._req("DELETE", "/api/term/key", {"path": victim}, token=tok)
+        self.assertEqual(code, 200, d)
+        self.assertFalse(os.path.exists(victim), "不创建也不删外部文件")
+
+    def test_requires_auth(self):
+        code, _ = self._req("POST", "/api/term/key", {"content": "-----BEGIN x"})
+        self.assertEqual(code, 401)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
