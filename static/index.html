@@ -403,7 +403,10 @@ input::placeholder, textarea::placeholder { color: var(--muted); }
 .fed-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding: 9px 14px; font-size: 13px; margin: 0 0 16px; position: sticky; top: 0; z-index: 44; background: var(--tabs-bg); backdrop-filter: blur(var(--glass)); -webkit-backdrop-filter: blur(var(--glass)); border: var(--bdw) solid var(--border); border-radius: var(--r-nav); box-shadow: var(--shadow-card), inset 0 1px 0 rgba(255,255,255,.04); }
 .fed-bar .fed-bar-t b { color: var(--accent); }
 .fed-bar .fed-bar-url { color: var(--muted); font-size: 12px; word-break: break-all; min-width: 0; }
-.fed-bar .btn { flex: none; }
+/* fed-bar 按钮统一定高+flex居中：彩色 emoji(🖥 走 Noto Color Emoji)字体行高 metric 大，
+   会把按钮撑得比旁侧文本箭头按钮(↩)高——定高后行内 emoji 由 align-items:center 居中不再外溢 */
+.fed-bar .btn { flex: none; display: inline-flex; align-items: center; justify-content: center;
+  height: 30px; padding: 0 12px; }
 .tab { display: inline-flex; align-items: center; justify-content: center; height: 32px; padding: 0 14px; line-height: 1; gap: 5px; box-sizing: border-box; background: var(--hover-bg); border: var(--bdw) solid var(--hover-border); color: var(--text); border-radius: var(--r-sm); font-size: 13px; cursor: pointer; transition: all .15s ease; }
 .tab svg { display: block; flex: none; }
 .tabs .h-ico-sm { margin-right: 0; } /* 间距由 gap 统一控制 */
