@@ -1524,8 +1524,8 @@ class TestUpgrade(unittest.TestCase):
         panel.restart_service = self.real_restart
         shutil.rmtree(self.app_tmp, ignore_errors=True)
 
-    def _make_new_files(self, version="9.9.9", broken=False):
-        src = tempfile.mkdtemp(prefix="fwpanel-new-")
+    def _make_new_files(self, version="9.9.9", broken=False, base=None):
+        src = base or tempfile.mkdtemp(prefix="fwpanel-new-")
         py_content = f'CURRENT_VERSION = "{version}"\nprint("new panel")\n'
         if broken:
             py_content = "def broken(:\n"
@@ -1539,11 +1539,25 @@ class TestUpgrade(unittest.TestCase):
         ico = os.path.join(src, "favicon.ico")
         with open(ico, "wb") as f:
             f.write(b"\x00\x00\x01\x00fake-ico")
+        # v2.1.20：模拟新版下载含 static/vendor + fonts 子资源（面板内升级需部署）
+        vdir = os.path.join(src, "static", "vendor")
+        os.makedirs(vdir, exist_ok=True)
+        with open(os.path.join(vdir, "xterm.js"), "w") as f:
+            f.write("!function(){console.log('xterm')}();")
+        with open(os.path.join(vdir, "xterm.css"), "w") as f:
+            f.write("/* xterm css */")
+        with open(os.path.join(vdir, "xterm-addon-fit.js"), "w") as f:
+            f.write("!function(){console.log('fit')}();")
+        fdir = os.path.join(src, "static", "fonts")
+        os.makedirs(fdir, exist_ok=True)
+        with open(os.path.join(fdir, "fw-sans-sc-regular.woff2"), "wb") as f:
+            f.write(b"wOF2fake-font")
         return os.path.join(src, "panel.py"), os.path.join(src, "index.html"), logo, ico
 
     def test_upgrade_success(self):
         panel.get_latest_version = lambda: "9.9.9"
-        panel.download_panel_files = lambda tag, tmp: self._make_new_files("9.9.9")
+        # mock 下载：文件建在 perform_upgrade 传入的 tmpdir 下（与真实 download_panel_files 一致）
+        panel.download_panel_files = lambda tag, tmp: self._make_new_files("9.9.9", base=tmp)
         ok, msg = panel.perform_upgrade()
         self.assertTrue(ok, msg)
         with open(os.path.join(self.app_tmp, "panel.py")) as f:
@@ -1552,6 +1566,54 @@ class TestUpgrade(unittest.TestCase):
                         "升级应生成备份文件")
         self.assertTrue(os.path.exists(os.path.join(self.app_tmp, "static", "favicon.ico")),
                         "升级应部署 favicon.ico")
+        # v2.1.20：面板内升级必须部署 static/vendor + fonts 子资源（否则 xterm.js 404 终端白屏）
+        self.assertTrue(os.path.exists(
+            os.path.join(self.app_tmp, "static", "vendor", "xterm.js")),
+            "升级应部署 static/vendor/xterm.js")
+        self.assertTrue(os.path.exists(
+            os.path.join(self.app_tmp, "static", "fonts", "fw-sans-sc-regular.woff2")),
+            "升级应部署 static/fonts 字体")
+
+    def test_download_panel_files_includes_vendor(self):
+        """download_panel_files 应下载 vendor/fonts 子资源到 tmpdir/static/（v2.1.20）"""
+        real_dl = panel.http_download
+        got = []
+        src = tempfile.mkdtemp(prefix="fwpanel-dl-")
+        try:
+            def fake_dl(url, dest, expect=None, timeout=30):
+                # 按 URL 路径回写对应文件（panel.py 无 static/ 前缀；其余都在 static/ 下）
+                rel = url.split("/static/")[-1] if "/static/" in url else url.split("/")[-1]
+                data = {
+                    "panel.py": b"#!/usr/bin/env python3\nCURRENT_VERSION = \"9.9.9\"\n",
+                    "index.html": b"<!DOCTYPE html>\n<html lang=\"zh-CN\">new</html>",
+                    "github-logo.png": b"\x89PNG\r\n\x1a\nlogo",
+                    "favicon.ico": b"\x00\x00\x01\x00ico",
+                    "vendor/xterm.js": b"!function(){}();",
+                    "vendor/xterm.css": b"/* css */",
+                    "vendor/xterm-addon-fit.js": b"!function(){}();",
+                    "fonts/fw-sans-sc-regular.woff2": b"wOF2font",
+                }
+                body = data.get(rel)
+                if body is None:
+                    return False
+                if expect and not body.startswith(expect):
+                    return False
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as f:
+                    f.write(body)
+                got.append(rel)
+                return True
+            panel.http_download = fake_dl
+            files = panel.download_panel_files("v9.9.9", src)
+            self.assertIsNotNone(files)
+            for rel in ("vendor/xterm.js", "vendor/xterm.css",
+                        "vendor/xterm-addon-fit.js",
+                        "fonts/fw-sans-sc-regular.woff2"):
+                self.assertTrue(os.path.exists(os.path.join(src, "static", rel)),
+                                f"应下载 {rel}，实际: {got}")
+        finally:
+            panel.http_download = real_dl
+            shutil.rmtree(src, ignore_errors=True)
 
     def test_issue_cert_dns(self):
         """DNS 证书申请：acme.sh 命令参数 + 凭证环境变量 + 缺凭证拒绝 + 不支持提供商"""
@@ -1634,7 +1696,7 @@ class TestUpgrade(unittest.TestCase):
     def test_upgrade_specific_tag(self):
         """perform_upgrade(tag=...) 升级到指定测试版 tag"""
         panel.get_latest_version = lambda: "9.9.9"  # 不应被调用（指定 tag 时）
-        panel.download_panel_files = lambda tag, tmp: self._make_new_files(tag)
+        panel.download_panel_files = lambda tag, tmp: self._make_new_files(tag, base=tmp)
         cur = [int(x) for x in panel.CURRENT_VERSION.split(".")]
         nxt = "%d.%d.%d" % (cur[0], cur[1], cur[2] + 1)   # 高于当前版本才允许升级
         ok, msg = panel.perform_upgrade(tag=nxt)

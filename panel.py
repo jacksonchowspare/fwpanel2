@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.1.20"
+CURRENT_VERSION = "2.1.21"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -765,6 +765,23 @@ def download_panel_files(tag, tmpdir):
                          expect=b"\x00\x00\x01\x00"):
             ok2 = True
             break
+    # 子资源（v2.1.20）：Web 终端 vendor + 字体。面板内升级此前从不部署 static 子资源，
+    # 导致 xterm.js 404 → 终端白屏。单个失败仅 warn 不阻断升级（保留前端缺组件防御提示）
+    _sub = os.path.join(tmpdir, "static")
+    for rel, expect in (
+        ("vendor/xterm.js", b"!function"),
+        ("vendor/xterm.css", b"/*"),
+        ("vendor/xterm-addon-fit.js", b"!function"),
+        ("fonts/fw-sans-sc-regular.woff2", b"wOF2"),
+        ("fonts/fw-sans-sc-bold.woff2", b"wOF2"),
+        ("fonts/0xProto-Regular.woff2", b"wOF2"),
+        ("fonts/0xProto-Bold.woff2", b"wOF2"),
+    ):
+        dest = os.path.join(_sub, rel)
+        os.makedirs(os.path.dirname(dest), exist_ok=True)
+        for tpl in UPGRADE_SOURCES:
+            if http_download(tpl.format(tag=tag, path="static/" + rel), dest, expect=expect):
+                break
     return py_path, html_path, (logo_path if ok else None), (ico_path if ok2 else None)
 
 
@@ -819,6 +836,17 @@ def perform_upgrade(tag=None):
             shutil.copy2(new_logo, panel_logo)
         if new_ico and os.path.exists(new_ico):
             shutil.copy2(new_ico, panel_ico)
+        # 子资源部署（v2.1.20）：vendor / fonts 整目录复制到 static/（缺失跳过）
+        for sub in ("vendor", "fonts"):
+            src_dir = os.path.join(tmpdir, "static", sub)
+            dst_dir = os.path.join(os.path.dirname(panel_html), sub)
+            if os.path.isdir(src_dir):
+                os.makedirs(dst_dir, exist_ok=True)
+                for fn in os.listdir(src_dir):
+                    try:
+                        shutil.copy2(os.path.join(src_dir, fn), os.path.join(dst_dir, fn))
+                    except Exception:
+                        pass
     except Exception as e:
         # 失败回滚
         try:
