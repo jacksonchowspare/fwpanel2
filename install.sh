@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="2.1.19"
+readonly SCRIPT_VERSION="2.1.20"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -232,6 +232,10 @@ do_upgrade() {
     if [ -d "$tmpdir/fonts" ]; then
         mkdir -p "$APP_DIR/static/fonts"
         cp "$tmpdir/fonts/"*.woff2 "$APP_DIR/static/fonts/" 2>/dev/null || true
+    fi
+    if [ -d "$tmpdir/vendor" ]; then
+        mkdir -p "$APP_DIR/static/vendor"
+        cp "$tmpdir/vendor/"*.js "$tmpdir/vendor/"*.css "$APP_DIR/static/vendor/" 2>/dev/null || true
     fi
     rm -rf "$tmpdir"
     # 语法校验
@@ -452,6 +456,8 @@ fetch_source() {
         *.png)  expect_hex="89504e47" ;;                    # \x89PNG
         *.ico)  expect_hex="00000100" ;;                    # ico 头
         *.woff2) expect_hex="774f4632" ;;                   # wOF2
+        *.js)   expect_hex="2166756e6374696f6e" ;;          # !function（UMD 库头）
+        *.css)  expect_hex="2f2a" ;;                        # /*（样式表注释头）
     esac
     download_file "$dest" "https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/$tag/$path" "$expect_hex" && return 0
     log_warn "GitHub 直连失败，切换 jsDelivr CDN ..."
@@ -486,6 +492,12 @@ deploy_files() {
             fetch_source "$tmp_src/static/fonts/$_f" "static/fonts/$_f" \
                 || log_warn "字体 $_f 下载失败（将使用系统字体）"
         done
+        # Web 终端 xterm.js（v2.1.19）
+        mkdir -p "$tmp_src/static/vendor"
+        for _f in xterm.js xterm.css xterm-addon-fit.js; do
+            fetch_source "$tmp_src/static/vendor/$_f" "static/vendor/$_f" \
+                || log_warn "终端资源 $_f 下载失败（Web 终端不可用）"
+        done
         src_py="$tmp_src/panel.py"
         src_html="$tmp_src/index.html"
         src_ico="$tmp_src/favicon.ico"
@@ -503,6 +515,13 @@ deploy_files() {
     if [ -d "$fonts_src" ]; then
         mkdir -p "$APP_DIR/static/fonts"
         cp -f "$fonts_src/"*.woff2 "$APP_DIR/static/fonts/" 2>/dev/null || true
+    fi
+    # vendor（xterm.js 等）:本地(tar/目录)安装直接复制;管道安装已下载到 tmp_src
+    local vendor_src="$script_dir/static/vendor"
+    if [ -n "$tmp_src" ]; then vendor_src="$tmp_src/static/vendor"; fi
+    if [ -d "$vendor_src" ]; then
+        mkdir -p "$APP_DIR/static/vendor"
+        cp -f "$vendor_src/"*.js "$vendor_src/"*.css "$APP_DIR/static/vendor/" 2>/dev/null || true
     fi
     [ -n "$tmp_src" ] && rm -rf "$tmp_src"
     log_info "文件部署完成"

@@ -3756,6 +3756,10 @@ async function openTerm() {
     if (d.busy >= d.max) toast("终端并发已达上限（" + d.busy + "/" + d.max + "）", "err");
   } catch (e) { /* 静默：旧版本无此接口 */ }
   if (!termInst) {
+    if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") {
+      toast("终端组件缺失（xterm.js 未部署）——请重新升级面板或手动补 static/vendor/", "err");
+      return;
+    }
     termFit = new FitAddon.FitAddon();
     termInst = new Terminal({
       fontFamily: "'0xProto','FW Sans SC',ui-monospace,Menlo,Consolas,monospace",
