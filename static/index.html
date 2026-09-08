@@ -486,7 +486,9 @@ tr:hover td { background: var(--panel-solid); }
     flex-wrap: wrap; gap: 6px; align-items: center; }
   .twin-keys.show { display: flex; }
   .twin-keys .tk-name { font-size: 11px; color: var(--muted); }
-  .twin-term { flex: 1; min-height: 0; padding: 6px 8px; background: #11141a; }
+  .twin-term { flex: 1; min-height: 0; padding: 0; display: flex; }
+  .tt-host { flex: 1; min-width: 0; min-height: 0; padding: 6px 8px;
+    background: #11141a; overflow: hidden; position: relative; }
   .twin.maxed { left: 0 !important; top: 0 !important; }
   .twin.maxed .twin-frame { width: 100vw !important; height: 100vh !important; border-radius: 0; }
   .twin-pop { position: absolute; right: 6px; top: 34px; z-index: 70; display: none;
@@ -502,6 +504,15 @@ tr:hover td { background: var(--panel-solid); }
   .tp-grid .tpg .sw { display: flex; gap: 2px; margin-bottom: 4px; }
   .tp-grid .tpg .sw i { width: 14px; height: 9px; border-radius: 2px; display: inline-block; }
   .twin.min { display: none; }
+  /* resize 手柄（v2.1.25）：斜纹 grip，避免直角视觉 */
+  .twin-resize { position: absolute; right: 0; bottom: 0; width: 22px; height: 22px;
+    cursor: nwse-resize; z-index: 66; border-radius: 6px 0 0 0; }
+  .twin-resize::after { content: ""; position: absolute; right: 4px; bottom: 4px;
+    width: 16px; height: 16px; opacity: .55;
+    background:
+      linear-gradient(135deg, transparent 0 42%, var(--border) 42% 56%, transparent 56%),
+      linear-gradient(135deg, transparent 0 28%, var(--border) 28% 42%, transparent 42%);
+    background-size: 100% 100%; }
 </style>
 <script>
 /* 界面缩放:4K/高分屏按视口宽度自动放大(html zoom,首帧前生效防闪烁);可在主题面板手动调 */
@@ -4019,11 +4030,23 @@ function termMax(win) {
   termFit(win);
 }
 
+function termApplyFit(win) {
+  // 立即重算 xterm 行列并通知后端（容器已是新尺寸）
+  if (!win.fit || win.min || win.el.classList.contains("min") || win.dying) return;
+  try {
+    win.fit.fit();
+    termSendResize(win);
+  } catch (e) {}
+}
+
+let __twFitRaf = {};
 function termFit(win) {
-  if (!win.fit || win.min || win.el.classList.contains("min")) return;
-  setTimeout(() => {
-    try { win.fit.fit(); termSendResize(win); } catch (e) {}
-  }, 30);
+  // rAF 节流：窗口/容器尺寸变化后下一帧重算，避免拖动中堆积
+  if (__twFitRaf[win.n]) return;
+  __twFitRaf[win.n] = requestAnimationFrame(() => {
+    __twFitRaf[win.n] = null;
+    termApplyFit(win);
+  });
 }
 
 function termSetDot(win, state) {
