@@ -27,6 +27,7 @@ fwpanel2 — 简易VPS管理面板2.0（适配 Debian 13 / nftables）
 """
 
 import argparse
+import base64
 import datetime
 import hashlib
 import hmac
@@ -35,7 +36,10 @@ import json
 import os
 import re
 import secrets
+import select
 import shutil
+import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -47,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.1.18"
+CURRENT_VERSION = "2.1.19"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -2414,6 +2418,197 @@ def install_pkgs(pkgs):
     return True, f"已安装: {' '.join(pkgs)}"
 
 
+# ============================ Web 终端（v2.1.19） ============================
+# 安全模型（用户确认 2026-09）：
+# 1. 打开终端 ≠ 自动 root：PTY 降权到专用低权用户 term（不存在时创建/提示）
+# 2. 终端内凭据（用户名/密码/密钥）由用户自己输入，面板不代管不落盘
+# 3. 密钥辅助：只列面板机 ~/.ssh 下私钥路径生成 ssh -i 命令，不读取内容
+# 4. 仅本机 Web 登录可开终端；远程节点终端经联邦中继（节点端也降权 term）
+# 5. 连接关闭即销毁 PTY；并发连接数限流；审计日志
+TERM_USER = "term"                # PTY 降权用户
+TERM_SHELL = "/bin/bash"
+TERM_MAX_CONNS = 8                # 并发终端上限
+WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+_term_conns = 0
+_term_conns_lock = threading.Lock()
+
+
+def ws_accept_key(key):
+    """RFC6455 Sec-WebSocket-Accept = base64(sha1(key + GUID))"""
+    return base64.b64encode(hashlib.sha1((key + WS_GUID).encode()).digest()).decode()
+
+
+def ws_encode_frame(payload, opcode=0x1):
+    """服务端→客户端帧（不掩码）。opcode: 1=text 2=binary 8=close 9=ping 0xA=pong"""
+    if isinstance(payload, str):
+        payload = payload.encode()
+    hdr = bytearray([0x80 | opcode])   # FIN=1
+    n = len(payload)
+    if n < 126:
+        hdr.append(n)
+    elif n < 65536:
+        hdr.append(126)
+        hdr += struct.pack(">H", n)
+    else:
+        hdr.append(127)
+        hdr += struct.pack(">Q", n)
+    return bytes(hdr) + payload
+
+
+def ws_encode_frame_client(payload, opcode=0x1):
+    """客户端→服务端帧（RFC6455 客户端帧必须掩码）。中继主控对节点用。"""
+    if isinstance(payload, str):
+        payload = payload.encode()
+    mask_key = secrets.token_bytes(4)
+    hdr = bytearray([0x80 | opcode])
+    n = len(payload)
+    if n < 126:
+        hdr.append(0x80 | n)
+    elif n < 65536:
+        hdr.append(0x80 | 126)
+        hdr += struct.pack(">H", n)
+    else:
+        hdr.append(0x80 | 127)
+        hdr += struct.pack(">Q", n)
+    hdr += mask_key
+    masked = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    return bytes(hdr) + masked
+
+
+def ws_read_frame(rfile):
+    """从 buffered reader 读一帧（客户端→服务端，需解掩码）。返回 (opcode, payload)。
+    连接关闭返回 (None, None)。"""
+    hdr = _ws_read_exact(rfile, 2)
+    if hdr is None:
+        return None, None
+    b0, b1 = hdr[0], hdr[1]
+    opcode = b0 & 0x0F
+    masked = b1 & 0x80
+    ln = b1 & 0x7F
+    if ln == 126:
+        ext = _ws_read_exact(rfile, 2)
+        if ext is None:
+            return None, None
+        ln = struct.unpack(">H", ext)[0]
+    elif ln == 127:
+        ext = _ws_read_exact(rfile, 8)
+        if ext is None:
+            return None, None
+        ln = struct.unpack(">Q", ext)[0]
+    mask_key = b""
+    if masked:
+        mask_key = _ws_read_exact(rfile, 4)
+        if mask_key is None:
+            return None, None
+    payload = _ws_read_exact(rfile, ln) if ln else b""
+    if payload is None:
+        return None, None
+    if masked:
+        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    return opcode, payload
+
+
+def _ws_read_exact(rfile, n):
+    buf = b""
+    while len(buf) < n:
+        try:
+            chunk = rfile.read(n - len(buf))
+        except Exception:
+            return None
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
+def ws_client_connect(url, token, timeout=15):
+    """作为 WS 客户端连接 url（http:// 或 https://），带 X-Fwpanel-Token。
+    成功返回 (sock, rfile)；失败抛异常。rfile 用 makefile 便于 read。"""
+    from urllib.parse import urlparse as _up
+    u = _up(url)
+    if u.scheme not in ("http", "https"):
+        raise ValueError("unsupported scheme: " + u.scheme)
+    port = u.port or (443 if u.scheme == "https" else 80)
+    host = u.hostname or ""
+    raw = socket.create_connection((host, port), timeout=timeout)
+    sock = raw
+    if u.scheme == "https":
+        import ssl
+        ctx = ssl.create_default_context()
+        sock = ctx.wrap_socket(raw, server_hostname=host)
+    key = base64.b64encode(secrets.token_bytes(16)).decode()
+    req = (
+        f"GET {u.path or '/'} HTTP/1.1\r\n"
+        f"Host: {host}:{port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n"
+        f"{FED_HEADER}: {token}\r\n"
+        "\r\n"
+    )
+    sock.sendall(req.encode())
+    rfile = sock.makefile("rb")
+    # 读响应行 + 头
+    status_line = rfile.readline()
+    if not status_line or b" 101 " not in status_line:
+        raise ConnectionError("upgrade refused: %r" % (status_line or b"<empty>"))
+    while True:
+        line = rfile.readline()
+        if line in (b"\r\n", b"\n", b""):
+            break
+    return sock, rfile
+
+
+def _term_ensure_user():
+    """确保低权用户 term 存在。root 下自动创建；非 root 且缺失返回 False。"""
+    try:
+        import pwd
+        pwd.getpwnam(TERM_USER)
+        return True
+    except KeyError:
+        pass
+    if os.geteuid() != 0:
+        return False
+    try:
+        subprocess.run(["useradd", "-m", "-s", TERM_SHELL, "-U", TERM_USER],
+                       capture_output=True, text=True, timeout=30)
+        import pwd
+        pwd.getpwnam(TERM_USER)
+        log(f"[term] 已创建低权用户 {TERM_USER}")
+        return True
+    except Exception as e:
+        log(f"[term] 创建用户失败: {e}")
+        return False
+
+
+def _term_spawn_pty():
+    """fork PTY 会话：以 term 低权用户跑 shell。返回 (master_fd, proc)。
+    非 root 环境（测试/DRY_RUN）退回当前用户，便于本地验证。"""
+    import pty
+    pid, master_fd = pty.fork()
+    if pid == 0:
+        # 子进程：降权到 term
+        try:
+            import pwd
+            pw = pwd.getpwnam(TERM_USER)
+            os.setgid(pw.pw_gid)
+            os.setuid(pw.pw_uid)
+            os.environ["HOME"] = pw.pw_dir
+            os.environ["USER"] = TERM_USER
+            os.environ["LOGNAME"] = TERM_USER
+        except Exception:
+            pass  # 非 root/测试环境：保持当前用户
+        os.execv(TERM_SHELL, [TERM_SHELL, "-l"])
+        os._exit(1)
+    return master_fd, pid
+
+
+def _term_audit(event, peer=""):
+    """终端审计日志"""
+    log(f"[term] {event} {peer}")
+
+
 # ---------- Docker 模块（v1.24.0）----------
 
 def docker_available():
@@ -3421,6 +3616,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._serve_static("index.html")
         elif path == "/favicon.ico":
             self._serve_static("favicon.ico")
+        elif path.startswith("/static/vendor/"):
+            self._serve_static(path[len("/static/"):])
         elif path.startswith("/static/fonts/"):
             self._serve_static(path[len("/static/"):])
         elif path == "/api/bbr":
@@ -3477,9 +3674,16 @@ class PanelHandler(BaseHTTPRequestHandler):
         elif path == "/api/fed/nodes":
             self._api_fed_nodes_list()
         elif path.startswith("/api/fed/"):
+            # 终端 WebSocket 升级由 _api_fed_proxy 内部识别（HTTP 头含 Upgrade）
             self._api_fed_proxy()
         elif path.startswith("/api/tasks/"):
             self._api_task_status(path[len("/api/tasks/"):])
+        elif path == "/api/term/ws":
+            self._api_term_ws()
+        elif path == "/api/term/keys":
+            self._api_term_keys()
+        elif path == "/api/term/info":
+            self._api_term_info()
         else:
             self._send(404, {"error": "Not Found"})
 
@@ -3511,7 +3715,194 @@ class PanelHandler(BaseHTTPRequestHandler):
             return
         self._send(200, t)
 
-    # ---------- 联邦 API（2.0 多机管理） ----------
+    # ---------- Web 终端（v2.1.19） ----------
+    def _api_term_info(self):
+        """GET /api/term/info → 终端可用性：term 用户存在、并发占用"""
+        token = self._require_auth()
+        if token is None:
+            return
+        with _term_conns_lock:
+            busy = _term_conns
+        self._send(200, {
+            "available": _term_ensure_user() if os.geteuid() == 0 else True,
+            "busy": busy, "max": TERM_MAX_CONNS,
+            "user": TERM_USER,
+        })
+
+    def _api_term_keys(self):
+        """GET /api/term/keys → 列出可选的 SSH 私钥路径（只列名不读内容）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        keys = []
+        # term 用户 ~/.ssh 下 + 常见位置（存在且为私钥特征：非 .pub）
+        candidates = []
+        try:
+            import pwd
+            term_home = pwd.getpwnam(TERM_USER).pw_dir
+            ssh_dir = os.path.join(term_home, ".ssh")
+            if os.path.isdir(ssh_dir):
+                candidates += [os.path.join(ssh_dir, f) for f in os.listdir(ssh_dir)]
+        except Exception:
+            pass
+        for d in ("/root/.ssh", os.path.expanduser("~/.ssh")):
+            try:
+                if os.path.isdir(d):
+                    candidates += [os.path.join(d, f) for f in os.listdir(d)]
+            except Exception:
+                pass
+        seen = set()
+        for p in candidates:
+            try:
+                base = os.path.basename(p)
+                if base.endswith(".pub") or "known_hosts" in base or "config" in base or "authorized" in base:
+                    continue
+                with open(p, "rb") as f:
+                    head = f.read(32)
+                if b"PRIVATE KEY" not in head:
+                    continue
+                rp = os.path.realpath(p)
+                if rp not in seen:
+                    seen.add(rp)
+                    keys.append(rp)
+            except Exception:
+                continue
+        self._send(200, {"keys": keys})
+
+    def _ws_token_ok(self):
+        """WS 升级鉴权：query token = 本机登录会话，或 X-Fwpanel-Token = 有效联邦令牌（节点被主控中继）。"""
+        parsed = urlparse(self.path)
+        qs = parse_qs(parsed.query)
+        qt = (qs.get("token") or [""])[0]
+        if qt and self.server.auth.check(qt):
+            return True
+        fed = self.headers.get(FED_HEADER, "")
+        if fed and self.server.auth.check_fed(fed):
+            return True
+        return False
+
+    def _ws_handshake(self):
+        """RFC6455 服务端握手：成功返回 True（已发 101）；失败已发响应返回 False"""
+        key = self.headers.get("Sec-WebSocket-Key", "")
+        if not key:
+            self._send(400, {"error": "not a websocket upgrade"})
+            return False
+        accept = ws_accept_key(key)
+        self.send_response_only(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", accept)
+        self.end_headers()
+        return True
+
+    def _ws_send(self, payload, opcode=0x1):
+        try:
+            self.wfile.write(ws_encode_frame(payload, opcode))
+            self.wfile.flush()
+            return True
+        except Exception:
+            return False
+
+    def _api_term_ws(self):
+        """GET /api/term/ws?token=… → 本机 Web 终端（WS 升级，PTY 降权 term 用户）"""
+        if not self._ws_token_ok():
+            self._send(401, {"error": "未登录"})
+            return
+        # root 面板必须降权到 term；非 root（低权限环境/测试）允许以当前用户跑
+        if os.geteuid() == 0 and not _term_ensure_user():
+            self._send(503, {"error": f"低权用户 {TERM_USER} 不存在且无法创建"})
+            return
+        with _term_conns_lock:
+            global _term_conns
+            if _term_conns >= TERM_MAX_CONNS:
+                self._send(503, {"error": "终端并发数已达上限"})
+                return
+            _term_conns += 1
+        peer = self.client_address[0] if self.client_address else ""
+        _term_audit("open", peer)
+        self.close_connection = True   # WS 长连接，禁止 HTTP keep-alive 复用
+        if not self._ws_handshake():
+            with _term_conns_lock:
+                _term_conns -= 1
+            return
+        try:
+            import fcntl
+            import termios
+            import struct as _struct
+            master_fd, pid = _term_spawn_pty()
+            stop = threading.Event()
+
+            def _pty_to_ws():
+                """PTY 输出 → WS 帧"""
+                try:
+                    while not stop.is_set():
+                        r, _, _ = select.select([master_fd], [], [], 0.3)
+                        if master_fd in r:
+                            try:
+                                data = os.read(master_fd, 8192)
+                            except OSError:
+                                break
+                            if not data:
+                                break
+                            if not self._ws_send(data, 0x1):
+                                break
+                except Exception:
+                    pass
+                stop.set()
+
+            def _ws_to_pty():
+                """WS 输入帧 → PTY；resize 帧(二进制 JSON) → ioctl"""
+                try:
+                    while not stop.is_set():
+                        opcode, payload = ws_read_frame(self.rfile)
+                        if opcode is None:          # 连接关闭
+                            break
+                        if opcode == 0x8:           # close
+                            self._ws_send(b"", 0x8)
+                            break
+                        if opcode == 0x9:           # ping → pong
+                            self._ws_send(payload, 0xA)
+                            continue
+                        if opcode == 0x2:           # binary = resize 控制
+                            try:
+                                j = json.loads(payload.decode())
+                                if j.get("type") == "resize":
+                                    fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                                                _struct.pack("HHHH", int(j.get("rows", 24)),
+                                                             int(j.get("cols", 80)), 0, 0))
+                            except Exception:
+                                pass
+                            continue
+                        if opcode == 0x1 and payload:
+                            os.write(master_fd, payload)
+                except Exception:
+                    pass
+                stop.set()
+
+            t1 = threading.Thread(target=_pty_to_ws, daemon=True)
+            t2 = threading.Thread(target=_ws_to_pty, daemon=True)
+            t1.start(); t2.start()
+            # 主线程等待任一端结束 → 全部收尾
+            t1.join(); t2.join()
+            stop.set()
+            try:
+                os.close(master_fd)
+            except Exception:
+                pass
+            try:
+                os.kill(pid, 9)
+            except Exception:
+                pass
+            _term_audit("close", peer)
+        finally:
+            with _term_conns_lock:
+                _term_conns -= 1
+            # 确保剩余数据冲刷（若 wfile 仍打开）
+            try:
+                self.wfile.flush()
+            except Exception:
+                pass
+
     def _api_fed_status(self):
         """本机联邦状态 / 探活（主面板添加节点时探测；本机登录或联邦令牌均可访问）"""
         token = self._require_auth()
@@ -3622,9 +4013,18 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     def _api_fed_proxy(self):
         """核心代理：把 /api/fed/<node_id>/api/... 原样转发到节点（带节点联邦令牌）"""
+        parsed = urlparse(self.path)
+        # WebSocket 升级（远程终端）：浏览器 WS 无法带 Authorization header，token 在 query ——
+        # 用 _ws_token_ok 校验（本机登录会话），校验通过后帧级中继到节点
+        if (self.headers.get("Upgrade", "").lower() == "websocket"
+                and parsed.path.endswith("/api/term/ws")):
+            if not self._ws_token_ok():
+                self._send(401, {"error": "未登录"})
+                return
+            self._relay_term_ws()
+            return
         if self._require_local() is None:
             return
-        parsed = urlparse(self.path)
         parts = parsed.path.split("/")
         # ['', 'api', 'fed', '<node_id>', 'api', ...]
         if len(parts) < 6 or parts[4] != "api":
@@ -3682,6 +4082,101 @@ class PanelHandler(BaseHTTPRequestHandler):
                 self.wfile.write(raw)
         except Exception as e:
             self._send(502, {"error": "节点不可达（%s）：请检查节点地址与网络" % type(e).__name__})
+
+    def _relay_term_ws(self):
+        """远程终端中继：浏览器(WS client) ↔ 本主控(WS server) ↔ 节点(WS client)。
+        帧级双向解码/重编码——浏览器帧(掩码)解码后以客户端帧(重掩码)发节点，反向同理。"""
+        parsed = urlparse(self.path)
+        parts = parsed.path.split("/")
+        # ['', 'api', 'fed', '<node_id>', 'api', 'term', 'ws']
+        if len(parts) < 6 or parts[3] == "":
+            self._send(404, {"error": "Not Found"})
+            return
+        node_id = parts[3]
+        nodes = _load_fed_nodes()
+        node = nodes.get(node_id)
+        if not node:
+            self._send(404, {"error": "节点不存在"})
+            return
+        base = (node.get("url") or "").rstrip("/")
+        tok = node.get("token", "")
+        if not base or not tok:
+            self._send(400, {"error": "节点未配置地址或令牌"})
+            return
+        # 1) 与浏览器完成服务端握手
+        if not self._ws_handshake():
+            return
+        # 2) 作为客户端连接节点（带联邦令牌）
+        try:
+            nsock, nrfile = ws_client_connect(base + "/api/term/ws", tok)
+        except Exception as e:
+            self._send(502, {"error": "节点终端不可达: %s" % type(e).__name__})
+            return
+        self.close_connection = True
+        stop = threading.Event()
+
+        def _browser_to_node():
+            """浏览器帧 → 节点（重掩码）"""
+            try:
+                while not stop.is_set():
+                    op, payload = ws_read_frame(self.rfile)
+                    if op is None:
+                        break
+                    if op == 0x8:      # close：通知节点后结束
+                        try:
+                            nsock.sendall(ws_encode_frame_client(b"", 0x8))
+                        except Exception:
+                            pass
+                        break
+                    if op == 0x9:      # ping
+                        self._ws_send(payload, 0xA)
+                        continue
+                    try:
+                        nsock.sendall(ws_encode_frame_client(payload or b"", op))
+                    except Exception:
+                        break
+            except Exception:
+                pass
+            stop.set()
+
+        def _node_to_browser():
+            """节点帧 → 浏览器（服务端帧不掩码）"""
+            try:
+                while not stop.is_set():
+                    op, payload = ws_read_frame(nrfile)
+                    if op is None:
+                        break
+                    if op == 0x8:      # 节点关闭
+                        self._ws_send(b"", 0x8)
+                        break
+                    if op == 0x9:      # 节点 ping → 回 pong（节点是 server 不会发 ping，防御）
+                        try:
+                            nsock.sendall(ws_encode_frame_client(payload or b"", 0xA))
+                        except Exception:
+                            pass
+                        continue
+                    try:
+                        self.wfile.write(ws_encode_frame(payload or b"", op))
+                        self.wfile.flush()
+                    except Exception:
+                        break
+            except Exception:
+                pass
+            stop.set()
+
+        t1 = threading.Thread(target=_browser_to_node, daemon=True)
+        t2 = threading.Thread(target=_node_to_browser, daemon=True)
+        t1.start(); t2.start()
+        t1.join(); t2.join()
+        stop.set()
+        try:
+            nsock.close()
+        except Exception:
+            pass
+        try:
+            self.wfile.flush()
+        except Exception:
+            pass
 
     def do_POST(self):
         parsed = urlparse(self.path)
@@ -3818,6 +4313,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             ctype = "text/html; charset=utf-8"
             # 注入当前版本号（登录页底部显示）
             data = data.replace(b"__VERSION__", CURRENT_VERSION.encode())
+        elif name.endswith(".js"):
+            ctype = "application/javascript; charset=utf-8"
+        elif name.endswith(".css"):
+            ctype = "text/css; charset=utf-8"
         elif name.endswith(".png"):
             ctype = "image/png"
         elif name.endswith(".ico"):

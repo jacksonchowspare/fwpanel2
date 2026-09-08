@@ -4557,5 +4557,87 @@ class TestTasks(unittest.TestCase):
             panel.install_docker_pkgs = real_install
 
 
+class TestWsFrames(unittest.TestCase):
+    """Web 终端 WS 帧层（v2.1.19）：握手 accept、帧编解码往返、掩码、长帧、分片无关性"""
+
+    def test_accept_key(self):
+        # RFC6455 官方示例：key "dGhlIHNhbXBsZSBub25jZQ==" → accept "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        self.assertEqual(panel.ws_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+                         "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=")
+
+    def test_encode_server_frame_no_mask(self):
+        frame = panel.ws_encode_frame(b"hi", 0x1)
+        # FIN+text: 0x81；长度 2 不掩码 → 0x02
+        self.assertEqual(frame, b"\x81\x02hi")
+
+    def test_server_frame_roundtrip(self):
+        for n in (0, 1, 125, 126, 65535, 65536, 100000):
+            payload = b"x" * n
+            frame = panel.ws_encode_frame(payload, 0x1)
+            # 用 BytesIO 模拟 buffered reader 读回
+            import io
+            op, out = panel.ws_read_frame(io.BytesIO(frame))
+            self.assertEqual(op, 0x1)
+            self.assertEqual(out, payload)
+
+    def test_client_masked_frame_roundtrip(self):
+        """客户端帧带掩码：服务端 ws_read_frame 必须正确解掩码"""
+        import io
+        payload = b"echo hello\n"
+        frame = panel.ws_encode_frame_client(payload, 0x1)
+        # 帧头第一字节 FIN+text
+        self.assertEqual(frame[0], 0x81)
+        # 客户端帧第二字节必须带掩码位 (0x80|len)
+        self.assertTrue(frame[1] & 0x80)
+        op, out = panel.ws_read_frame(io.BytesIO(frame))
+        self.assertEqual(op, 0x1)
+        self.assertEqual(out, payload)
+
+    def test_client_masked_long_payload(self):
+        import io
+        payload = os.urandom(70000)  # 127 扩展长度路径
+        frame = panel.ws_encode_frame_client(payload, 0x2)
+        self.assertEqual(frame[1] & 0x80, 0x80)
+        self.assertEqual(frame[1] & 0x7F, 127)
+        op, out = panel.ws_read_frame(io.BytesIO(frame))
+        self.assertEqual(op, 0x2)
+        self.assertEqual(out, payload)
+
+    def test_ws_read_frame_empty_returns_none(self):
+        import io
+        self.assertEqual(panel.ws_read_frame(io.BytesIO(b"")), (None, None))
+        # 只有半个头 → 也视为关闭
+        self.assertEqual(panel.ws_read_frame(io.BytesIO(b"\x81")), (None, None))
+
+    def test_split_frames_are_assembled(self):
+        """TCP 分片：帧被拆成多段到达仍能正确组装（_ws_read_exact 补读）"""
+        import io
+        payload = b"A" * 5000
+        frame = panel.ws_encode_frame(payload, 0x1)
+        # 模拟 recv 每次只给 7 字节的慢速流
+        class Chunked:
+            def __init__(self, data, chunk):
+                self.data, self.chunk, self.i = data, chunk, 0
+            def read(self, n):
+                if self.i >= len(self.data):
+                    return b""
+                # 模拟慢速流：最多给 chunk 字节，且尊重 read(n) 的上限
+                take = min(self.chunk, n, len(self.data) - self.i)
+                out = self.data[self.i:self.i + take]
+                self.i += take
+                return out
+        op, out = panel.ws_read_frame(Chunked(frame, 7))
+        self.assertEqual(op, 0x1)
+        self.assertEqual(out, payload)
+
+    def test_close_ping_opcodes_roundtrip(self):
+        import io
+        for op, payload in ((0x8, b""), (0x9, b"ping"), (0xA, b"pong")):
+            frame = panel.ws_encode_frame(payload, op)
+            got_op, got_payload = panel.ws_read_frame(io.BytesIO(frame))
+            self.assertEqual(got_op, op)
+            self.assertEqual(got_payload, payload)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

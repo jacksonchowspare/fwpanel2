@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="2.1.18"
+readonly SCRIPT_VERSION="2.1.19"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -205,6 +205,11 @@ do_upgrade() {
     mkdir -p "$tmpdir/fonts"
     for f in fw-sans-sc-regular.woff2 fw-sans-sc-bold.woff2 0xProto-Regular.woff2 0xProto-Bold.woff2; do
         fetch_source "$tmpdir/fonts/$f" "static/fonts/$f" || log_warn "字体 $f 下载失败(将使用系统字体)"
+    done
+    # Web 终端 xterm.js（v2.1.19）：下载失败仅终端不可用，主功能不受影响
+    mkdir -p "$tmpdir/vendor"
+    for f in xterm.js xterm.css xterm-addon-fit.js; do
+        fetch_source "$tmpdir/vendor/$f" "static/vendor/$f" || log_warn "终端资源 $f 下载失败(Web 终端不可用)"
     done
     # 备份当前版本（保留最近 3 份）
     local bak
