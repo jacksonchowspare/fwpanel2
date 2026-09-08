@@ -465,7 +465,7 @@ tr:hover td { background: var(--panel-solid); }
   .twin { position: fixed; z-index: 55; }
   .twin-frame { display: flex; flex-direction: column; overflow: hidden;
     border: var(--bdw) solid var(--border); border-radius: var(--r-modal);
-    background: var(--card); box-shadow: var(--shadow-modal); }
+    background: var(--card); box-shadow: var(--shadow-modal); position: relative; }
   .twin-title { display: flex; align-items: center; gap: 4px; padding: 5px 10px;
     cursor: move; user-select: none; background: var(--card);   /* v2.1.24：实底不透明 */
     border-bottom: 1px solid var(--border); }
@@ -513,15 +513,16 @@ tr:hover td { background: var(--panel-solid); }
       linear-gradient(135deg, transparent 0 42%, var(--border) 42% 56%, transparent 56%),
       linear-gradient(135deg, transparent 0 28%, var(--border) 28% 42%, transparent 42%);
     background-size: 100% 100%; }
-  /* 终端右键菜单（v2.1.27） */
+  /* 终端右键菜单（v2.1.27）：挂在 .twin-frame(zoom,position:relative) 内，
+     坐标 = 布局px = 视觉/zoom，内容随窗口缩放一致，clamp 内不触发 overflow 裁切 */
   .twin-ctx { position: absolute; z-index: 85; display: none; flex-direction: column; gap: 1px;
-    min-width: 120px; padding: 4px; background: var(--card);
+    min-width: 118px; padding: 4px; background: var(--card);
     border: var(--bdw) solid var(--border); border-radius: var(--r-panel, 10px);
     box-shadow: var(--shadow-modal); }
   .twin-ctx.show { display: flex; }
   .twin-ctx .tc-btn { display: flex; align-items: center; gap: 7px; width: 100%;
     border: 0; background: transparent; color: var(--text); font-size: 12.5px;
-    padding: 7px 9px; border-radius: 6px; cursor: pointer; text-align: left; }
+    padding: 7px 9px; border-radius: 6px; cursor: pointer; text-align: left; white-space: nowrap; }
   .twin-ctx .tc-btn:hover { background: var(--hover-bg2); }
   .twin-ctx .tc-sep { height: 1px; background: var(--border); margin: 2px 4px; }
 </style>
@@ -3888,12 +3889,12 @@ function termMakeWin(fedId, fedName) {
       "</div>" +
       '<div class="twin-term"><div class="tt-host"></div></div>' +
       '<div class="twin-resize"></div>' +
-    "</div>" +
-    '<div class="twin-ctx" id="twin_ctx_' + n + '">' +
-      '<button class="tc-btn" data-act="paste">📥 粘贴</button>' +
-      '<button class="tc-btn" data-act="copy">📋 复制</button>' +
-      '<div class="tc-sep"></div>' +
-      '<button class="tc-btn" data-act="clear">🧹 清屏</button>' +
+      '<div class="twin-ctx">' +
+        '<button class="tc-btn" data-act="paste">📥 粘贴</button>' +
+        '<button class="tc-btn" data-act="copy">📋 复制</button>' +
+        '<div class="tc-sep"></div>' +
+        '<button class="tc-btn" data-act="clear">🧹 清屏</button>' +
+      "</div>" +
     "</div>";
   document.body.appendChild(el);
   const win = {
@@ -3990,18 +3991,50 @@ function termFontZoom(win, delta) {
   }
 }
 function termBindFontKeys(win) {
-  // xterm 隐藏输入框的键盘：Ctrl/⌘ + =/-/0 → 调字号（阻止浏览器页面缩放）
-  if (!win.term) return;
-  try {
-    win.term.attachCustomKeyEventHandler(ev => {
-      if (ev.type !== "keydown" || !(ev.ctrlKey || ev.metaKey)) return true;
+  // 全局只注册一次：capture 阶段拦截 Ctrl/⌘+=/-/0，焦点在终端内时阻止浏览器页面缩放
+  if (!window.__twFontKeysBound) {
+    window.__twFontKeysBound = true;
+    document.addEventListener("keydown", ev => {
+      if (ev.type !== "keydown" || !(ev.ctrlKey || ev.metaKey)) return;
       const k = ev.key;
-      if (k === "=" || k === "+") { termFontZoom(win, 1); return false; }
-      if (k === "-" || k === "_") { termFontZoom(win, -1); return false; }
-      if (k === "0") { win.fontSize = 13; localStorage.setItem("term_font_size", "13"); if (win.term) { win.term.options.fontSize = 13; } setTimeout(() => termApplyFit(win), 60); return false; }
-      return true;
-    });
-  } catch (e) {}
+      const isPlus = (k === "=" || k === "+");
+      const isMinus = (k === "-" || k === "_");
+      const isZero = (k === "0");
+      if (!isPlus && !isMinus && !isZero) return;
+      // 焦点必须落在某个终端窗口内
+      const ae = document.activeElement;
+      let w = null;
+      for (const tw of TERM_WINS) {
+        if (tw.host && tw.host.contains(ae)) { w = tw; break; }
+      }
+      if (!w || w.dying || !w.term) return;
+      ev.preventDefault();
+      ev.stopPropagation();
+      if (isZero) {
+        w.fontSize = 13;
+        localStorage.setItem("term_font_size", "13");
+        try { w.term.options.fontSize = 13; } catch (e) {}
+        setTimeout(() => termApplyFit(w), 60);
+      } else {
+        termFontZoom(w, isPlus ? 1 : -1);
+      }
+    }, true);
+  }
+  // xterm 自身键盘兜底（部分版本返回 false 即阻断 xterm 处理，仍保留）
+  if (win.term) {
+    try {
+      win.term.attachCustomKeyEventHandler(ev => {
+        if (ev.type !== "keydown" || !(ev.ctrlKey || ev.metaKey)) return true;
+        const k = ev.key;
+        if (k === "=" || k === "+" || k === "-" || k === "_" || k === "0") {
+          ev.preventDefault();   // 显式阻止浏览器默认（页面缩放）
+          ev.stopPropagation();
+          return false;
+        }
+        return true;
+      });
+    } catch (e) {}
+  }
   // 滚轮：Ctrl + 滚轮 → 调字号（阻止浏览器页面缩放）
   try {
     win.host.addEventListener("wheel", ev => {
