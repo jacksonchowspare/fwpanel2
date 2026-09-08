@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.1.30"
+CURRENT_VERSION = "2.1.31"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -2597,6 +2597,14 @@ def ws_client_connect(url, token, timeout=15):
         line = rfile.readline()
         if line in (b"\r\n", b"\n", b""):
             break
+    # v2.1.31：握手成功后清残留超时——create_connection(timeout=15) 的超时
+    # 会一直挂在 socket 上，中继读线程空闲 15s 即被 socket.timeout 掐断
+    # （_ws_read_exact 把超时当连接关闭）→ 远程终端空闲约 15s 断开。
+    # 连接阶段 15s 保护保留，长连阶段必须转阻塞，心跳由协议层 25s ping 负责。
+    try:
+        sock.settimeout(None)
+    except Exception:
+        pass
     return sock, rfile
 
 

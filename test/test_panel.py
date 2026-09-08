@@ -4700,6 +4700,38 @@ class TestWsFrames(unittest.TestCase):
             self.assertEqual(got_op, op)
             self.assertEqual(got_payload, payload)
 
+    def test_ws_client_connect_clears_residual_timeout(self):
+        """v2.1.31: 远程终端空闲约 15s 断开——create_connection(timeout=15) 的超时残留
+        在 socket 上,中继读线程空闲超时被 _ws_read_exact 当连接关闭。握手成功后必须清超时。"""
+        import socket as _sock
+        import threading as _th
+        srv = _sock.socket()
+        srv.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        srv.listen(1)
+        port = srv.getsockname()[1]
+        resp = (b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
+        def _accept():
+            try:
+                c, _ = srv.accept()
+                c.sendall(resp)
+                c.close()
+            except Exception:
+                pass
+        _th.Thread(target=_accept, daemon=True).start()
+        try:
+            sock, rfile = panel.ws_client_connect(
+                "http://127.0.0.1:%d/api/term/ws" % port, "tok")
+            try:
+                self.assertIsNone(
+                    sock.gettimeout(),
+                    "ws_client_connect 握手后 socket 仍残留连接超时 → 远程终端中继空闲会被掐断")
+            finally:
+                sock.close()
+        finally:
+            srv.close()
+
 
 class TestTermKeyApi(unittest.TestCase):
     """终端临时私钥上传/删除端点（v2.1.22）：校验 PEM、路径防穿越、删除后文件消失"""
