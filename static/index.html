@@ -498,7 +498,8 @@ tr:hover td { background: var(--panel-solid); }
   .twin-pop .tp-t { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
   .tp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
   .tp-grid .tpg { cursor: pointer; border: 1px solid var(--border); border-radius: 8px;
-    padding: 5px 7px; font-size: 11px; background: var(--input-bg); text-align: left; }
+    padding: 5px 7px; font-size: 11px; color: var(--text);   /* v2.1.29：显式文字色，防 button 默认黑字 */
+    background: var(--input-bg); text-align: left; }
   .tp-grid .tpg:hover { border-color: var(--accent); }
   .tp-grid .tpg.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
   .tp-grid .tpg .sw { display: flex; gap: 2px; margin-bottom: 4px; }
