@@ -3331,7 +3331,29 @@ async function changePwd() {
 let dkContainers = [], dkImages = [], dkStats = [];
 let dkPage = 1; const DK_PAGE_SIZE = 5;
 
+function resetDockerView() {
+  // 跨机器切换残留防御（本机/远程节点往返时，未安装分支不清旧状态行导致串台）
+  // 每次 loadDocker 先归零全部动态元素，再由目标机器数据填充
+  const s = $("docker_status");
+  s.textContent = "检测中...";
+  s.className = "";
+  $("docker_install_area").style.display = "none";
+  $("btn_dk_uninstall").style.display = "none";
+  $("dk_rows").innerHTML = '<tr><td colspan="5" style="color:var(--muted)">未安装 Docker 或暂无容器</td></tr>';
+  $("dk_img_rows").innerHTML = '<tr><td colspan="6" style="color:var(--muted)">未安装 Docker 或暂无镜像</td></tr>';
+  const dd = $("dk_dirs_status");
+  dd.textContent = "检测中...";
+  dd.style.color = "var(--muted)";
+  const dr = $("dk_dataroot_status");
+  dr.textContent = "检测中...";
+  dr.style.color = "var(--muted)";
+  $("dk_compose_list").innerHTML = '<div style="color:var(--muted);font-size:12px">暂无已保存项目</div>';
+  $("dk_stats_rows").innerHTML = '<tr><td colspan="6" style="color:var(--muted)">无运行中容器</td></tr>';
+  dkContainers = []; dkImages = []; dkStats = [];
+}
+
 async function loadDocker() {
+  resetDockerView();
   try {
     const st = await api("GET", "/api/docker");
     if (!st.installed) {
