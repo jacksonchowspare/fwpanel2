@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.1.25"
+CURRENT_VERSION = "2.1.26"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -2740,10 +2740,13 @@ def _term_login_shell():
     return TERM_SHELL
 
 
-def _term_spawn_pty():
+def _term_spawn_pty(rows=24, cols=80):
     """fork PTY 会话：以 term 低权用户跑 shell（zsh 优先，语法高亮）。返回 (master_fd, proc)。
     非 root 环境（测试/DRY_RUN）退回当前用户，便于本地验证。"""
     import pty
+    import fcntl
+    import termios
+    import struct as _st
     shell = _term_login_shell()
     pid, master_fd = pty.fork()
     if pid == 0:
@@ -2759,11 +2762,22 @@ def _term_spawn_pty():
             os.environ["SHELL"] = shell
         except Exception:
             pass  # 非 root/测试环境：保持当前用户
+        # v2.1.26：必须显式给 TERM——systemd 服务环境 TERM 为空，
+        # zsh 行编辑(zle)在 dumb/空 TERM 下击键重绘错乱（输入乱跳）；bash readline 容忍才未暴露
+        if not os.environ.get("TERM") or os.environ.get("TERM") in ("dumb", "unknown"):
+            os.environ["TERM"] = "xterm-256color"
         try:
             os.execv(shell, [shell, "-l"])
         except Exception:
             os.execv(TERM_SHELL, [TERM_SHELL, "-l"])
         os._exit(1)
+    # 父进程：立刻设置 PTY 窗口尺寸（pty.fork 新建时 winsize 全 0，
+    # zsh 启动读到 0 行 0 列 → 提示符/行编辑错乱）。后续前端 resize 帧会覆盖。
+    try:
+        fcntl.ioctl(master_fd, termios.TIOCSWINSZ,
+                    _st.pack("HHHH", rows, cols, 0, 0))
+    except Exception:
+        pass
     return master_fd, pid
 
 
