@@ -1605,6 +1605,13 @@ async function fedCheckUpgrade(n) {
     const u = await api("GET", "/api/fed/" + n.id + "/api/upgrade/check");
     if (!u) return;
     const cur = u.current || "";
+    // v2.1.30：节点当前版本补通道后缀（正式版/测试版），与本机状态卡一致
+    const vb = $("fed_ver_b_" + n.id);
+    if (vb) {
+      const ch = u.current_channel === "beta" ? " 测试版" : (u.current_channel === "stable" ? " 正式版" : "");
+      vb.textContent = "v" + cur + ch;
+      vb.style.color = "var(--text)";
+    }
     const stableOk = u.update_available && u.latest && vcmp(u.latest, cur) > 0;            // 正式版可升
     const betaTag = (u.prerelease && u.prerelease.tag) || "";
     // 测试版可升:比当前新,且比正式版还新(或无正式版可升)——测试版不比正式版新时不显示
@@ -1612,7 +1619,6 @@ async function fedCheckUpgrade(n) {
                       (!stableOk || vcmp(betaTag, u.latest || "") > 0));
     if (!stableOk && !betaOk) return;
     // 版本标签标橙提示
-    const vb = $("fed_ver_b_" + n.id);
     if (vb) {
       const tips = [];
       if (stableOk) tips.push("正式版 v" + u.latest);
