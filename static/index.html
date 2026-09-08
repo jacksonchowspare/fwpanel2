@@ -513,6 +513,17 @@ tr:hover td { background: var(--panel-solid); }
       linear-gradient(135deg, transparent 0 42%, var(--border) 42% 56%, transparent 56%),
       linear-gradient(135deg, transparent 0 28%, var(--border) 28% 42%, transparent 42%);
     background-size: 100% 100%; }
+  /* 终端右键菜单（v2.1.27） */
+  .twin-ctx { position: absolute; z-index: 85; display: none; flex-direction: column; gap: 1px;
+    min-width: 120px; padding: 4px; background: var(--card);
+    border: var(--bdw) solid var(--border); border-radius: var(--r-panel, 10px);
+    box-shadow: var(--shadow-modal); }
+  .twin-ctx.show { display: flex; }
+  .twin-ctx .tc-btn { display: flex; align-items: center; gap: 7px; width: 100%;
+    border: 0; background: transparent; color: var(--text); font-size: 12.5px;
+    padding: 7px 9px; border-radius: 6px; cursor: pointer; text-align: left; }
+  .twin-ctx .tc-btn:hover { background: var(--hover-bg2); }
+  .twin-ctx .tc-sep { height: 1px; background: var(--border); margin: 2px 4px; }
 </style>
 <script>
 /* 界面缩放:4K/高分屏按视口宽度自动放大(html zoom,首帧前生效防闪烁);可在主题面板手动调 */
@@ -3877,6 +3888,12 @@ function termMakeWin(fedId, fedName) {
       "</div>" +
       '<div class="twin-term"><div class="tt-host"></div></div>' +
       '<div class="twin-resize"></div>' +
+    "</div>" +
+    '<div class="twin-ctx" id="twin_ctx_' + n + '">' +
+      '<button class="tc-btn" data-act="paste">📥 粘贴</button>' +
+      '<button class="tc-btn" data-act="copy">📋 复制</button>' +
+      '<div class="tc-sep"></div>' +
+      '<button class="tc-btn" data-act="clear">🧹 清屏</button>' +
     "</div>";
   document.body.appendChild(el);
   const win = {
@@ -3886,8 +3903,9 @@ function termMakeWin(fedId, fedName) {
     fileEl: el.querySelector(".twin-keys input"), pickBtn: el.querySelector(".twin-keys button"),
     host: el.querySelector(".tt-host"), term: null, fit: null, ws: null,
     resizeEl: el.querySelector(".twin-resize"),
+    ctxEl: el.querySelector(".twin-ctx"),
     keyPath: null, fedId: fedId || null, fedName: fedName || null,
-    rect: { left, top, W, H }, min: false, maxed: false, dot: null,
+    rect: { left, top, W, H }, min: false, maxed: false, dot: null, fontSize: 13,
   };
   TERM_WINS.push(win);
   win.dot = termMakeDock(win);
@@ -3899,10 +3917,100 @@ function termMakeWin(fedId, fedName) {
   btns[4].onclick = e => { e.stopPropagation(); termClose(win); };
   win.pickBtn.onclick = () => win.fileEl.click();
   win.fileEl.addEventListener("change", () => termPickKey(win));
+  // v2.1.27：终端区右键 → 自定义菜单（粘贴/复制/清屏）
+  const ctxBtns = win.ctxEl ? win.ctxEl.querySelectorAll(".tc-btn") : [];
+  ctxBtns.forEach(b => b.addEventListener("click", () => termCtxAction(win, b.dataset.act)));
+  win.host.addEventListener("contextmenu", e => {
+    e.preventDefault();
+    if (win.ws && win.ctxEl) termShowCtx(win, e.clientX, e.clientY);
+  });
   termDrag(win);
   termResize(win);
   termBuildPalette(win, pal.id);
   return win;
+}
+
+/* ---- 右键菜单（v2.1.27）---- */
+let __ctxOpen = null;    // 当前打开的窗口
+function termCtxHide() {
+  if (__ctxOpen && __ctxOpen.ctxEl) __ctxOpen.ctxEl.classList.remove("show");
+  __ctxOpen = null;
+}
+document.addEventListener("pointerdown", e => {
+  if (__ctxOpen && __ctxOpen.ctxEl && !__ctxOpen.ctxEl.contains(e.target)) termCtxHide();
+});
+function termShowCtx(win, cx, cy) {
+  termCtxHide();
+  __ctxOpen = win;
+  const ctx = win.ctxEl;
+  const z = termZoom();
+  // 菜单定位：相对窗口视觉坐标 → 除 zoom 得内容层坐标
+  const fr = win.frame.getBoundingClientRect();
+  const W = win.rect.W, H = win.rect.H;
+  let lx = (cx - fr.left) / z, ly = (cy - fr.top) / z;
+  // 防溢出窗口（估算菜单 130x110 内容 px）
+  if (lx + 130 > W) lx = Math.max(0, W - 134);
+  if (ly + 115 > H) ly = Math.max(0, H - 118);
+  ctx.style.left = lx + "px";
+  ctx.style.top = ly + "px";
+  ctx.classList.add("show");
+}
+function termCtxAction(win, act) {
+  termCtxHide();
+  if (act === "clear") { try { win.term.clear(); } catch (e) {} return; }
+  if (act === "copy") {
+    const sel = win.term ? win.term.getSelection() : "";
+    if (!sel) { toast("没有选中内容（先按住鼠标拖选要复制的文字）", "err"); return; }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(sel).then(() => toast("已复制 " + sel.length + " 字符"), () => toast("复制失败", "err"));
+    } else toast("当前浏览器不支持剪贴板 API", "err");
+    return;
+  }
+  if (act === "paste") {
+    if (!(navigator.clipboard && navigator.clipboard.readText)) { toast("当前浏览器不支持剪贴板读取（可 Ctrl+Shift+V）", "err"); return; }
+    navigator.clipboard.readText().then(t => {
+      if (t && win.term && win.ws) win.term.paste(t);
+    }).catch(() => toast("无法读取剪贴板（浏览器权限），可 Ctrl+Shift+V 粘贴", "err"));
+  }
+}
+
+/* ---- 终端字号缩放（v2.1.27）：焦点在终端内时 Ctrl+±/滚轮只调命令行字号 ---- */
+function termFontBase() {
+  const v = parseInt(localStorage.getItem("term_font_size"), 10);
+  return (v && v >= 8 && v <= 36) ? v : 13;
+}
+function termFontZoom(win, delta) {
+  let nf = Math.max(8, Math.min(36, win.fontSize + delta));
+  if (nf === win.fontSize) return;
+  win.fontSize = nf;
+  localStorage.setItem("term_font_size", String(nf));
+  if (win.term) {
+    try { win.term.options.fontSize = nf; } catch (e) {}
+    setTimeout(() => termApplyFit(win), 60);   // 等 xterm 字符测量刷新后重算行列
+  }
+}
+function termBindFontKeys(win) {
+  // xterm 隐藏输入框的键盘：Ctrl/⌘ + =/-/0 → 调字号（阻止浏览器页面缩放）
+  if (!win.term) return;
+  try {
+    win.term.attachCustomKeyEventHandler(ev => {
+      if (ev.type !== "keydown" || !(ev.ctrlKey || ev.metaKey)) return true;
+      const k = ev.key;
+      if (k === "=" || k === "+") { termFontZoom(win, 1); return false; }
+      if (k === "-" || k === "_") { termFontZoom(win, -1); return false; }
+      if (k === "0") { win.fontSize = 13; localStorage.setItem("term_font_size", "13"); if (win.term) { win.term.options.fontSize = 13; } setTimeout(() => termApplyFit(win), 60); return false; }
+      return true;
+    });
+  } catch (e) {}
+  // 滚轮：Ctrl + 滚轮 → 调字号（阻止浏览器页面缩放）
+  try {
+    win.host.addEventListener("wheel", ev => {
+      if (ev.ctrlKey || ev.metaKey) {
+        ev.preventDefault();
+        termFontZoom(win, ev.deltaY < 0 ? 1 : -1);
+      }
+    }, { passive: false });
+  } catch (e) {}
 }
 
 function termResize(win) {
@@ -4083,15 +4191,17 @@ async function openTerm() {
   } catch (e) { /* 静默 */ }
 
   const win = termMakeWin(fedId, fedName);
+  win.fontSize = termFontBase();
   const pal = termPalette(termThemeDefault());
   const fit = new FitAddon.FitAddon();
   const term = new Terminal({
     fontFamily: "'0xProto','FW Sans SC',ui-monospace,Menlo,Consolas,monospace",
-    fontSize: 13, cursorBlink: true, scrollback: 5000, theme: pal.theme,
+    fontSize: win.fontSize, cursorBlink: true, scrollback: 5000, theme: pal.theme,
   });
   term.loadAddon(fit);
   term.open(win.host);
   win.term = term; win.fit = fit;
+  termBindFontKeys(win);   // v2.1.27：Ctrl+±/滚轮 缩放终端字号
   setTimeout(() => { try { fit.fit(); termSendResize(win); } catch (e) {} }, 40);
   term.onData(d => { if (win.ws && win.ws.readyState === 1) win.ws.send(d); });
   term.onResize(() => termSendResize(win));
