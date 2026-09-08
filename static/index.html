@@ -450,6 +450,48 @@ tr:hover td { background: var(--panel-solid); }
 .modal input { width: 100%; }
 .modal input[type="checkbox"] { width: auto; flex: none; }
 .modal .btnrow { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+  /* ---- Web 终端多窗口系统（v2.1.23）---- */
+  #term_dock { position: fixed; left: 8px; top: 50%; transform: translateY(-50%); z-index: 46;
+    display: flex; flex-direction: column; gap: 8px; }
+  .twin-tab { width: 44px; height: 44px; border-radius: 12px; border: var(--bdw) solid var(--border);
+    background: var(--card); color: var(--text); font-size: 17px; cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
+    box-shadow: var(--shadow-card); transition: transform .15s; position: relative; }
+  .twin-tab:hover { transform: scale(1.08); }
+  .twin-tab .tt-n { font-size: 9px; color: var(--muted); line-height: 1; }
+  .twin { position: fixed; z-index: 55; }
+  .twin-frame { display: flex; flex-direction: column; overflow: hidden;
+    border: var(--bdw) solid var(--border); border-radius: var(--r-modal);
+    background: var(--card); box-shadow: var(--shadow-modal); }
+  .twin-title { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+    cursor: move; user-select: none; background: var(--hover-bg);
+    border-bottom: 1px dashed var(--border); border-radius: var(--r-modal) var(--r-modal) 0 0; }
+  .twin-title .tw-ico { font-size: 13px; }
+  .twin-title .tw-txt { font-size: 12px; font-weight: 600; flex: 1; white-space: nowrap;
+    overflow: hidden; text-overflow: ellipsis; }
+  .twin-title .tw-btn { cursor: pointer; border: 0; background: transparent; color: var(--muted);
+    font-size: 14px; line-height: 1; padding: 3px 6px; border-radius: 6px; }
+  .twin-title .tw-btn:hover { background: rgba(128,128,128,.18); color: var(--text); }
+  .twin-keys { display: none; padding: 7px 10px; border-bottom: 1px dashed var(--border);
+    flex-wrap: wrap; gap: 6px; align-items: center; }
+  .twin-keys.show { display: flex; }
+  .twin-keys .tk-name { font-size: 11px; color: var(--muted); }
+  .twin-term { flex: 1; min-height: 0; padding: 6px 8px; background: #11141a; }
+  .twin.maxed { left: 0 !important; top: 0 !important; }
+  .twin.maxed .twin-frame { width: 100vw !important; height: 100vh !important; border-radius: 0; }
+  .twin-pop { position: absolute; right: 6px; top: 34px; z-index: 70; display: none;
+    width: 224px; padding: 10px; background: var(--card); border: var(--bdw) solid var(--border);
+    border-radius: var(--r-panel, 10px); box-shadow: var(--shadow-modal); }
+  .twin-pop.show { display: block; }
+  .twin-pop .tp-t { font-size: 11px; color: var(--muted); margin-bottom: 6px; }
+  .tp-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+  .tp-grid .tpg { cursor: pointer; border: 1px solid var(--border); border-radius: 8px;
+    padding: 5px 7px; font-size: 11px; background: var(--input-bg); text-align: left; }
+  .tp-grid .tpg:hover { border-color: var(--accent); }
+  .tp-grid .tpg.on { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+  .tp-grid .tpg .sw { display: flex; gap: 2px; margin-bottom: 4px; }
+  .tp-grid .tpg .sw i { width: 14px; height: 9px; border-radius: 2px; display: inline-block; }
+  .twin.min { display: none; }
 </style>
 <script>
 /* 界面缩放:4K/高分屏按视口宽度自动放大(html zoom,首帧前生效防闪烁);可在主题面板手动调 */
@@ -1182,29 +1224,8 @@ tr:hover td { background: var(--panel-solid); }
   </div>
 </div>
 
-<!-- Web 终端弹窗（v2.1.19） -->
-<div id="term_modal" class="modal-mask hidden">
-  <div class="modal" style="width:min(92vw,1100px);height:min(86vh,720px);display:flex;flex-direction:column;padding:0">
-    <div style="display:flex;align-items:center;gap:10px;padding:10px 14px;border-bottom:1px dashed var(--border)">
-      <h3 style="margin:0">🖥 Web 终端</h3>
-      <span style="color:var(--muted);font-size:12px" id="term_hint">term 低权用户 · 需 root 请自行 su / ssh</span>
-      <span style="flex:1"></span>
-      <button class="btn mini ghost" onclick="termToggleKeyRow()" title="从你的电脑选择 SSH 私钥，临时上传供本会话使用（关闭即删）">🔑 用我的密钥</button>
-      <button class="btn mini" onclick="closeTerm()">关闭</button>
-    </div>
-    <div id="term_keys_row" style="display:none;padding:8px 14px;border-bottom:1px dashed var(--border);background:var(--input-bg)">
-      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-        <input type="file" id="term_key_file" accept=".pem,.key,id_rsa,id_ed25519" style="display:none">
-        <button class="btn mini" onclick="$('term_key_file').click()">📂 选择本地密钥文件…</button>
-        <span id="term_key_name" style="color:var(--muted);font-size:12px;flex:1;min-width:150px"></span>
-      </div>
-      <div style="color:var(--muted);font-size:11px;margin-top:6px">
-        从你的电脑上传私钥 → 临时存放到面板机（仅本次会话，权限 600）→ 自动拼 <code>ssh -i</code> 命令；关闭终端即删除，不落盘保存
-      </div>
-    </div>
-    <div id="term_box" style="flex:1;min-height:0;padding:8px 10px;background:#11141a;border-radius:0 0 8px 8px"></div>
-  </div>
-</div>
+<!-- Web 终端多窗口系统（v2.1.23）：dock 在左侧悬浮，窗口由 JS 动态创建 -->
+<div id="term_dock"></div>
 
 <!-- 编辑代理弹窗 -->
 <div id="pxe_modal" class="modal-mask hidden">
@@ -1936,6 +1957,17 @@ function applyZoomForce() {
   if (t) t.style.zoom = z;
   const cal = $("tr_cal_box");
   if (cal) cal.style.zoom = z;
+  // 终端多窗口（v2.1.23）：内容层跟随全局缩放；最大化窗口重算尺寸
+  document.querySelectorAll(".twin-frame").forEach(f => { f.style.zoom = z; });
+  try {   // TERM_WINS 在脚本后部 let 声明，applyZoomForce 首帧执行时处于 TDZ → 捕获忽略
+    TERM_WINS.forEach(w => {
+      if (w.maxed) {
+        w.frame.style.width = (window.innerWidth / z) + "px";
+        w.frame.style.height = (window.innerHeight / z) + "px";
+      }
+      termFit(w);
+    });
+  } catch (e) { /* 初始化前无窗口 */ }
   paintZoom();
 }
 function setZoom(v) {
@@ -3733,137 +3765,357 @@ function uninstallDocker() {
   }, "卸载 Docker");
 }
 
-/* ---------- Web 终端（v2.1.19） ---------- */
-let termInst = null;      // xterm 实例
-let termWs = null;        // WebSocket
-let termFit = null;
+/* ---------- Web 终端多窗口系统（v2.1.23） ---------- */
+const TERM_MAX_WIN = 8;
+let TERM_SEQ = 0;
+let TERM_WINS = [];          // 活动窗口（含最小化的）
+const TERM_PALETTES = [
+  { id: "dark", n: "深色经典",
+    theme: { background: "#11141a", foreground: "#d8dee9", cursor: "#d8dee9", cursorAccent: "#11141a",
+      selectionBackground: "#33506e", black: "#3b4252", red: "#e06c75", green: "#98c379", yellow: "#e5c07b",
+      blue: "#61afef", magenta: "#c678dd", cyan: "#56b6c2", white: "#d8dee9" }, sw: ["#11141a", "#61afef"] },
+  { id: "light", n: "浅色纸",
+    theme: { background: "#fdf6e3", foreground: "#383838", cursor: "#383838", cursorAccent: "#fdf6e3",
+      selectionBackground: "#b8d4e3", black: "#383838", red: "#a04040", green: "#2e7d32", yellow: "#9e6a03",
+      blue: "#1a5fb4", magenta: "#9b59b6", cyan: "#0e8a8a", white: "#fdf6e3" }, sw: ["#fdf6e3", "#383838"] },
+  { id: "green", n: "绿黑经典",
+    theme: { background: "#000000", foreground: "#33ff66", cursor: "#33ff66", cursorAccent: "#000000",
+      selectionBackground: "#1a3d1a", black: "#000000", red: "#ff3355", green: "#33ff66", yellow: "#ccff00",
+      blue: "#33aaff", magenta: "#ff33cc", cyan: "#33ffff", white: "#cfcfcf" }, sw: ["#000000", "#33ff66"] },
+  { id: "solar", n: "Solarized 暗",
+    theme: { background: "#002b36", foreground: "#93a1a1", cursor: "#93a1a1", cursorAccent: "#002b36",
+      selectionBackground: "#073642", black: "#073642", red: "#dc322f", green: "#859900", yellow: "#b58900",
+      blue: "#268bd2", magenta: "#d33682", cyan: "#2aa198", white: "#eee8d5" }, sw: ["#002b36", "#268bd2"] },
+  { id: "neon", n: "霓虹暗",
+    theme: { background: "#12081f", foreground: "#e6d7ff", cursor: "#b17af0", cursorAccent: "#12081f",
+      selectionBackground: "#4c1d95", black: "#2d1b4e", red: "#ff4d88", green: "#5cffb0", yellow: "#ffd166",
+      blue: "#7c9bff", magenta: "#d17aff", cyan: "#5ce1ff", white: "#e6d7ff" }, sw: ["#12081f", "#d17aff"] },
+];
 
-function termWsUrl() {
-  // 远程管理模式 → 经主控中继到节点；否则本机
+function termThemeDefault() { return localStorage.getItem("term_theme") || "dark"; }
+function termPalette(id) { return TERM_PALETTES.find(p => p.id === id) || TERM_PALETTES[0]; }
+function termZoom() {
+  const v = localStorage.getItem("ui_zoom");
+  const z = (!v || v === "auto") ? zoomAuto() : (parseFloat(v) || 1);
+  return Math.min(2, Math.max(1, z));
+}
+
+function termWsUrl(fedId) {
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
-  const prefix = fedNode ? "/api/fed/" + fedNode.id : "";
+  const prefix = fedId ? "/api/fed/" + fedId : "";
   return proto + "//" + location.host + prefix + "/api/term/ws?token=" + encodeURIComponent(token);
 }
+function termApiPrefix(fedId) { return fedId ? "/api/fed/" + fedId : ""; }
 
-async function openTerm() {
-  $("term_modal").classList.remove("hidden");
-  $("term_hint").textContent = fedNode
-    ? "远程终端（" + (fedNode.name || "") + "）· term 低权用户 · 需 root 请自行 su / ssh"
-    : "本机终端 · term 低权用户 · 需 root 请自行 su / ssh";
-  $("term_keys_row").style.display = "none";
-  termBindKeyFile();
-  try {
-    // 探测可用性（经代理到目标机）
-    const prefix = fedNode ? "/api/fed/" + fedNode.id : "";
-    const d = await api("GET", prefix + "/api/term/info");
-    if (!d.available) toast("低权用户 term 不存在且无法自动创建（面板需 root 运行）", "err");
-    if (d.busy >= d.max) toast("终端并发已达上限（" + d.busy + "/" + d.max + "）", "err");
-  } catch (e) { /* 静默：旧版本无此接口 */ }
-  if (!termInst) {
-    if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") {
-      toast("终端组件缺失（xterm.js 未部署）——请重新升级面板或手动补 static/vendor/", "err");
-      return;
-    }
-    termFit = new FitAddon.FitAddon();
-    termInst = new Terminal({
-      fontFamily: "'0xProto','FW Sans SC',ui-monospace,Menlo,Consolas,monospace",
-      fontSize: 13, cursorBlink: true, scrollback: 5000,
-      theme: { background: "#11141a", foreground: "#e6e6e6" },
-    });
-    termInst.loadAddon(termFit);
-    termInst.open($("term_box"));
-    termFit.fit();
-    termInst.onData(d => { if (termWs && termWs.readyState === 1) termWs.send(d); });
-    window.addEventListener("resize", () => { if (termFit) termFit.fit(); termSendResize(); });
-  }
-  termInst.focus();
-  termSendResize();
-  // 连接 WS
-  try { termWs = new WebSocket(termWsUrl()); }
-  catch (e) { toast("无法连接终端: " + e.message, "err"); return; }
-  termWs.onopen = () => { termInst.writeln("\x1b[90m-- 已连接（term 用户，非 root）--\x1b[0m"); termSendResize(); };
-  termWs.onmessage = ev => { try { termInst.write(ev.data); } catch (e) {} };
-  termWs.onclose = () => {
-    try { termInst.writeln("\x1b[90m\r\n-- 连接已关闭 --\x1b[0m"); } catch (e) {}
-    termWs = null;
-  };
-  termWs.onerror = () => { try { termInst.writeln("\x1b[91m\r\n-- 连接错误 --\x1b[0m"); } catch (e) {} };
+function termNewSeq() { return ++TERM_SEQ; }
+
+function termMakeDock(win) {
+  const d = document.createElement("div");
+  d.className = "twin-tab";
+  d.id = "twtab_" + win.n;
+  d.title = "终端 #" + win.n + "（点击恢复）";
+  d.innerHTML = '<span>🖥</span><span class="tt-n">#' + win.n + "</span><span class='tt-dot'></span>";
+  d.onclick = () => termRestore(win);
+  d.style.display = "none";   // 仅最小化时显示
+  $("term_dock").appendChild(d);
+  return d;
 }
 
-function termSendResize() {
-  if (!termWs || termWs.readyState !== 1 || !termInst) return;
+function termMakeWin(fedId, fedName) {
+  const n = termNewSeq();
+  const z = termZoom();
+  const pal = termPalette(termThemeDefault());
+  const title = fedId ? ("远程终端 · " + (fedName || "")) : "本机终端";
+  const el = document.createElement("div");
+  el.className = "twin";
+  el.id = "twin_" + n;
+  const W = 800, H = 500;
+  const left = Math.max(8, Math.round((window.innerWidth - W * z) / 2 + ((n - 1) % 5) * 28));
+  const top = Math.max(8, Math.round((window.innerHeight - H * z) / 2 - 40 + ((n - 1) % 5) * 24));
+  el.style.left = left + "px";
+  el.style.top = top + "px";
+  el.innerHTML =
+    '<div class="twin-frame" style="width:' + W + 'px;height:' + H + 'px;zoom:' + z + '">' +
+      '<div class="twin-title">' +
+        '<span class="tw-ico">🖥</span>' +
+        '<span class="tw-txt" title="' + title.replace(/"/g, "&quot;") + '">' + title + '</span>' +
+        '<button class="tw-btn" title="配色方案">🎨</button>' +
+        '<button class="tw-btn" title="用我的密钥（本地文件，关闭即删）">🔑</button>' +
+        '<button class="tw-btn" title="最小化到左侧">🗕</button>' +
+        '<button class="tw-btn" title="最大化 / 还原">⛶</button>' +
+        '<button class="tw-btn" title="关闭终端">✕</button>' +
+        '<div class="twin-pop">' +
+          '<div class="tp-t">终端配色（新开窗口沿用）</div>' +
+          '<div class="tp-grid"></div>' +
+        "</div>" +
+      "</div>" +
+      '<div class="twin-keys">' +
+        '<input type="file" accept=".pem,.key,id_rsa,id_ed25519" style="display:none">' +
+        '<button class="btn mini">📂 选择本地密钥文件…</button>' +
+        '<span class="tk-name"></span>' +
+      "</div>" +
+      '<div class="twin-term"><div class="tt-host"></div></div>' +
+    "</div>";
+  document.body.appendChild(el);
+  const win = {
+    n, el, frame: el.querySelector(".twin-frame"),
+    title: el.querySelector(".tw-txt"), pop: el.querySelector(".twin-pop"),
+    keysRow: el.querySelector(".twin-keys"), keysName: el.querySelector(".tk-name"),
+    fileEl: el.querySelector(".twin-keys input"), pickBtn: el.querySelector(".twin-keys button"),
+    host: el.querySelector(".tt-host"), term: null, fit: null, ws: null,
+    keyPath: null, fedId: fedId || null, fedName: fedName || null,
+    rect: { left, top, W, H }, min: false, maxed: false, dot: null,
+  };
+  TERM_WINS.push(win);
+  win.dot = termMakeDock(win);
+  const btns = win.el.querySelectorAll(".twin-title .tw-btn");
+  btns[0].onclick = e => { e.stopPropagation(); termTheme(win); };
+  btns[1].onclick = e => { e.stopPropagation(); termToggleKeyRow(win); };
+  btns[2].onclick = e => { e.stopPropagation(); termMin(win); };
+  btns[3].onclick = e => { e.stopPropagation(); termMax(win); };
+  btns[4].onclick = e => { e.stopPropagation(); termClose(win); };
+  win.pickBtn.onclick = () => win.fileEl.click();
+  win.fileEl.addEventListener("change", () => termPickKey(win));
+  termDrag(win);
+  termBuildPalette(win, pal.id);
+  return win;
+}
+
+function termBuildPalette(win, activeId) {
+  const grid = win.pop.querySelector(".tp-grid");
+  grid.innerHTML = "";
+  TERM_PALETTES.forEach(p => {
+    const b = document.createElement("button");
+    b.className = "tpg" + (p.id === activeId ? " on" : "");
+    b.innerHTML = '<span class="sw"><i style="background:' + p.sw[0] + '"></i><i style="background:' + p.sw[1] + '"></i></span>' + p.n;
+    b.onclick = () => {
+      win.pop.classList.remove("show");
+      termApplyPalette(win, p.id);
+    };
+    grid.appendChild(b);
+  });
+}
+
+function termApplyPalette(win, id) {
+  const p = termPalette(id);
+  localStorage.setItem("term_theme", id);
+  if (win.term) {
+    try { win.term.options.theme = p.theme; } catch (e) {}
+  }
+  termBuildPalette(win, id);
+}
+
+function termDrag(win) {
+  const title = win.el.querySelector(".twin-title");
+  title.addEventListener("dblclick", e => {
+    if (e.target.closest(".tw-btn") || e.target.closest(".twin-pop")) return;
+    termMax(win);
+  });
+  title.addEventListener("pointerdown", e => {
+    if (e.target.closest(".tw-btn") || e.target.closest(".twin-pop")) return;
+    if (win.maxed) return;
+    e.preventDefault();
+    const sx = e.clientX, sy = e.clientY;
+    const ol = win.el.offsetLeft, ot = win.el.offsetTop;
+    const move = ev => {
+      let nl = ol + (ev.clientX - sx), nt = ot + (ev.clientY - sy);
+      nl = Math.max(0, Math.min(nl, window.innerWidth - 80));
+      nt = Math.max(0, Math.min(nt, window.innerHeight - 60));
+      win.el.style.left = nl + "px";
+      win.el.style.top = nt + "px";
+    };
+    const up = () => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+      win.rect.left = parseInt(win.el.style.left, 10);
+      win.rect.top = parseInt(win.el.style.top, 10);
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+  });
+}
+
+function termTheme(win) {
+  win.pop.classList.toggle("show");
+  // 点外部收起
+  setTimeout(() => {
+    document.addEventListener("pointerdown", function h(ev) {
+      if (!win.pop.contains(ev.target)) {
+        win.pop.classList.remove("show");
+        document.removeEventListener("pointerdown", h);
+      }
+    });
+  }, 0);
+}
+
+function termMin(win) {
+  win.min = true;
+  win.el.classList.add("min");
+  win.dot.style.display = "";
+}
+function termRestore(win) {
+  win.min = false;
+  win.el.classList.remove("min");
+  win.dot.style.display = "none";
+  termFit(win);
+}
+function termMax(win) {
+  win.maxed = !win.maxed;
+  if (win.maxed) {
+    win.rect.left = win.el.offsetLeft; win.rect.top = win.el.offsetTop;
+    const z = termZoom();
+    win.el.classList.add("maxed");
+    win.frame.style.width = (window.innerWidth / z) + "px";
+    win.frame.style.height = (window.innerHeight / z) + "px";
+  } else {
+    win.el.classList.remove("maxed");
+    const z = termZoom();
+    win.frame.style.width = win.rect.W + "px";
+    win.frame.style.height = win.rect.H + "px";
+    win.el.style.left = win.rect.left + "px";
+    win.el.style.top = win.rect.top + "px";
+  }
+  termFit(win);
+}
+
+function termFit(win) {
+  if (!win.fit || win.min || win.el.classList.contains("min")) return;
+  setTimeout(() => {
+    try { win.fit.fit(); termSendResize(win); } catch (e) {}
+  }, 30);
+}
+
+function termSetDot(win, state) {
+  if (win.dot) {
+    const d = win.dot.querySelector(".tt-dot");
+    if (d) d.classList.toggle("busy", state === "busy");
+  }
+}
+
+function termSendResize(win) {
+  if (!win.ws || win.ws.readyState !== 1 || !win.term) return;
   try {
-    termWs.send(new Blob([JSON.stringify({ type: "resize", cols: termInst.cols, rows: termInst.rows })], { type: "application/octet-stream" }));
+    win.ws.send(new Blob([JSON.stringify({ type: "resize", cols: win.term.cols, rows: win.term.rows })], { type: "application/octet-stream" }));
   } catch (e) {}
 }
 
-let termUpKeyPath = null;   // 本次会话临时上传的私钥路径（关闭终端时删除）
-
-function termToggleKeyRow() {
-  const row = $("term_keys_row");
-  const show = row.style.display === "none";
-  row.style.display = show ? "" : "none";
-  if (show) $("term_key_file").click();
-}
-
-function termBindKeyFile() {
-  const inp = $("term_key_file");
-  if (inp && !inp.dataset.bound) {
-    inp.dataset.bound = "1";
-    inp.addEventListener("change", () => termPickKey());
+async function openTerm() {
+  const active = TERM_WINS.filter(w => !w.dying).length;
+  if (active >= TERM_MAX_WIN) {
+    toast("终端数量已达上限（" + TERM_MAX_WIN + " 个），请先关闭部分终端", "err");
+    return;
   }
-}
-
-function closeTerm() {
-  termDelKey();   // 删除本次会话临时上传的私钥（不留面板机）
-  if (termWs) { try { termWs.onclose = null; termWs.close(); } catch (e) {} termWs = null; }
-  if (termInst) { try { termInst.dispose(); } catch (e) {} termInst = null; termFit = null; }
-  const box = $("term_box"); if (box) box.innerHTML = "";
-  $("term_modal").classList.add("hidden");
-  $("term_keys_row").style.display = "none";
-}
-
-async function termDelKey() {
-  const p = termUpKeyPath;
-  termUpKeyPath = null;
-  if (!p) return;
+  const fedId = fedNode ? fedNode.id : null;
+  const fedName = fedNode ? (fedNode.name || "") : null;
+  if (typeof Terminal === "undefined" || typeof FitAddon === "undefined") {
+    toast("终端组件缺失（xterm.js 未部署）——请重新升级面板或手动补 static/vendor/", "err");
+    return;
+  }
+  // 探测可用性（经代理到目标机；纯提示不阻断）
   try {
-    const prefix = fedNode ? "/api/fed/" + fedNode.id : "";
-    await api("DELETE", prefix + "/api/term/key", { path: p });
-  } catch (e) { /* 远程已断/已删则忽略 */ }
+    const d = await api("GET", termApiPrefix(fedId) + "/api/term/info");
+    if (!d.available) toast("低权用户 term 不存在且无法自动创建（面板需 root 运行）", "err");
+    if (d.busy >= d.max) toast("目标机终端并发已达上限（" + d.busy + "/" + d.max + "）", "err");
+  } catch (e) { /* 静默 */ }
+
+  const win = termMakeWin(fedId, fedName);
+  const pal = termPalette(termThemeDefault());
+  const fit = new FitAddon.FitAddon();
+  const term = new Terminal({
+    fontFamily: "'0xProto','FW Sans SC',ui-monospace,Menlo,Consolas,monospace",
+    fontSize: 13, cursorBlink: true, scrollback: 5000, theme: pal.theme,
+  });
+  term.loadAddon(fit);
+  term.open(win.host);
+  win.term = term; win.fit = fit;
+  setTimeout(() => { try { fit.fit(); termSendResize(win); } catch (e) {} }, 40);
+  term.onData(d => { if (win.ws && win.ws.readyState === 1) win.ws.send(d); });
+  term.onResize(() => termSendResize(win));
+  // 连接 WS
+  try { win.ws = new WebSocket(termWsUrl(win.fedId)); }
+  catch (e) { toast("无法连接终端: " + e.message, "err"); termClose(win); return; }
+  termSetDot(win, "busy");
+  win.ws.onopen = () => {
+    try { term.writeln("\x1b[90m-- 已连接（term 用户，非 root）--\x1b[0m"); } catch (e) {}
+    termSendResize(win);
+  };
+  win.ws.onmessage = ev => { try { term.write(ev.data); } catch (e) {} };
+  win.ws.onclose = () => {
+    try { term.writeln("\x1b[90m\r\n-- 连接已关闭 --\x1b[0m"); } catch (e) {}
+    termSetDot(win, "dead");
+    win.ws = null;
+  };
+  win.ws.onerror = () => { try { term.writeln("\x1b[91m\r\n-- 连接错误 --\x1b[0m"); } catch (e) {} };
 }
 
-async function termPickKey() {
-  const inp = $("term_key_file");
-  const f = inp.files && inp.files[0];
+function termToggleKeyRow(win) {
+  const show = !win.keysRow.classList.contains("show");
+  win.keysRow.classList.toggle("show", show);
+  if (show) win.fileEl.click();
+}
+
+async function termDelKey(win) {
+  const p = win.keyPath;
+  win.keyPath = null;
+  if (!p) return;
+  try { await api("DELETE", termApiPrefix(win.fedId) + "/api/term/key", { path: p }); }
+  catch (e) { /* 已删/远程断则忽略 */ }
+}
+
+async function termPickKey(win) {
+  const f = win.fileEl.files && win.fileEl.files[0];
   if (!f) return;
-  if (f.size > 100 * 1024) { toast("密钥文件过大", "err"); inp.value = ""; return; }
+  if (f.size > 100 * 1024) { toast("密钥文件过大", "err"); win.fileEl.value = ""; return; }
   const name = f.name || "";
   try {
     const content = await f.text();
-    if (!content.includes("PRIVATE KEY")) { toast("不是有效的私钥文件", "err"); inp.value = ""; return; }
-    $("term_key_name").textContent = "上传中…";
-    const prefix = fedNode ? "/api/fed/" + fedNode.id : "";
-    const d = await api("POST", prefix + "/api/term/key", { content, filename: name });
-    // 替换旧密钥：先删旧的再记新的（保持面板机同时只有一把临时密钥）
-    if (termUpKeyPath && termUpKeyPath !== d.path) {
-      try { await api("DELETE", prefix + "/api/term/key", { path: termUpKeyPath }); } catch (e) {}
+    if (!content.includes("PRIVATE KEY")) { toast("不是有效的私钥文件", "err"); win.fileEl.value = ""; return; }
+    win.keysName.textContent = "上传中…";
+    const d = await api("POST", termApiPrefix(win.fedId) + "/api/term/key", { content, filename: name });
+    if (win.keyPath && win.keyPath !== d.path) {
+      try { await api("DELETE", termApiPrefix(win.fedId) + "/api/term/key", { path: win.keyPath }); } catch (e) {}
     }
-    termUpKeyPath = d.path;
-    $("term_key_name").textContent = "已就绪: " + name + " → ssh -i " + d.path;
-    if (termInst) {
-      termInst.paste("ssh -i " + d.path + " ");
-      termInst.writeln("\x1b[90m# 已临时注入私钥（关闭终端自动删除），请补上 user@host 后回车\x1b[0m");
-      termInst.focus();
+    win.keyPath = d.path;
+    win.keysName.textContent = "已就绪: " + name;
+    if (win.term) {
+      win.term.paste("ssh -i " + d.path + " ");
+      win.term.writeln("\x1b[90m# 已临时注入私钥（关闭终端自动删除），请补上 user@host 后回车\x1b[0m");
+      win.term.focus();
     }
     toast("私钥已临时注入（关闭终端即删除）");
   } catch (e) {
-    $("term_key_name").textContent = "";
+    win.keysName.textContent = "";
     toast(e.message, "err");
   } finally {
-    inp.value = "";
+    win.fileEl.value = "";
   }
 }
+
+function termClose(win) {
+  if (win.dying) return;
+  win.dying = true;
+  termDelKey(win);   // 删除本窗口临时私钥
+  if (win.ws) { try { win.ws.onclose = null; win.ws.close(); } catch (e) {} win.ws = null; }
+  if (win.term) { try { win.term.dispose(); } catch (e) {} win.term = null; }
+  try { win.el.remove(); } catch (e) {}
+  try { win.dot.remove(); } catch (e) {}
+  TERM_WINS = TERM_WINS.filter(w => w !== win);
+}
+
+// 全局 resize：活动窗口重新 fit + 最大化窗口重算尺寸
+window.addEventListener("resize", () => {
+  clearTimeout(window.__twResizeT);
+  window.__twResizeT = setTimeout(() => {
+    const z = termZoom();
+    TERM_WINS.forEach(w => {
+      if (w.maxed) {
+        w.frame.style.width = (window.innerWidth / z) + "px";
+        w.frame.style.height = (window.innerHeight / z) + "px";
+      }
+      termFit(w);
+    });
+  }, 200);
+});
 
 /* ---------- 初始化 ---------- */
 document.addEventListener("keydown", e => { if (e.key === "Enter" && !$("main").classList.contains("hidden") === false) login(); });
