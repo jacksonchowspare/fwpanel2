@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.1.16"
+CURRENT_VERSION = "2.1.17"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -468,6 +468,25 @@ class Auth:
 
 FED_NODES_FILE = os.path.join(BASE_DIR, "fed_nodes.json")
 FED_HEADER = "X-Fwpanel-Token"
+
+# 联邦代理转发超时分档：长任务端点放宽（节点端安装/拉取/续期等可能数分钟，
+# 25s 会误报"节点不可达"——用户实测远程装 Docker 报 TimeoutError 但实际装完）。
+# 前缀匹配 rest 路径（节点侧 API），命中即用长超时（600s > 节点端任何 subprocess 上限）
+FED_LONG_TASK_PREFIXES = (
+    "/api/docker/install", "/api/docker/uninstall",
+    "/api/docker/pull", "/api/docker/create", "/api/docker/rmi",
+    "/api/docker/compose/up", "/api/docker/compose/upgrade",
+    "/api/docker/data-root",
+    "/api/proxy/install", "/api/proxy/",
+    "/api/cert/", "/api/upgrade",
+)
+
+
+def fed_proxy_timeout(rest):
+    """按节点侧目标路径分档：长任务 600s，其余 25s"""
+    if any(rest.startswith(p) for p in FED_LONG_TASK_PREFIXES):
+        return 600
+    return 25
 
 
 def _load_fed_nodes():
@@ -2421,7 +2440,18 @@ def install_docker_pkgs(source="official"):
                        capture_output=True, text=True, timeout=60)
     except Exception:
         pass
-    return True, "Docker 已安装并启动（国内镜像源）" if source == "china" else "Docker 已安装并启动"
+    # 轮询确认 docker 服务真正 active（daemon 启动有几秒延迟，装完立即查会显示 inactive，
+    # 曾导致远程装完刷新只见"服务未运行"）。上限 30s，超过则明确报错而非假成功
+    for _ in range(15):
+        try:
+            r = subprocess.run(["systemctl", "is-active", "docker"],
+                               capture_output=True, text=True, timeout=10)
+            if r.returncode == 0 and (r.stdout or "").strip() == "active":
+                return True, "Docker 已安装并启动（国内镜像源）" if source == "china" else "Docker 已安装并启动"
+        except Exception:
+            pass
+        time.sleep(2)
+    return False, "Docker 已安装，但服务未能启动（systemctl is-active 非 active）。请手动执行: systemctl start docker 并查看日志"
 
 
 def uninstall_docker_pkgs():
@@ -3496,7 +3526,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         req.add_header(FED_HEADER, node.get("token", ""))
         req.add_header("Content-Type", self.headers.get("Content-Type", "application/json"))
         try:
-            with urllib.request.urlopen(req, timeout=25) as resp:
+            with urllib.request.urlopen(req, timeout=fed_proxy_timeout(rest)) as resp:
                 raw = resp.read()
                 self.send_response(resp.status)
                 self.send_header("Content-Type", resp.headers.get(

@@ -2296,6 +2296,9 @@ class TestDocker(unittest.TestCase):
                 return types.SimpleNamespace(
                     returncode=100, stdout="",
                     stderr="E: Unable to locate package docker-compose-v2")
+            # systemctl is-active docker → active（安装后轮询确认服务启动）
+            if args[:2] == ["systemctl", "is-active"]:
+                return types.SimpleNamespace(returncode=0, stdout="active", stderr="")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         try:
@@ -4320,6 +4323,86 @@ class TestFed(unittest.TestCase):
         self.assertEqual(code, 200)
         code, d = self._req(self.baseB, "GET", "/api/fed", fed=new_tok)
         self.assertEqual(code, 401, "clear 后令牌应失效")
+
+    def test_fed_proxy_timeout_tiered(self):
+        """代理超时分档：长任务端点 600s，常规 25s"""
+        long_paths = ["/api/docker/install", "/api/docker/uninstall",
+                      "/api/docker/pull", "/api/docker/create", "/api/docker/rmi",
+                      "/api/docker/compose/up", "/api/docker/compose/upgrade",
+                      "/api/docker/data-root", "/api/proxy/install",
+                      "/api/proxy/abc123", "/api/cert/example.com",
+                      "/api/upgrade"]
+        short_paths = ["/api/status", "/api/docker", "/api/docker/dirs",
+                       "/api/docker/containers", "/api/rules", "/api/traffic",
+                       "/api/ssh", "/api/proxy"]
+        for p in long_paths:
+            self.assertEqual(panel.fed_proxy_timeout(p), 600, f"{p} 应 600s")
+        for p in short_paths:
+            self.assertEqual(panel.fed_proxy_timeout(p), 25, f"{p} 应 25s")
+
+    def test_install_docker_waits_service_active(self):
+        """安装后轮询 systemctl is-active 直到 active 才返回成功；超时未 active 报错不假成功"""
+        import types
+        real_run = panel.subprocess.run
+        real_mgr = panel.pkg_mgr
+        real_dry = panel.DRY_RUN
+        real_sleep = panel.time.sleep
+        calls = []
+
+        def fake_run(args, **kw):
+            calls.append(args)
+            if args[0] == "apt-get" and args[1] == "update":
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args[:2] == ["systemctl", "is-active"]:
+                # 前 2 次 inactive（服务启动中），第 3 次 active
+                n = sum(1 for a in calls if a[:2] == ["systemctl", "is-active"])
+                return types.SimpleNamespace(
+                    returncode=0 if n >= 3 else 3,
+                    stdout="active" if n >= 3 else "inactive", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        try:
+            panel.pkg_mgr = lambda: "apt"
+            panel.DRY_RUN = False
+            panel.subprocess.run = fake_run
+            panel.time.sleep = lambda s: None
+            ok, msg = panel.install_docker_pkgs("official")
+            self.assertTrue(ok, msg)
+            self.assertIn("已安装并启动", msg)
+        finally:
+            panel.subprocess.run = real_run
+            panel.pkg_mgr = real_mgr
+            panel.DRY_RUN = real_dry
+            panel.time.sleep = real_sleep
+
+    def test_install_docker_service_never_active_reports_error(self):
+        """服务一直起不来 → 返回失败提示手动处理，不假成功"""
+        import types
+        real_run = panel.subprocess.run
+        real_mgr = panel.pkg_mgr
+        real_dry = panel.DRY_RUN
+        real_sleep = panel.time.sleep
+
+        def fake_run(args, **kw):
+            if args[0] == "apt-get" and args[1] == "update":
+                return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            if args[:2] == ["systemctl", "is-active"]:
+                return types.SimpleNamespace(returncode=3, stdout="inactive", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        try:
+            panel.pkg_mgr = lambda: "apt"
+            panel.DRY_RUN = False
+            panel.subprocess.run = fake_run
+            panel.time.sleep = lambda s: None
+            ok, msg = panel.install_docker_pkgs("official")
+            self.assertFalse(ok)
+            self.assertIn("未能启动", msg)
+        finally:
+            panel.subprocess.run = real_run
+            panel.pkg_mgr = real_mgr
+            panel.DRY_RUN = real_dry
+            panel.time.sleep = real_sleep
 
 
 if __name__ == "__main__":
