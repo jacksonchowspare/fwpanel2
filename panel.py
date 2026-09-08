@@ -47,7 +47,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.1.17"
+CURRENT_VERSION = "2.1.18"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -66,6 +66,105 @@ SSH_PORT_DEFAULT = 22
 TOKEN_TTL = 24 * 3600          # token 有效期 24 小时
 LOCK_MAX_FAIL = 5              # 连续失败次数
 LOCK_SECONDS = 300             # 锁定 5 分钟
+
+# ------------------------------- 长任务后台执行（v2.1.18） -------------------------------
+# 动机：nginx 网关 proxy_read_timeout 默认 60s，安装/拉取/证书等长任务经反代访问会 504
+# （用户实测主控机装 Docker 报 HTTP 504，刷新后发现已装好——任务实际在跑，只是网关先断）。
+# 方案：长任务接口立即返回 task_id，后端起线程执行，前端轮询 /api/tasks/<id>。
+# 任务状态落盘 BASE_DIR/tasks.json——面板重启不丢结果（用户要求持久化）。
+TASKS_FILE = os.path.join(BASE_DIR, "tasks.json")
+_TASKS_LOCK = threading.Lock()
+_tasks = {}          # task_id -> {action, status, ok, msg, started, finished, done}
+_tasks_loaded = False
+MAX_TASKS_KEEP = 200  # 磁盘最多保留条数（滚动清理最旧已完成）
+
+
+def _tasks_load():
+    """面板启动时从磁盘加载任务记录；running 状态（上次进程中断）标记为 error"""
+    global _tasks, _tasks_loaded
+    with _TASKS_LOCK:
+        if _tasks_loaded:
+            return
+        _tasks = {}
+        try:
+            if os.path.exists(TASKS_FILE):
+                with open(TASKS_FILE, encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    _tasks = data.get("tasks", {}) or {}
+        except (OSError, ValueError):
+            _tasks = {}
+        # 上次进程遗留的 running → error（线程已随进程消失，任务实际中断）
+        for t in _tasks.values():
+            if t.get("status") == "running" and not t.get("done"):
+                t["status"] = "error"
+                t["ok"] = False
+                t["msg"] = "面板重启导致任务中断，请重新执行"
+                t["finished"] = time.time()
+        _tasks_loaded = True
+
+
+def _tasks_save():
+    """任务表落盘（原子写）。仅保留最近 MAX_TASKS_KEEP 条已完成/失败的记录"""
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+        kept = {}
+        # 保留全部 running（不能丢），已完成只留最近 MAX_TASKS_KEEP 条
+        running = {k: v for k, v in _tasks.items() if v.get("status") == "running"}
+        done_items = [(k, v) for k, v in _tasks.items() if v.get("status") != "running"]
+        done_items.sort(key=lambda kv: kv[1].get("finished") or 0, reverse=True)
+        for k, v in done_items[:MAX_TASKS_KEEP]:
+            kept[k] = v
+        kept.update(running)
+        tmp = TASKS_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"tasks": kept}, f, ensure_ascii=False, indent=1)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, TASKS_FILE)
+    except Exception:
+        pass
+
+
+def start_task(action, fn, *args):
+    """启动后台长任务：记录 running 并落盘 → 线程执行 → 更新结果。
+    返回 task_id（前端轮询 /api/tasks/<id>）"""
+    _tasks_load()
+    tid = secrets.token_hex(8)
+    with _TASKS_LOCK:
+        _tasks[tid] = {
+            "action": action, "status": "running", "ok": False,
+            "msg": "执行中...", "started": time.time(),
+            "finished": None, "done": False,
+        }
+        _tasks_save()
+
+    def _worker():
+        try:
+            ok, msg = fn(*args)
+        except Exception as e:
+            ok, msg = False, f"任务异常: {e}"
+        with _TASKS_LOCK:
+            t = _tasks.get(tid)
+            if t is not None:
+                t["status"] = "ok" if ok else "error"
+                t["ok"] = ok
+                t["msg"] = msg
+                t["finished"] = time.time()
+                t["done"] = True
+                _tasks_save()
+
+    threading.Thread(target=_worker, daemon=True).start()
+    return tid
+
+
+def get_task(tid):
+    """查询任务：磁盘已加载则查内存；未加载先加载（重启后内存空，从磁盘恢复）"""
+    _tasks_load()
+    with _TASKS_LOCK:
+        t = _tasks.get(tid)
+        if t is None:
+            return None
+        return dict(t)
 
 # 升级源（国内友好优先）：jsDelivr → GitHub raw → ghproxy.net → ghfast.top → gh-proxy.com
 # ⚠ ghproxy.com 已废弃（返回 200 但内容为 HTML 错误页），不可用；后三个镜像 2026-08 实测返回真实文件
@@ -3379,8 +3478,38 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_fed_nodes_list()
         elif path.startswith("/api/fed/"):
             self._api_fed_proxy()
+        elif path.startswith("/api/tasks/"):
+            self._api_task_status(path[len("/api/tasks/"):])
         else:
             self._send(404, {"error": "Not Found"})
+
+    # ---------- 长任务状态（v2.1.18：异步长任务轮询） ----------
+    def _run_long_task(self, action, fn, *args):
+        """长任务统一入口：fn 返回 (ok, msg)。
+        DRY_RUN/测试环境 → 同步执行直接返回（既有测试语义不变）；
+        真实环境 → start_task 后台执行，立即返回 task_id 供前端轮询。"""
+        if DRY_RUN:
+            try:
+                ok, msg = fn(*args)
+            except Exception as e:
+                ok, msg = False, f"任务异常: {e}"
+            self._send(200 if ok else 500, {"ok": ok, "msg": msg})
+            return None
+        tid = start_task(action, fn, *args)
+        self._send(200, {"ok": True, "task": tid,
+                         "msg": "任务已开始，后台执行中（可在页面停留等待自动完成）"})
+        return tid
+
+    def _api_task_status(self, tid):
+        """GET /api/tasks/<id> → 后台任务状态 {status: running|ok|error, ok, msg}"""
+        token = self._require_auth()
+        if token is None:
+            return
+        t = get_task(tid.strip())
+        if t is None:
+            self._send(404, {"error": "任务不存在或已过期"})
+            return
+        self._send(200, t)
 
     # ---------- 联邦 API（2.0 多机管理） ----------
     def _api_fed_status(self):
@@ -4142,16 +4271,14 @@ class PanelHandler(BaseHTTPRequestHandler):
         source = str(data.get("source", "official"))
         if source not in ("official", "china"):
             source = "official"
-        ok, msg = install_docker_pkgs(source)
-        self._send(200 if ok else 500, {"ok": ok, "msg": msg})
+        self._run_long_task("docker/install", install_docker_pkgs, source)
 
     def _api_docker_uninstall(self):
         """POST /api/docker/uninstall → 一键卸载 docker（国内/国外源安装均可）"""
         token = self._require_auth()
         if token is None:
             return
-        ok, msg = uninstall_docker_pkgs()
-        self._send(200 if ok else 500, {"ok": ok, "msg": msg})
+        self._run_long_task("docker/uninstall", uninstall_docker_pkgs)
 
     def _api_docker_action(self):
         """POST /api/docker/action {action, id} → start/stop/restart/remove"""
@@ -4181,10 +4308,9 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not name or not image:
             self._send(400, {"error": "容器名称和镜像不能为空"})
             return
-        ok, msg = docker_create(name, image,
-                                str(data.get("ports", "")),
-                                str(data.get("envs", "")))
-        self._send(200 if ok else 500, {"ok": ok, "msg": msg})
+        self._run_long_task("docker/create", docker_create, name, image,
+                            str(data.get("ports", "")),
+                            str(data.get("envs", "")))
 
     def _api_docker_pull(self):
         """POST /api/docker/pull {name} → 拉取镜像"""
@@ -4196,8 +4322,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not name:
             self._send(400, {"error": "镜像名不能为空"})
             return
-        ok, msg = docker_pull(name)
-        self._send(200 if ok else 500, {"ok": ok, "msg": msg})
+        self._run_long_task("docker/pull", docker_pull, name)
 
     def _api_docker_rmi(self):
         """POST /api/docker/rmi {id} → 删除镜像"""
@@ -4225,8 +4350,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         token = self._require_auth()
         if token is None:
             return
-        ok, msg = set_docker_data_root()
-        self._send(200 if ok else 500, {"ok": ok, "msg": msg})
+        self._run_long_task("docker/data-root", set_docker_data_root)
 
     def _api_docker_compose_up(self):
         """POST /api/docker/compose/up {content, folder} → 保存并启动 compose"""
@@ -4238,8 +4362,8 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not content.strip():
             self._send(400, {"error": "docker-compose.yml 内容不能为空"})
             return
-        ok, msg = docker_compose_up(content, str(data.get("folder", "")))
-        self._send(200 if ok else 500, {"ok": ok, "msg": msg})
+        self._run_long_task("docker/compose/up", docker_compose_up,
+                            content, str(data.get("folder", "")))
 
     def _api_docker_compose_list(self):
         """GET /api/docker/compose → 已保存的 compose 项目列表"""
@@ -4271,8 +4395,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not folder:
             self._send(400, {"error": "缺少项目文件夹名称"})
             return
-        ok, msg = docker_compose_upgrade(folder)
-        self._send(200 if ok else 500, {"ok": ok, "msg": msg})
+        self._run_long_task("docker/compose/upgrade", docker_compose_upgrade, folder)
 
     def _api_docker_compose_down(self):
         """POST /api/docker/compose/down {folder} → 停止指定 compose 项目"""
@@ -4598,10 +4721,15 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True, "msg": "防火墙已关闭（所有端口放行，规则配置已保留，重新开启恢复）"})
 
     def _api_proxy_install(self):
-        """一键安装 nginx + certbot（按发行版 apt/pacman/dnf），并自动写入 nginx 配置"""
+        """一键安装 nginx + certbot（按发行版 apt/pacman/dnf），并自动写入 nginx 配置。
+        长任务 → 后台执行（nginx 网关 60s 超时不会误报）"""
         token = self._require_auth()
         if token is None:
             return
+        self._run_long_task("proxy/install", self._proxy_install_work)
+
+    def _proxy_install_work(self):
+        """proxy/install 主体（独立方法便于后台线程执行；返回 (ok, msg)）"""
         todo = []
         if not nginx_available():
             todo.append("nginx")
@@ -4610,8 +4738,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         if todo:
             ok, msg = install_pkgs(todo)
             if not ok:
-                self._send(500, {"error": msg})
-                return
+                return False, msg
         # 启动 nginx 服务
         if nginx_available() and not nginx_active():
             try:
@@ -4627,9 +4754,8 @@ class PanelHandler(BaseHTTPRequestHandler):
         ensure_nginx_default()
         ok2, msg2 = apply_proxies(ProxyStore())
         if not ok2:
-            self._send(500, {"error": f"nginx 配置写入失败: {msg2}"})
-            return
-        self._send(200, {"ok": True, "msg": f"安装完成（{', '.join(todo) or '已是最新'}）；{msg2}"})
+            return False, f"nginx 配置写入失败: {msg2}"
+        return True, f"安装完成（{', '.join(todo) or '已是最新'}）；{msg2}"
 
     def _api_cert(self):
         """独立证书列表：域名、邮箱、有效期、路径"""
@@ -4676,7 +4802,8 @@ class PanelHandler(BaseHTTPRequestHandler):
     def _api_cert_add(self):
         """单独申请 SSL 证书：{domain, email?, method?: http|dns, provider?, credentials?}
 
-        http = certbot webroot（需 80 可达）；dns = acme.sh DNS 验证（Cloudflare/DNSPod/阿里云）"""
+        http = certbot webroot（需 80 可达）；dns = acme.sh DNS 验证（Cloudflare/DNSPod/阿里云）
+        签发为长任务 → 后台执行（nginx 网关 60s 超时不会误报）"""
         token = self._require_auth()
         if token is None:
             return
@@ -4700,14 +4827,17 @@ class PanelHandler(BaseHTTPRequestHandler):
                 merged = dns_creds[provider]
             else:
                 merged = saved
-            ok, msg = issue_cert_dns(domain, email, provider, merged)
-            if not ok:
-                self._send(500, {"error": msg})
-                return
-            store = load_cert_store()
-            store[domain] = {"email": email, "method": "dns", "provider": provider}
-            save_cert_store(store)
-            self._send(200, {"ok": True, "msg": f"{domain} 证书已签发（DNS 验证）"})
+
+            def _issue_dns_work():
+                ok, msg = issue_cert_dns(domain, email, provider, merged)
+                if not ok:
+                    return False, msg
+                store = load_cert_store()
+                store[domain] = {"email": email, "method": "dns", "provider": provider}
+                save_cert_store(store)
+                return True, f"{domain} 证书已签发（DNS 验证）"
+
+            self._run_long_task("cert/issue-dns", _issue_dns_work)
             return
         if method != "http":
             self._send(400, {"error": "method 必须是 http 或 dns"})
@@ -4720,14 +4850,17 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not ok:
             self._send(500, {"error": msg})
             return
-        ok, msg = issue_cert(domain, email)
-        if not ok:
-            self._send(500, {"error": msg})
-            return
-        store = load_cert_store()
-        store[domain] = {"email": email, "method": "http"}
-        save_cert_store(store)
-        self._send(200, {"ok": True, "msg": f"{domain} 证书已签发"})
+
+        def _issue_http_work():
+            ok, msg = issue_cert(domain, email)
+            if not ok:
+                return False, msg
+            store = load_cert_store()
+            store[domain] = {"email": email, "method": "http"}
+            save_cert_store(store)
+            return True, f"{domain} 证书已签发"
+
+        self._run_long_task("cert/issue", _issue_http_work)
 
     def _api_cert_action(self, suffix):
         """证书操作：POST /api/cert/<domain> {action: renew|delete}"""
@@ -4743,14 +4876,17 @@ class PanelHandler(BaseHTTPRequestHandler):
             return
         if action == "renew":
             email, method, provider, source = _cert_meta(store.get(domain))
-            if method == "dns":
-                ok, msg = renew_cert_dns(domain)
-            else:
-                ok, msg = renew_cert(domain)
-            if not ok:
-                self._send(500, {"error": msg})
-                return
-            self._send(200, {"ok": True, "msg": f"{domain} 证书已续期"})
+
+            def _renew_work():
+                if method == "dns":
+                    ok, msg = renew_cert_dns(domain)
+                else:
+                    ok, msg = renew_cert(domain)
+                if not ok:
+                    return False, msg
+                return True, f"{domain} 证书已续期"
+
+            self._run_long_task("cert/renew", _renew_work)
         elif action == "delete":
             del store[domain]
             save_cert_store(store)
@@ -4875,35 +5011,40 @@ class PanelHandler(BaseHTTPRequestHandler):
             ok, msg = apply_proxies(pstore)
             self._send(200, {"ok": True, "msg": f"代理 {p['domain']} 已{'启用' if p['enabled'] else '停用'}（{msg}）"})
         elif action == "ssl":
-            ok, msg = issue_cert(p["domain"], str(data.get("email", "")).strip())
-            if not ok:
-                self._send(500, {"error": msg})
-                return
-            p["ssl"] = True
-            pstore.save()
-            # 反代申请的证书自动登记进证书列表（source=proxy，与独立申请统一管理）
-            store = load_cert_store()
-            if p["domain"] in store and isinstance(store[p["domain"]], dict):
-                store[p["domain"]]["source"] = "proxy"
-            else:
-                store[p["domain"]] = {"email": str(data.get("email", "")).strip(),
-                                      "method": "http", "source": "proxy"}
-            save_cert_store(store)
-            ok2, msg2 = apply_proxies(pstore)
-            tail = f"；{msg2}" if ok2 else f"；配置应用失败: {msg2}"
-            self._send(200, {"ok": True, "msg": msg + tail})
+            def _ssl_work():
+                ok, msg = issue_cert(p["domain"], str(data.get("email", "")).strip())
+                if not ok:
+                    return False, msg
+                p["ssl"] = True
+                pstore.save()
+                # 反代申请的证书自动登记进证书列表（source=proxy，与独立申请统一管理）
+                store = load_cert_store()
+                if p["domain"] in store and isinstance(store[p["domain"]], dict):
+                    store[p["domain"]]["source"] = "proxy"
+                else:
+                    store[p["domain"]] = {"email": str(data.get("email", "")).strip(),
+                                          "method": "http", "source": "proxy"}
+                save_cert_store(store)
+                ok2, msg2 = apply_proxies(pstore)
+                tail = f"；{msg2}" if ok2 else f"；配置应用失败: {msg2}"
+                return True, msg + tail
+
+            self._run_long_task("proxy/ssl", _ssl_work)
         elif action == "renew":
             ref = (p.get("cert_ref") or "").strip() or p["domain"]
             cstore = load_cert_store()
             _, method, _, _ = _cert_meta(cstore.get(ref))
-            if method == "dns":
-                ok, msg = renew_cert_dns(ref)
-            else:
-                ok, msg = renew_cert(ref)
-            if not ok:
-                self._send(500, {"error": msg})
-                return
-            self._send(200, {"ok": True, "msg": msg})
+
+            def _renew_work():
+                if method == "dns":
+                    ok, msg = renew_cert_dns(ref)
+                else:
+                    ok, msg = renew_cert(ref)
+                if not ok:
+                    return False, msg
+                return True, msg
+
+            self._run_long_task("proxy/renew", _renew_work)
         elif action == "blockip":
             p["block_ip"] = bool(data.get("enabled", True))
             pstore.save()
@@ -5392,6 +5533,8 @@ def main():
     # serve：端口/监听地址以 config.json 为权威（安装时写入），CLI 显式参数可覆盖
     bind = args.bind or config.get("bind", "127.0.0.1")
     port = args.port or int(config.get("port", DEFAULT_PORT))
+    # 长任务表启动加载：把上次进程遗留的 running 标记为 error（v2.1.18）
+    _tasks_load()
     # 自动同步 SSH 保护端口到系统实际端口（防锁死保护跟随当前 SSH 端口，手动设置后停止）
     sync_ssh_port(config)
     store = RuleStore()

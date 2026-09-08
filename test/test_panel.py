@@ -4405,5 +4405,157 @@ class TestFed(unittest.TestCase):
             panel.time.sleep = real_sleep
 
 
+class TestTasks(unittest.TestCase):
+    """长任务后台执行机制（v2.1.18）：start_task 异步 + 状态落盘 + 重启恢复"""
+
+    def setUp(self):
+        # 隔离：重置任务表并清掉共享目录里的任务文件
+        panel._tasks = {}
+        panel._tasks_loaded = False
+        if os.path.exists(panel.TASKS_FILE):
+            os.remove(panel.TASKS_FILE)
+
+    def tearDown(self):
+        panel._tasks = {}
+        panel._tasks_loaded = False
+        if os.path.exists(panel.TASKS_FILE):
+            os.remove(panel.TASKS_FILE)
+
+    def test_start_task_async_and_poll(self):
+        """start_task 立即返回 tid；任务完成后 get_task 能查到结果"""
+        import time as _t
+
+        def slow_work():
+            _t.sleep(0.1)
+            return True, "干完了"
+
+        tid = panel.start_task("test/slow", slow_work)
+        self.assertTrue(tid)
+        # 立即查：应存在且 running（线程还没跑完）
+        t0 = panel.get_task(tid)
+        self.assertIsNotNone(t0)
+        # 轮询至完成（上限 3s）
+        deadline = _t.time() + 3
+        while _t.time() < deadline:
+            t = panel.get_task(tid)
+            if t and t["status"] != "running":
+                break
+            _t.sleep(0.02)
+        self.assertEqual(t["status"], "ok", t)
+        self.assertTrue(t["ok"])
+        self.assertEqual(t["msg"], "干完了")
+        self.assertTrue(t["done"])
+
+    def test_start_task_error_captured(self):
+        """任务函数抛异常 → status=error，不崩线程"""
+        import time as _t
+
+        def boom():
+            raise RuntimeError("炸了")
+
+        tid = panel.start_task("test/boom", boom)
+        deadline = _t.time() + 3
+        while _t.time() < deadline:
+            t = panel.get_task(tid)
+            if t and t["status"] != "running":
+                break
+            _t.sleep(0.02)
+        self.assertEqual(t["status"], "error", t)
+        self.assertFalse(t["ok"])
+        self.assertIn("炸了", t["msg"])
+
+    def test_tasks_persist_to_disk(self):
+        """任务结果落盘：完成后磁盘文件可读且含该任务（模拟面板重启后仍能查到）"""
+        import time as _t
+        tid = panel.start_task("test/persist", lambda: (True, "已落盘"))
+        deadline = _t.time() + 3
+        while _t.time() < deadline:
+            t = panel.get_task(tid)
+            if t and t["status"] != "running":
+                break
+            _t.sleep(0.02)
+        self.assertTrue(os.path.exists(panel.TASKS_FILE), "任务文件应写入磁盘")
+        with open(panel.TASKS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertIn(tid, data.get("tasks", {}), "磁盘记录应含该任务")
+        self.assertEqual(data["tasks"][tid]["status"], "ok")
+
+    def test_reload_marks_stale_running_as_error(self):
+        """模拟重启：磁盘遗留 running 任务，重新加载后标记 error（进程中断）"""
+        import time as _t
+        # 手工构造磁盘文件：一个 running 任务
+        os.makedirs(os.path.dirname(panel.TASKS_FILE), exist_ok=True)
+        with open(panel.TASKS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"tasks": {
+                "deadbeef": {"action": "x", "status": "running", "ok": False,
+                             "msg": "执行中...", "started": _t.time() - 10,
+                             "finished": None, "done": False},
+                "beefdead": {"action": "y", "status": "ok", "ok": True,
+                             "msg": "完成", "started": _t.time() - 20,
+                             "finished": _t.time(), "done": True},
+            }}, f)
+        # 重置加载标志 → 模拟新进程首次访问
+        panel._tasks_loaded = False
+        t = panel.get_task("deadbeef")
+        self.assertEqual(t["status"], "error", "遗留 running 应标记 error")
+        self.assertIn("中断", t["msg"])
+        t2 = panel.get_task("beefdead")
+        self.assertEqual(t2["status"], "ok", "已完成任务不受影响")
+
+    def test_docker_install_handler_async_in_real_mode(self):
+        """真实模式（非 DRY_RUN）POST docker/install → 返回 task_id 而非同步结果"""
+        saved_dry = panel.DRY_RUN
+        real_install = panel.install_docker_pkgs
+        import types
+        try:
+            panel.DRY_RUN = False
+            panel.install_docker_pkgs = lambda source="official": (True, "装好了")
+            panel.subprocess.run = lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr="")
+            # 用真实 HTTP 请求（复用一个临时 PanelServer）
+            import threading
+            cfg = make_cfg(user="taskuser", pwd="TaskPass123", mode="permissive")
+            cfg.data["port"] = 17990
+            cfg.data["bind"] = "127.0.0.1"
+            store = panel.RuleStore(); store.rules = []
+            nft = panel.NFTManager(store, cfg)
+            auth = panel.Auth(cfg)
+            srv = panel.PanelServer(("127.0.0.1", 17990), panel.PanelHandler,
+                                    cfg, store, nft, auth)
+            th = threading.Thread(target=srv.serve_forever, daemon=True)
+            th.start()
+            try:
+                base = "http://127.0.0.1:17990"
+                r = urllib.request.Request(base + "/api/login", method="POST",
+                                           data=json.dumps({"username": "taskuser", "password": "TaskPass123"}).encode())
+                r.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(r, timeout=10) as resp:
+                    tok = json.loads(resp.read())["token"]
+                req = urllib.request.Request(base + "/api/docker/install", method="POST",
+                                             data=b"{}")
+                req.add_header("Content-Type", "application/json")
+                req.add_header("Authorization", "Bearer " + tok)
+                with urllib.request.urlopen(req, timeout=10) as resp:
+                    d = json.loads(resp.read())
+                self.assertIn("task", d, "真实模式应返回 task_id: %s" % d)
+                # 轮询到完成
+                import time as _t
+                deadline = _t.time() + 3
+                while _t.time() < deadline:
+                    q = urllib.request.Request(base + "/api/tasks/" + d["task"])
+                    q.add_header("Authorization", "Bearer " + tok)
+                    with urllib.request.urlopen(q, timeout=10) as resp:
+                        st = json.loads(resp.read())
+                    if st["status"] != "running":
+                        break
+                    _t.sleep(0.05)
+                self.assertEqual(st["status"], "ok", st)
+                self.assertEqual(st["msg"], "装好了")
+            finally:
+                srv.shutdown(); srv.server_close()
+        finally:
+            panel.DRY_RUN = saved_dry
+            panel.install_docker_pkgs = real_install
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

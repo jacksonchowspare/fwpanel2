@@ -1257,6 +1257,25 @@ async function api(method, path, body) {
   return data;
 }
 
+// 长任务异步执行（v2.1.18）：POST 返回 {task} → 轮询 GET /api/tasks/<id> 至完成。
+// nginx 网关 60s 超时会掐断长连接（装 Docker 曾报 HTTP 504），异步后接口秒回、轮询短请求，彻底免疫。
+// 同步路径（DRY_RUN/旧服务端无 task 字段）直接返回原响应。resolve = {ok,msg}；失败 reject Error。
+async function apiTask(method, path, body, onProgress) {
+  const d = await api(method, path, body);
+  if (!d.task) return d;                       // 服务端同步完成（无后台任务）
+  const tid = d.task;
+  for (;;) {
+    await new Promise(r => setTimeout(r, 1500));
+    let t;
+    try { t = await api("GET", "/api/tasks/" + tid); }
+    catch (e) { if (e.message !== "未登录") continue; throw e; }   // 瞬时网络错误继续轮询
+    if (onProgress) onProgress(t);
+    if (t.status === "ok") return { ok: true, msg: t.msg || "完成", task: tid };
+    if (t.status === "error") { const e = new Error(t.msg || "任务执行失败"); e.task = tid; throw e; }
+    // running → 继续等
+  }
+}
+
 /* ---------- 登录 ---------- */
 function fedUiReset() {
   fedNode = null; API = "";
@@ -1763,7 +1782,7 @@ async function addCert() {
     const st = $("cert_status");
     st.textContent = "⏳ 正在申请，请稍候（最多 180 秒）...";
     st.style.color = "";
-    api("POST", "/api/cert", { domain, email, method, provider, credentials: creds }).then(d => {
+    apiTask("POST", "/api/cert", { domain, email, method, provider, credentials: creds }).then(d => {
       toast(d.msg || "证书已签发", "okk");
       $("cert_domain").value = ""; $("cert_email").value = "";
       loadCerts(); loadProxy();  // 反代列表 SSL 状态列同步刷新
@@ -1776,7 +1795,7 @@ async function addCert() {
 }
 function renewCertSolo(domain) {
   confirmPanel(`确认手动续期 ${domain} 的证书？\n\n将强制重新签发（绕过自动续期），需要 80 端口可访问。`, () => {
-    api("POST", "/api/cert/" + domain, { action: "renew" }).then(d => {
+    apiTask("POST", "/api/cert/" + domain, { action: "renew" }).then(d => {
       toast(d.msg || "续期成功", "okk"); loadCerts(); loadProxy();
     }).catch(e => toast(e.message, "err"));
   }, "🔄 续期确认");
@@ -2453,7 +2472,7 @@ async function installNginx() {
     // ⚠ 不能用 event.target：回调在确认弹窗确定按钮点击后执行，target 是确定按钮（v1.24.6 修复）
     const btn = $("btn_install_nginx"); const old = btn.textContent;
     btn.disabled = true; btn.textContent = "安装中...（几分钟）";
-    api("POST", "/api/proxy/install", {}).then(d => {
+    apiTask("POST", "/api/proxy/install", {}).then(d => {
       toast(d.msg || "安装完成", "okk"); loadProxy();
       btn.disabled = false; btn.textContent = old;
     }).catch(e => { toast(e.message, "err"); btn.disabled = false; btn.textContent = old; });
@@ -2488,7 +2507,7 @@ async function issueSsl(id) {
   if (email === null) return;
   toast("⏳ 证书申请中（约 10-60 秒），请稍候...");
   try {
-    const d = await api("POST", "/api/proxy/" + id, { action: "ssl", email });
+    const d = await apiTask("POST", "/api/proxy/" + id, { action: "ssl", email });
     toast(d.msg || "证书已申请", "okk");
     loadProxy(); loadCerts();
     // 证书生效后 nginx 会把 http 301 到 https——域名访问时主动跳转 https，避免列表状态停留在旧页面
@@ -2499,7 +2518,7 @@ async function issueSsl(id) {
 }
 async function renewCert(id) {
   confirmPanel("确认手动续期该证书？\n\n将强制重新签发（绕过自动续期），需要 80 端口可访问。", () => {
-    api("POST", "/api/proxy/" + id, { action: "renew" }).then(d => {
+    apiTask("POST", "/api/proxy/" + id, { action: "renew" }).then(d => {
       toast(d.msg || "续期成功", "okk"); loadProxy(); loadCerts();
     }).catch(e => toast(e.message, "err"));
   }, "🔄 续期确认");
@@ -3494,7 +3513,7 @@ async function pullDocker() {
   const name = $("dk_pull_name").value.trim();
   if (!name) { toast("请输入镜像名", "err"); return; }
   try {
-    const d = await api("POST", "/api/docker/pull", { name });
+    const d = await apiTask("POST", "/api/docker/pull", { name });
     toast(d.msg || "拉取完成", d.ok ? "okk" : "err");
     if (d.ok) { $("dk_pull_name").value = ""; loadDocker(); }
   } catch (e) { toast(e.message, "err"); }
@@ -3505,7 +3524,7 @@ async function createDocker() {
   if (!name || !image) { toast("容器名称和镜像不能为空", "err"); return; }
   confirmPanel(`创建容器：${name}\n镜像：${image}\n端口：${$("dk_ports").value.trim() || "无"}\n环境变量：${$("dk_envs").value.trim() || "无"}`, async () => {
     try {
-      const d = await api("POST", "/api/docker/create", {
+      const d = await apiTask("POST", "/api/docker/create", {
         name, image,
         ports: $("dk_ports").value.trim(),
         envs: $("dk_envs").value.trim(),
@@ -3543,7 +3562,7 @@ function createDockerDirs() {
 function setDockerDataRoot() {
   confirmPanel("配置 Docker 镜像存储目录？\n\n将修改 /etc/docker/daemon.json 的 data-root 为 /DockerData/dockerimage，并重启 Docker 服务。\n\n⚠ 已有镜像/容器不会自动迁移到新位置，建议在刚安装、还没拉取镜像时配置。", async () => {
     try {
-      const d = await api("POST", "/api/docker/data-root", {});
+      const d = await apiTask("POST", "/api/docker/data-root", {});
       toast(d.msg || "配置完成", d.ok ? "okk" : "err");
       loadDocker();
     } catch (e) { toast(e.message, "err"); }
@@ -3595,7 +3614,7 @@ async function composeStart(folder) {
 function composeUpgrade(folder) {
   confirmPanel(`确定升级项目 ${folder}？\n\n将拉取最新镜像并重建容器（docker compose pull + up -d）。\n数据卷不受影响，需要几分钟。`, async () => {
     try {
-      const d = await api("POST", "/api/docker/compose/upgrade", { folder });
+      const d = await apiTask("POST", "/api/docker/compose/upgrade", { folder });
       toast(d.msg || "升级完成", d.ok ? "okk" : "err");
       loadComposeList();
     } catch (e) { toast(e.message, "err"); }
@@ -3617,7 +3636,7 @@ async function composeUp() {
   if (!content.trim()) { toast("请先粘贴 docker-compose.yml 内容", "err"); return; }
   const folder = $("dk_compose_folder").value.trim();
   try {
-    const d = await api("POST", "/api/docker/compose/up", { content, folder });
+    const d = await apiTask("POST", "/api/docker/compose/up", { content, folder });
     toast(d.msg || "启动完成", d.ok ? "okk" : "err");
     if (d.ok) { $("dk_compose").value = ""; $("dk_compose_folder").value = ""; loadDocker(); }
   } catch (e) { toast(e.message, "err"); }
@@ -3664,7 +3683,7 @@ function installDocker(source) {
     const btn = $(btnId);
     btn.disabled = true; btn.textContent = "安装中...（几分钟）";
     try {
-      const d = await api("POST", "/api/docker/install", { source });
+      const d = await apiTask("POST", "/api/docker/install", { source });
       toast(d.msg || "安装完成", d.ok ? "okk" : "err");
       loadDocker();
     } catch (e) { toast(e.message, "err"); }
@@ -3677,7 +3696,7 @@ function uninstallDocker() {
     const btn = $("btn_dk_uninstall");
     btn.disabled = true; btn.textContent = "卸载中...（几分钟）";
     try {
-      const d = await api("POST", "/api/docker/uninstall", {});
+      const d = await apiTask("POST", "/api/docker/uninstall", {});
       toast(d.msg || "卸载完成", d.ok ? "okk" : "err");
       loadDocker();
     } catch (e) { toast(e.message, "err"); }
