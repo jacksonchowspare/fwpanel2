@@ -4792,5 +4792,90 @@ class TestTermKeyApi(unittest.TestCase):
         self.assertEqual(code, 401)
 
 
+class TestTermZsh(unittest.TestCase):
+    """term 终端 zsh 语法高亮配置（v2.1.24）：zshrc 生成、登录 shell 选择、安装分支"""
+
+    def tearDown(self):
+        panel._TERM_SETUP_DONE = False
+
+    def test_zshrc_content_with_highlight(self):
+        c = panel._term_zshrc_content("/usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh")
+        self.assertIn("source /usr/share/zsh-syntax-highlighting", c)
+        self.assertIn("ZSH_HIGHLIGHT_STYLES[command]", c)
+        self.assertIn("PROMPT=", c)
+
+    def test_zshrc_content_without_highlight(self):
+        c = panel._term_zshrc_content("")
+        self.assertNotIn("\nsource ", c)   # 无高亮时不含 source 指令（注释里的字样除外）
+        self.assertIn("PROMPT=", c)   # 提示符始终有
+
+    def test_prepare_zsh_writes_rc(self):
+        """已有 zsh 和高亮插件时：只写 .zshrc + chown，不触发任何安装"""
+        home = tempfile.mkdtemp(prefix="fwterm-home-")
+        real_which = panel.shutil.which
+        real_paths = panel.ZSH_HL_PATHS
+        real_run = panel.subprocess.run
+        calls = []
+        try:
+            panel.shutil.which = lambda n: "/usr/bin/zsh" if n == "zsh" else None
+            # 让探测路径指向临时目录里的伪插件
+            fake_hl = os.path.join(home, "hl.zsh")
+            with open(fake_hl, "w") as f:
+                f.write("# hl")
+            panel.ZSH_HL_PATHS = (fake_hl,)
+            panel.subprocess.run = lambda *a, **k: calls.append(a) or type("R", (), {"returncode": 0})()
+            ok, msg = panel._term_prepare_zsh(home, os.geteuid(), os.geteuid())
+            self.assertTrue(ok, msg)
+            self.assertEqual(calls, [], "zsh 与插件都已存在时不应触发任何安装")
+            zshrc = os.path.join(home, ".zshrc")
+            self.assertTrue(os.path.exists(zshrc))
+            with open(zshrc, encoding="utf-8") as f:
+                self.assertIn("ZSH_HIGHLIGHT_STYLES[command]", f.read())
+        finally:
+            panel.shutil.which = real_which
+            panel.ZSH_HL_PATHS = real_paths
+            panel.subprocess.run = real_run
+            shutil.rmtree(home, ignore_errors=True)
+
+    def test_login_shell_fallback_nonroot(self):
+        """非 root（测试环境）：zsh 装了也不用，回落 bash（保持测试语义）"""
+        real_euid = panel.os.geteuid
+        real_which = panel.shutil.which
+        try:
+            panel.os.geteuid = lambda: 1000
+            panel.shutil.which = lambda n: "/usr/bin/zsh" if n == "zsh" else None
+            self.assertEqual(panel._term_login_shell(), panel.TERM_SHELL)
+        finally:
+            panel.os.geteuid = real_euid
+            panel.shutil.which = real_which
+
+    def test_ensure_async_runs_once(self):
+        """_term_ensure_zsh_async 内部锁：并发调用只启动一个后台线程"""
+        home = tempfile.mkdtemp(prefix="fwterm-home-")
+        real_which, real_run = panel.shutil.which, panel.subprocess.run
+        started = []
+        real_thread = panel.threading.Thread
+        try:
+            panel.shutil.which = lambda n: None   # 触发安装分支（但被 mock 吞）
+            panel.subprocess.run = lambda *a, **k: type("R", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+            class FakeThread:
+                def __init__(self, target=None, daemon=False, *a, **k):
+                    self.target = target
+                def start(self):
+                    started.append(self.target)
+            panel.threading.Thread = FakeThread
+            panel._term_ensure_zsh_async(home, os.geteuid(), os.geteuid())
+            panel._term_ensure_zsh_async(home, os.geteuid(), os.geteuid())
+            self.assertEqual(len(started), 1, "重复调用只应启动一次后台准备")
+            panel._term_ensure_zsh_async(home, os.geteuid(), os.geteuid())
+            self.assertEqual(len(started), 1)
+        finally:
+            panel.shutil.which = real_which
+            panel.subprocess.run = real_run
+            panel.threading.Thread = real_thread
+            panel._TERM_SETUP_DONE = False
+            shutil.rmtree(home, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -453,25 +453,35 @@ tr:hover td { background: var(--panel-solid); }
   /* ---- Web 终端多窗口系统（v2.1.23）---- */
   #term_dock { position: fixed; left: 8px; top: 50%; transform: translateY(-50%); z-index: 46;
     display: flex; flex-direction: column; gap: 8px; }
-  .twin-tab { width: 44px; height: 44px; border-radius: 12px; border: var(--bdw) solid var(--border);
-    background: var(--card); color: var(--text); font-size: 17px; cursor: pointer;
-    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 1px;
+  .twin-tab { width: 64px; height: 64px; border-radius: 14px; border: var(--bdw) solid var(--border);
+    background: var(--card); color: var(--text); font-size: 24px; cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 2px;
     box-shadow: var(--shadow-card); transition: transform .15s; position: relative; }
-  .twin-tab:hover { transform: scale(1.08); }
-  .twin-tab .tt-n { font-size: 9px; color: var(--muted); line-height: 1; }
+  .twin-tab:hover { transform: scale(1.06); }
+  .twin-tab .tt-n { font-size: 11px; color: var(--muted); line-height: 1; }
+  .twin-tab .tt-dot { position: absolute; top: 6px; right: 6px; width: 9px; height: 9px;
+    border-radius: 50%; background: #22c55e; border: 2px solid var(--card); }
+  .twin-tab .tt-dot.busy { background: #f59e0b; }
   .twin { position: fixed; z-index: 55; }
   .twin-frame { display: flex; flex-direction: column; overflow: hidden;
     border: var(--bdw) solid var(--border); border-radius: var(--r-modal);
     background: var(--card); box-shadow: var(--shadow-modal); }
-  .twin-title { display: flex; align-items: center; gap: 8px; padding: 7px 10px;
-    cursor: move; user-select: none; background: var(--hover-bg);
-    border-bottom: 1px dashed var(--border); border-radius: var(--r-modal) var(--r-modal) 0 0; }
+  .twin-title { display: flex; align-items: center; gap: 4px; padding: 5px 10px;
+    cursor: move; user-select: none; background: var(--card);   /* v2.1.24：实底不透明 */
+    border-bottom: 1px solid var(--border); }
   .twin-title .tw-ico { font-size: 13px; }
   .twin-title .tw-txt { font-size: 12px; font-weight: 600; flex: 1; white-space: nowrap;
     overflow: hidden; text-overflow: ellipsis; }
-  .twin-title .tw-btn { cursor: pointer; border: 0; background: transparent; color: var(--muted);
-    font-size: 14px; line-height: 1; padding: 3px 6px; border-radius: 6px; }
-  .twin-title .tw-btn:hover { background: rgba(128,128,128,.18); color: var(--text); }
+  .twin-title .tw-btn { cursor: pointer; border: 0; background: transparent; color: var(--text);
+    font-size: 12px; line-height: 1.2; padding: 5px 7px; border-radius: 6px;
+    display: inline-flex; align-items: center; gap: 4px; white-space: nowrap; }
+  .twin-title .tw-btn:hover { background: var(--hover-bg2); }
+  .twin-title .tw-btn.danger:hover { background: rgba(239,68,68,.14); color: #ef4444; }
+  .twin-resize { position: absolute; right: 0; bottom: 0; width: 16px; height: 16px;
+    cursor: nwse-resize; z-index: 66; opacity: .5; }
+  .twin-resize::after { content: ""; position: absolute; right: 3px; bottom: 3px;
+    width: 7px; height: 7px; border-right: 2px solid var(--border);
+    border-bottom: 2px solid var(--border); }
   .twin-keys { display: none; padding: 7px 10px; border-bottom: 1px dashed var(--border);
     flex-wrap: wrap; gap: 6px; align-items: center; }
   .twin-keys.show { display: flex; }
@@ -3829,7 +3839,7 @@ function termMakeWin(fedId, fedName) {
   const el = document.createElement("div");
   el.className = "twin";
   el.id = "twin_" + n;
-  const W = 800, H = 500;
+  const W = 900, H = 560;
   const left = Math.max(8, Math.round((window.innerWidth - W * z) / 2 + ((n - 1) % 5) * 28));
   const top = Math.max(8, Math.round((window.innerHeight - H * z) / 2 - 40 + ((n - 1) % 5) * 24));
   el.style.left = left + "px";
@@ -3839,11 +3849,11 @@ function termMakeWin(fedId, fedName) {
       '<div class="twin-title">' +
         '<span class="tw-ico">🖥</span>' +
         '<span class="tw-txt" title="' + title.replace(/"/g, "&quot;") + '">' + title + '</span>' +
-        '<button class="tw-btn" title="配色方案">🎨</button>' +
-        '<button class="tw-btn" title="用我的密钥（本地文件，关闭即删）">🔑</button>' +
-        '<button class="tw-btn" title="最小化到左侧">🗕</button>' +
-        '<button class="tw-btn" title="最大化 / 还原">⛶</button>' +
-        '<button class="tw-btn" title="关闭终端">✕</button>' +
+        '<button class="tw-btn" title="终端配色方案">🎨 配色</button>' +
+        '<button class="tw-btn" title="用我的密钥（本地文件，关闭即删）">🔑 密钥</button>' +
+        '<button class="tw-btn" title="最小化到左侧悬浮">🗕 最小化</button>' +
+        '<button class="tw-btn" title="最大化 / 还原（也可双击标题栏）">⛶ 最大化</button>' +
+        '<button class="tw-btn danger" title="关闭终端">✕ 关闭</button>' +
         '<div class="twin-pop">' +
           '<div class="tp-t">终端配色（新开窗口沿用）</div>' +
           '<div class="tp-grid"></div>' +
@@ -3855,6 +3865,7 @@ function termMakeWin(fedId, fedName) {
         '<span class="tk-name"></span>' +
       "</div>" +
       '<div class="twin-term"><div class="tt-host"></div></div>' +
+      '<div class="twin-resize"></div>' +
     "</div>";
   document.body.appendChild(el);
   const win = {
@@ -3863,6 +3874,7 @@ function termMakeWin(fedId, fedName) {
     keysRow: el.querySelector(".twin-keys"), keysName: el.querySelector(".tk-name"),
     fileEl: el.querySelector(".twin-keys input"), pickBtn: el.querySelector(".twin-keys button"),
     host: el.querySelector(".tt-host"), term: null, fit: null, ws: null,
+    resizeEl: el.querySelector(".twin-resize"),
     keyPath: null, fedId: fedId || null, fedName: fedName || null,
     rect: { left, top, W, H }, min: false, maxed: false, dot: null,
   };
@@ -3877,8 +3889,37 @@ function termMakeWin(fedId, fedName) {
   win.pickBtn.onclick = () => win.fileEl.click();
   win.fileEl.addEventListener("change", () => termPickKey(win));
   termDrag(win);
+  termResize(win);
   termBuildPalette(win, pal.id);
   return win;
+}
+
+function termResize(win) {
+  // 拖动右下角调整窗口大小（布局尺寸，zoom 内容层自动跟随）
+  const rz = win.resizeEl;
+  if (!rz) return;
+  rz.addEventListener("pointerdown", e => {
+    if (win.maxed) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const sx = e.clientX, sy = e.clientY;
+    const ow = win.rect.W, oh = win.rect.H;
+    const move = ev => {
+      const z = termZoom();
+      let nw = Math.max(480, Math.min(Math.round(ow + (ev.clientX - sx) / z), 2400));
+      let nh = Math.max(300, Math.min(Math.round(oh + (ev.clientY - sy) / z), 1600));
+      win.frame.style.width = nw + "px";
+      win.frame.style.height = nh + "px";
+      win.rect.W = nw; win.rect.H = nh;
+      termFit(win);
+    };
+    const up = () => {
+      document.removeEventListener("pointermove", move);
+      document.removeEventListener("pointerup", up);
+    };
+    document.addEventListener("pointermove", move);
+    document.addEventListener("pointerup", up);
+  });
 }
 
 function termBuildPalette(win, activeId) {

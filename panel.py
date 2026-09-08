@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.1.23"
+CURRENT_VERSION = "2.1.24"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -2459,6 +2459,14 @@ def install_pkgs(pkgs):
 # 5. 连接关闭即销毁 PTY；并发连接数限流；审计日志
 TERM_USER = "term"                # PTY 降权用户
 TERM_SHELL = "/bin/bash"
+# zsh 语法高亮（v2.1.24）：登录 shell 升级 zsh + zsh-syntax-highlighting，路径多发行版探测
+ZSH_HL_PATHS = (
+    "/usr/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh",
+    "/usr/share/zsh/plugins/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh",
+    "/usr/local/share/zsh-syntax-highlighting/zsh-syntax-highlighting.zsh",
+)
+_TERM_SETUP_LOCK = threading.Lock()
+_TERM_SETUP_DONE = False
 TERM_MAX_CONNS = 8                # 并发终端上限
 WS_GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 _term_conns = 0
@@ -2592,6 +2600,115 @@ def ws_client_connect(url, token, timeout=15):
     return sock, rfile
 
 
+def _term_zshrc_content(hl_path=""):
+    """term 用户 .zshrc：语法高亮 + 简洁路径提示符。hl_path 为空则不含高亮段。"""
+    lines = [
+        "# FW-Panel2 Web 终端自动配置 (v2.1.24)",
+        "# 语法高亮 zsh-syntax-highlighting + 简洁提示符；手工改动请保留 source 行",
+    ]
+    if hl_path:
+        lines += [
+            f"source {hl_path}",
+            "# —— 语法高亮配色（跟随默认深色终端）——",
+            "ZSH_HIGHLIGHT_STYLES[command]=fg=blue,bold",
+            "ZSH_HIGHLIGHT_STYLES[alias]=fg=blue,bold",
+            "ZSH_HIGHLIGHT_STYLES[builtin]=fg=blue,bold",
+            "ZSH_HIGHLIGHT_STYLES[function]=fg=blue,bold",
+            "ZSH_HIGHLIGHT_STYLES[path]=fg=green,underline",
+            "ZSH_HIGHLIGHT_STYLES[globbing]=fg=magenta,bold",
+            "ZSH_HIGHLIGHT_STYLES[history-expansion]=fg=magenta,bold",
+            "ZSH_HIGHLIGHT_STYLES[single-hyphen-option]=fg=yellow",
+            "ZSH_HIGHLIGHT_STYLES[double-hyphen-option]=fg=yellow",
+            "ZSH_HIGHLIGHT_STYLES[comment]=fg=cyan",
+            "ZSH_HIGHLIGHT_STYLES[default]=none",
+        ]
+    lines += [
+        "",
+        "# —— 提示符：user@host 目录 ——",
+        "setopt prompt_subst",
+        'PROMPT="%F{cyan}%n@%m%f %F{green}%~%f %F{white}❯%f "',
+        "",
+    ]
+    return "\n".join(lines) + "\n"
+
+
+def _term_prepare_zsh(home_dir, uid, gid, timeout=240):
+    """为 term 用户配置 zsh 语法高亮：
+    1) 探测 zsh / 高亮插件，缺失时用发行版包管理器安装（apt/pacman/dnf）
+    2) 写 .zshrc（高亮 + 提示符），chown term
+    返回 (ok, msg)。仅 root 调用；任何失败都回落 bash 不影响终端可用。"""
+    import shutil as _sh
+    zsh = _sh.which("zsh")
+    hl = next((p for p in ZSH_HL_PATHS if os.path.isfile(p)), "")
+    if not zsh:
+        try:
+            dist = (detect_distro() or "").lower()
+            if "arch" in dist:
+                subprocess.run(["pacman", "-S", "--noconfirm", "--needed", "zsh"],
+                               capture_output=True, text=True, timeout=timeout)
+            elif "fedora" in dist or "centos" in dist or "rhel" in dist or "rocky" in dist or "alma" in dist:
+                subprocess.run(["dnf", "install", "-y", "zsh"],
+                               capture_output=True, text=True, timeout=timeout)
+            else:  # Debian/Ubuntu 及默认
+                subprocess.run(["apt-get", "update"], capture_output=True, text=True, timeout=timeout)
+                subprocess.run(["apt-get", "install", "-y", "zsh"],
+                               capture_output=True, text=True, timeout=timeout)
+            zsh = _sh.which("zsh")
+        except Exception as e:
+            log(f"[term] zsh 安装失败（回落 bash）: {e}")
+            return False, "zsh 安装失败"
+    if not hl:
+        try:
+            dist = (detect_distro() or "").lower()
+            if "arch" in dist:
+                subprocess.run(["pacman", "-S", "--noconfirm", "--needed", "zsh-syntax-highlighting"],
+                               capture_output=True, text=True, timeout=timeout)
+            elif "fedora" in dist or "centos" in dist or "rhel" in dist:
+                subprocess.run(["dnf", "install", "-y", "zsh-syntax-highlighting"],
+                               capture_output=True, text=True, timeout=timeout)
+            else:
+                subprocess.run(["apt-get", "install", "-y", "zsh-syntax-highlighting"],
+                               capture_output=True, text=True, timeout=timeout)
+            hl = next((p for p in ZSH_HL_PATHS if os.path.isfile(p)), "")
+        except Exception as e:
+            log(f"[term] zsh-syntax-highlighting 安装失败: {e}")
+    try:
+        os.makedirs(home_dir, exist_ok=True)
+        zshrc = os.path.join(home_dir, ".zshrc")
+        with open(zshrc, "w", encoding="utf-8") as f:
+            f.write(_term_zshrc_content(hl))
+        try:
+            os.chown(home_dir, uid, gid)
+            os.chown(zshrc, uid, gid)
+        except Exception:
+            pass
+        if hl:
+            log(f"[term] zsh 语法高亮就绪: {hl}")
+        else:
+            log("[term] zsh 已装但高亮插件不可用（回落无高亮）")
+        return bool(hl), "ok"
+    except Exception as e:
+        log(f"[term] .zshrc 写入失败: {e}")
+        return False, "zshrc 写入失败"
+
+
+def _term_ensure_zsh_async(home_dir, uid, gid):
+    """后台准备 zsh 语法高亮（只跑一次，不阻塞终端打开）。"""
+    global _TERM_SETUP_DONE
+    if _TERM_SETUP_DONE:
+        return
+    with _TERM_SETUP_LOCK:
+        if _TERM_SETUP_DONE:
+            return
+        _TERM_SETUP_DONE = True
+    def _worker():
+        try:
+            _term_prepare_zsh(home_dir, uid, gid)
+        except Exception as e:
+            log(f"[term] zsh 准备异常: {e}")
+    threading.Thread(target=_worker, daemon=True).start()
+
+
 def _term_ensure_user():
     """确保低权用户 term 存在。root 下自动创建；非 root 且缺失返回 False。"""
     try:
@@ -2614,10 +2731,20 @@ def _term_ensure_user():
         return False
 
 
+def _term_login_shell():
+    """term 登录 shell：zsh 已装则优先（语法高亮 v2.1.24），否则 bash。仅 root/生产环境。"""
+    if os.geteuid() == 0:
+        z = shutil.which("zsh")
+        if z:
+            return z
+    return TERM_SHELL
+
+
 def _term_spawn_pty():
-    """fork PTY 会话：以 term 低权用户跑 shell。返回 (master_fd, proc)。
+    """fork PTY 会话：以 term 低权用户跑 shell（zsh 优先，语法高亮）。返回 (master_fd, proc)。
     非 root 环境（测试/DRY_RUN）退回当前用户，便于本地验证。"""
     import pty
+    shell = _term_login_shell()
     pid, master_fd = pty.fork()
     if pid == 0:
         # 子进程：降权到 term
@@ -2629,9 +2756,13 @@ def _term_spawn_pty():
             os.environ["HOME"] = pw.pw_dir
             os.environ["USER"] = TERM_USER
             os.environ["LOGNAME"] = TERM_USER
+            os.environ["SHELL"] = shell
         except Exception:
             pass  # 非 root/测试环境：保持当前用户
-        os.execv(TERM_SHELL, [TERM_SHELL, "-l"])
+        try:
+            os.execv(shell, [shell, "-l"])
+        except Exception:
+            os.execv(TERM_SHELL, [TERM_SHELL, "-l"])
         os._exit(1)
     return master_fd, pid
 
@@ -3898,6 +4029,14 @@ class PanelHandler(BaseHTTPRequestHandler):
         if os.geteuid() == 0 and not _term_ensure_user():
             self._send(503, {"error": f"低权用户 {TERM_USER} 不存在且无法创建"})
             return
+        # v2.1.24：root 环境后台准备 zsh 语法高亮（只跑一次；失败回落 bash 不影响本次连接）
+        if os.geteuid() == 0:
+            try:
+                import pwd
+                _pw = pwd.getpwnam(TERM_USER)
+                _term_ensure_zsh_async(_pw.pw_dir, _pw.pw_uid, _pw.pw_gid)
+            except Exception:
+                pass
         with _term_conns_lock:
             global _term_conns
             if _term_conns >= TERM_MAX_CONNS:
