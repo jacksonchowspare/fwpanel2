@@ -1733,7 +1733,16 @@ function ensureFedTab() {
   fedLoaded = false;   // 登录后重置渲染标记,防止残留失败状态导致服务器页空白
   if ((localStorage.getItem("fw_sec") || "") === "fed") renderFed();
 }
-function showLogin() { fedUiReset(); $("login").classList.remove("hidden"); $("main").classList.add("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "inline-block"; }
+// 关闭所有浮层（弹窗遮罩 + 悬浮终端窗口）。
+// ⚠ 退出登录/会话失效时必须调用：任何开着的弹窗遮罩都会盖住登录卡片，
+// 表现为"登录页打不开、点什么都没反应"（用户实测：开着主题面板点退出 → 卡住）
+function closeAllFloating() {
+  document.querySelectorAll(".modal-mask").forEach(m => m.classList.add("hidden"));
+  cfmCallback = null;
+  try { TERM_WINS.slice().forEach(w => termClose(w)); } catch (e) {}
+  const d = $("term_dock"); if (d) d.innerHTML = "";
+}
+function showLogin() { closeAllFloating(); fedUiReset(); $("login").classList.remove("hidden"); $("main").classList.add("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "inline-block"; }
 function showMain()  { $("login").classList.add("hidden"); $("main").classList.remove("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "none"; }
 async function login() {
   try {

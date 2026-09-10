@@ -285,6 +285,31 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   const sshTx = await page.$eval('[data-sec="ssh"]', e => e.innerText);
   rec("SSH 页有面板端口搬家提示", /面板端口已移至/.test(sshTx));
 
+  // ---- 退出登录后不能有残留浮层（否则登录页被遮住 = "打不开"）----
+  await page.evaluate(() => { document.querySelectorAll(".modal-mask").forEach(m => m.classList.add("hidden")); });
+  await page.click("#btn_theme").catch(() => {});
+  await page.waitForTimeout(600);
+  const thmOpen = await page.evaluate(() => [...document.querySelectorAll(".modal-mask")].filter(m => !m.classList.contains("hidden")).map(m => m.id));
+  rec("主题面板能被打开（前置条件）", thmOpen.includes("thm_modal"), JSON.stringify(thmOpen));
+  await page.evaluate(() => logout());
+  await page.waitForTimeout(1500);
+  const afterLogout = await page.evaluate(() => {
+    const lg = document.getElementById("login");
+    const btn = lg.querySelector("button");
+    const bx = btn.getBoundingClientRect();
+    const top = document.elementFromPoint(bx.left + bx.width / 2, bx.top + bx.height / 2);
+    return {
+      open: [...document.querySelectorAll(".modal-mask")].filter(m => !m.classList.contains("hidden")).map(m => m.id),
+      twins: document.querySelectorAll(".twin").length,
+      loginHidden: lg.classList.contains("hidden"),
+      topIsButton: !!top && top.tagName === "BUTTON",
+      topId: top ? (top.tagName + "#" + (top.id || "")) : "无"
+    };
+  });
+  rec("退出后没有残留弹窗遮罩", afterLogout.open.length === 0, JSON.stringify(afterLogout.open));
+  rec("退出后悬浮终端窗口已关闭", afterLogout.twins === 0, "twins=" + afterLogout.twins);
+  rec("退出后登录页可见且登录按钮可点", !afterLogout.loginHidden && afterLogout.topIsButton, afterLogout.topId);
+
   // ---- 各 tab 区块布局形态（防"把 panel 误写成 grid2 变成左右两列"）----
   const shapes = await page.evaluate(() => {
     // 隐藏的区块量不到宽度：先临时全部展开（保留原内联 display），量完再还原
