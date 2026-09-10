@@ -262,11 +262,6 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   rec("「用下一个可用端口」能给出可用端口", !!wz3.port && /🟢/.test(wz3.state), "端口=" + wz3.port + " 状态=" + JSON.stringify(wz3.state.slice(0, 30)));
   await page.evaluate(() => document.getElementById("appw_modal").classList.add("hidden"));
 
-  console.log("\n== 控制台错误 ==");
-  const real = errors.filter(e => !/favicon|net::ERR_ABORTED/i.test(e));
-  console.log(real.length ? real.slice(0, 10).join("\n") : "  无");
-  const pass = results.filter(r => r.ok).length;
-  console.log("\n结果：" + pass + "/" + results.length + " 通过");
   // ---- v3.2.0 系统页（本机设置收口）----
   await page.click('.tab[data-tab="sys"]');
   await page.waitForTimeout(2500);
@@ -285,30 +280,15 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   const sshTx = await page.$eval('[data-sec="ssh"]', e => e.innerText);
   rec("SSH 页有面板端口搬家提示", /面板端口已移至/.test(sshTx));
 
-  // ---- 退出登录后不能有残留浮层（否则登录页被遮住 = "打不开"）----
-  await page.evaluate(() => { document.querySelectorAll(".modal-mask").forEach(m => m.classList.add("hidden")); });
-  await page.click("#btn_theme").catch(() => {});
-  await page.waitForTimeout(600);
-  const thmOpen = await page.evaluate(() => [...document.querySelectorAll(".modal-mask")].filter(m => !m.classList.contains("hidden")).map(m => m.id));
-  rec("主题面板能被打开（前置条件）", thmOpen.includes("thm_modal"), JSON.stringify(thmOpen));
-  await page.evaluate(() => logout());
-  await page.waitForTimeout(1500);
-  const afterLogout = await page.evaluate(() => {
-    const lg = document.getElementById("login");
-    const btn = lg.querySelector("button");
-    const bx = btn.getBoundingClientRect();
-    const top = document.elementFromPoint(bx.left + bx.width / 2, bx.top + bx.height / 2);
-    return {
-      open: [...document.querySelectorAll(".modal-mask")].filter(m => !m.classList.contains("hidden")).map(m => m.id),
-      twins: document.querySelectorAll(".twin").length,
-      loginHidden: lg.classList.contains("hidden"),
-      topIsButton: !!top && top.tagName === "BUTTON",
-      topId: top ? (top.tagName + "#" + (top.id || "")) : "无"
-    };
-  });
-  rec("退出后没有残留弹窗遮罩", afterLogout.open.length === 0, JSON.stringify(afterLogout.open));
-  rec("退出后悬浮终端窗口已关闭", afterLogout.twins === 0, "twins=" + afterLogout.twins);
-  rec("退出后登录页可见且登录按钮可点", !afterLogout.loginHidden && afterLogout.topIsButton, afterLogout.topId);
+  const v6tx2 = (await page.$eval("#sys_ipv6", e => e.innerText)).trim();
+  rec("IPv6 显示真实状态（不是 - / 未知）", !/IPv6\s*-\s*$/.test(v6tx2) && !/未知/.test(v6tx2), v6tx2.replace(/\s+/g," ").slice(0,50));
+  await page.evaluate(() => showKernel());
+  await page.waitForTimeout(800);
+  const kmsg2 = await page.$eval("#cfm_msg", e => e.innerText).catch(() => "");
+  rec("内核弹窗显示真实内核版本号", /\d+\.\d+/.test(kmsg2), kmsg2.replace(/\n+/g," | ").slice(0,60));
+  rec("内核弹窗显示 BBR 支持结论", /支持/.test(kmsg2) && !/未知/.test(kmsg2), "");
+  await page.evaluate(() => { const m = document.getElementById("cfm_modal"); if (m) m.classList.add("hidden"); });
+
 
   // ---- 各 tab 区块布局形态（防"把 panel 误写成 grid2 变成左右两列"）----
   const shapes = await page.evaluate(() => {
@@ -353,16 +333,36 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   rec("系统页仍是两列网格（我的新页面没被改坏）",
       sysShapes.some(s => s.display === "grid"), JSON.stringify(sysShapes));
 
-  const v6tx2 = (await page.$eval("#sys_ipv6", e => e.innerText)).trim();
-  rec("IPv6 显示真实状态（不是 - / 未知）", !/IPv6\s*-\s*$/.test(v6tx2) && !/未知/.test(v6tx2), v6tx2.replace(/\s+/g," ").slice(0,50));
-  await page.click('button:has-text("内核版本")');
-  await page.waitForTimeout(800);
-  const kmsg2 = await page.$eval("#cfm_msg", e => e.innerText).catch(() => "");
-  rec("内核弹窗显示真实内核版本号", /\d+\.\d+/.test(kmsg2), kmsg2.replace(/\n+/g," | ").slice(0,60));
-  rec("内核弹窗显示 BBR 支持结论", /支持/.test(kmsg2) && !/未知/.test(kmsg2), "");
-  await page.evaluate(() => { const m = document.getElementById("cfm_modal"); if (m) m.classList.add("hidden"); });
+  // ---- 退出登录后不能有残留浮层（否则登录页被遮住 = "打不开"）----
+  // 直接调用 openTheme()：登录页的浮动主题按钮在登录后是隐藏的，点它会超时
+  await page.evaluate(() => { document.querySelectorAll(".modal-mask").forEach(m => m.classList.add("hidden")); openTheme(); });
+  await page.waitForTimeout(600);
+  const thmOpen = await page.evaluate(() => [...document.querySelectorAll(".modal-mask")].filter(m => !m.classList.contains("hidden")).map(m => m.id));
+  rec("主题面板能被打开（前置条件）", thmOpen.includes("thm_modal"), JSON.stringify(thmOpen));
+  await page.evaluate(() => logout());
+  await page.waitForTimeout(1500);
+  const afterLogout = await page.evaluate(() => {
+    const lg = document.getElementById("login");
+    const btn = lg.querySelector("button");
+    const bx = btn.getBoundingClientRect();
+    const top = document.elementFromPoint(bx.left + bx.width / 2, bx.top + bx.height / 2);
+    return {
+      open: [...document.querySelectorAll(".modal-mask")].filter(m => !m.classList.contains("hidden")).map(m => m.id),
+      twins: document.querySelectorAll(".twin").length,
+      loginHidden: lg.classList.contains("hidden"),
+      topIsButton: !!top && top.tagName === "BUTTON",
+      topId: top ? (top.tagName + "#" + (top.id || "")) : "无"
+    };
+  });
+  rec("退出后没有残留弹窗遮罩", afterLogout.open.length === 0, JSON.stringify(afterLogout.open));
+  rec("退出后悬浮终端窗口已关闭", afterLogout.twins === 0, "twins=" + afterLogout.twins);
+  rec("退出后登录页可见且登录按钮可点", !afterLogout.loginHidden && afterLogout.topIsButton, afterLogout.topId);
 
-
+  console.log("\n== 控制台错误 ==");
+  const real = errors.filter(e => !/favicon|net::ERR_ABORTED/i.test(e));
+  console.log(real.length ? real.slice(0, 10).join("\n") : "  无");
+  const pass = results.filter(r => r.ok).length;
+  console.log("\n结果：" + pass + "/" + results.length + " 通过");
   results.filter(r => !r.ok).forEach(r => console.log("  ✗ " + r.name + " | " + r.detail));
   await browser.close();
   process.exit(pass === results.length ? 0 : 1);
