@@ -52,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.1.0"
+CURRENT_VERSION = "3.1.1"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -130,6 +130,32 @@ def _tasks_save():
         pass
 
 
+# v3.1.1：长任务内部上报进度（用户实测「部署应用一直显示执行中，不知道卡住还是完成」——
+# 根因是任务体内部没有回传进度，前端只能看到创建时那句"执行中..."）
+_TASK_CTX = threading.local()
+
+
+def task_progress(msg="", log_line="", **fields):
+    """从长任务体内部上报进度：写进任务记录的 msg / log，前端轮询即可看到。
+    没有任务上下文时（例如同步调用）静默忽略。"""
+    tid = getattr(_TASK_CTX, "tid", "")
+    if not tid:
+        return
+    with _TASKS_LOCK:
+        t = _tasks.get(tid)
+        if not t:
+            return
+        if msg:
+            t["msg"] = msg
+        if log_line:
+            log = t.setdefault("log", [])
+            log.append(time.strftime("%H:%M:%S ") + str(log_line)[:300])
+            t["log"] = log[-60:]
+        for k, v in fields.items():
+            t[k] = v
+        _tasks_save()
+
+
 def start_task(action, fn, *args):
     """启动后台长任务：记录 running 并落盘 → 线程执行 → 更新结果。
     返回 task_id（前端轮询 /api/tasks/<id>）"""
@@ -139,15 +165,18 @@ def start_task(action, fn, *args):
         _tasks[tid] = {
             "action": action, "status": "running", "ok": False,
             "msg": "执行中...", "started": time.time(),
-            "finished": None, "done": False,
+            "finished": None, "done": False, "log": [],
         }
         _tasks_save()
 
     def _worker():
+        _TASK_CTX.tid = tid
         try:
             ok, msg = fn(*args)
         except Exception as e:
             ok, msg = False, f"任务异常: {e}"
+        finally:
+            _TASK_CTX.tid = ""
         with _TASKS_LOCK:
             t = _tasks.get(tid)
             if t is not None:
@@ -156,6 +185,8 @@ def start_task(action, fn, *args):
                 t["msg"] = msg
                 t["finished"] = time.time()
                 t["done"] = True
+                if not ok:
+                    t.setdefault("log", []).append(time.strftime("%H:%M:%S ") + "失败：" + str(msg)[:300])
                 _tasks_save()
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -2457,6 +2488,44 @@ def render_proxy_conf(p):
     return "\n".join(lines) + "\n"
 
 
+def repair_stale_jobs():
+    """面板启动时修复上次异常退出留下的僵尸状态（v3.1.1）
+
+    背景：sg1 一键部署 WordPress 时机器内存耗尽被重启，面板里那条任务永远显示"执行中"、
+    应用记录永远是 deploying —— 用户无法判断到底卡住还是失败。这里启动即判定为「已中断」。"""
+    try:
+        _tasks_load()
+        changed = False
+        with _TASKS_LOCK:
+            for tid, t in _tasks.items():
+                if t.get("status") == "running" and not t.get("done"):
+                    t["status"] = "error"
+                    t["ok"] = False
+                    t["done"] = True
+                    t["finished"] = time.time()
+                    t["msg"] = "任务被中断（面板或服务器在任务执行期间重启/崩溃）——请重试"
+                    t.setdefault("log", []).append(time.strftime("%H:%M:%S ") + "中断：面板启动时发现该任务未完成")
+                    changed = True
+            if changed:
+                _tasks_save()
+    except Exception as e:
+        log(f"[repair_stale_jobs] 任务修复失败: {e}")
+    try:
+        store = AppStore()
+        n = 0
+        for a in store.apps:
+            if a.get("status") == "deploying":
+                st = app_container_status(a.get("folder", ""))
+                note = ("部署被中断（面板/服务器在部署期间重启）。当前容器状态：" + str(st.get("detail", "")) +
+                        "。可以点「↻ 重试部署」继续，或卸载重来")
+                store.update(a["id"], status="error", error=note)
+                n += 1
+        if n:
+            log(f"[repair_stale_jobs] 标记 {n} 个部署中断的应用")
+    except Exception as e:
+        log(f"[repair_stale_jobs] 应用状态修复失败: {e}")
+
+
 def app_compose_file(folder):
     return os.path.join(COMPOSE_BASE, folder, "docker-compose.yml")
 
@@ -2551,7 +2620,8 @@ def app_write_files(app):
            "data_dir": data_dir, "images": app.get("images") or {},
            "db_pw": app["db_pw"], "db_root_pw": app["db_root_pw"],
            "admin_pw": app.get("admin_pw", ""), "admin_token": app.get("admin_token", ""),
-           "bind": "0.0.0.0" if app.get("expose_public") else "127.0.0.1"}
+           "bind": "0.0.0.0" if app.get("expose_public") else "127.0.0.1",
+           "db_tune": app_db_tune(app["template"], t)}
     compose = app_compose_text(app["template"], ctx)
     env = app_env_text(app["template"], ctx)
     with open(os.path.join(d, "docker-compose.yml"), "w") as f:
@@ -2692,12 +2762,16 @@ def app_deploy_work(aid):
         return False, "应用记录不存在"
     t = app_template(app["template"]) or {}
     logs = []
+    name = app.get("name") or t.get("name") or app["template"]
+    task_progress(f"{name}：正在生成配置…", "生成 compose 与 .env")
     # 1) 写配置
     ok, msg = app_write_files(app)
     if not ok:
         return False, msg
     logs.append("配置已生成")
     # 2) 起容器（首次会拉镜像，可能十几分钟；up 本身就会先 pull）
+    task_progress(f"{name}：正在拉取镜像并启动容器…（首次可能要 5-20 分钟，页面可以关掉稍后再看）",
+                  "docker compose up -d 开始（含镜像拉取）")
     ok, out = app_compose_cmd(app["folder"], "up", "-d", timeout=1800, full=True)
     if not ok:
         tail = (out or "").strip().splitlines()[-6:]
@@ -2708,16 +2782,21 @@ def app_deploy_work(aid):
     # 3) 等健康（最多 240 秒；容器没起来不算部署失败，后续步骤继续，日志里写明）
     st = app_container_status(app["folder"])
     if not DRY_RUN and not st.get("running"):
-        deadline = time.time() + 240
+        deadline = time.time() + 300
+        waited = 0
         while time.time() < deadline:
             st = app_container_status(app["folder"])
             if st.get("running"):
                 break
+            waited += 5
+            task_progress(f"{name}：等待容器就绪… 已等 {waited} 秒（{st.get('detail', '')[:60]}）",
+                          "容器状态：" + str(st.get("detail", ""))[:120] if waited % 30 == 0 else "")
             time.sleep(5)
     logs.append("容器状态：" + str(st.get("detail", ""))[:120])
     # 4) 有域名 → 建反代 + 放行 80/443（+ 签证书）
     domain = (app.get("domain") or "").strip()
     if domain:
+        task_progress(f"{name}：正在创建反向代理…", f"域名 {domain} → 127.0.0.1:{app['port']}")
         ps = ProxyStore()
         entry = ps.get(app["proxy_id"]) if app.get("proxy_id") else None
         if not entry:
@@ -2743,6 +2822,7 @@ def app_deploy_work(aid):
         okp, msgp = apply_all_nginx(ProxyStore(), SiteStore(), None)
         logs.append("nginx：" + msgp[:100])
         # 5) 证书：DNS 预检 → 后台签发（失败不回滚部署，仅提示）
+        task_progress(f"{name}：正在检查域名解析并申请证书…", "DNS 预检 + HTTP-01 签发")
         okdns, why = site_dns_precheck(domain, domain)
         if okdns:
             okc, msgc = issue_cert(domain, str(Config().get("acme_email", "") or ""))
@@ -4924,13 +5004,72 @@ def _app_pw(n=24):
     return secrets.token_urlsafe(n)
 
 
+def mem_info():
+    """返回 {total_mb, available_mb, swap_mb}（读取 /proc/meminfo，跨发行版稳定）"""
+    info = {"total_mb": 0, "available_mb": 0, "swap_mb": 0}
+    try:
+        vals = {}
+        with open("/proc/meminfo") as f:
+            for line in f:
+                if ":" not in line:
+                    continue
+                k, v = line.split(":", 1)
+                vals[k.strip()] = int(v.strip().split()[0]) if v.strip().split() else 0
+        info["total_mb"] = vals.get("MemTotal", 0) // 1024
+        info["available_mb"] = vals.get("MemAvailable", vals.get("MemFree", 0)) // 1024
+        info["swap_mb"] = vals.get("SwapTotal", 0) // 1024
+    except Exception:
+        pass
+    return info
+
+
+def app_mem_guard(tpl_id=None, tpl=None):
+    """部署前内存检查 → (ok, level, msg)。level: ok | warn | block
+
+    v3.1.1：sg1 实测教训 —— 956MB 无 swap 的机器上装 MySQL 8 + WordPress，
+    内存耗尽导致整机失联（SSH 都握不上手）。低于模板硬性下限直接拦，低于推荐值给出明确警告。"""
+    t = tpl or app_template(tpl_id) or {}
+    mi = mem_info()
+    total, swap = mi["total_mb"], mi["swap_mb"]
+    hard = int(t.get("min_mem_mb") or 900)
+    soft = int(t.get("warn_mem_mb") or max(hard, 1800))
+    name = t.get("name", tpl_id or "应用")
+    if not total:
+        return True, "ok", ""      # 读不到内存信息时不拦（避免误伤）
+    if total < hard:
+        return False, "block", (
+            f"本机内存 {total}MB（swap {swap}MB），低于 {name} 的最低要求 {hard}MB —— "
+            f"贸然部署会把机器打爆（实测会整机失联，连 SSH 都连不上）。"
+            f"建议：① 先加 swap（推荐 1-2GB）；② 改用更轻的应用（如 Typecho）；③ 升级实例规格。")
+    if total < soft or (swap == 0 and total < soft + 512):
+        tip = "本机没有 swap，建议先加 1-2GB swap" if swap == 0 else f"swap 仅 {swap}MB"
+        return True, "warn", (
+            f"内存偏紧：本机 {total}MB、{tip}。{name} 在这种配置上首次启动（数据库初始化）会比较慢、"
+            f"也可能因内存不足失败。建议加 swap 或升级规格；确认要继续吗？")
+    return True, "ok", ""
+
+
+def app_db_tune(tpl_id, tpl=None):
+    """按机器内存给出数据库低内存参数（低配机器能显著降低打爆风险）"""
+    t = tpl or app_template(tpl_id) or {}
+    mi = mem_info()
+    total = mi["total_mb"] or 2048
+    pool = 64 if total < 1600 else 128
+    args = [f"--innodb-buffer-pool-size={pool}M", "--performance-schema=0", "--max-connections=50"]
+    if (t.get("db") == "mysql") and (t.get("images", {}).get("db", "").startswith("mysql")):
+        args.append("--innodb-redo-log-capacity=64M")
+    return args
+
+
 APP_TEMPLATES = {
     "wordpress": {
         "name": "WordPress", "icon": "📝",
         "desc": "最流行的博客 / 建站程序，PHP + MySQL",
-        "images": {"main": "wordpress:latest", "db": "mysql:8.0"},
+        # v3.1.1：默认数据库由 mysql:8.0 换成 mariadb:11 —— MySQL 8 在 1GB 机器上初始化即打爆内存
+        # （sg1 实测：956MB 无 swap，部署中整机失联）。MariaDB 同协议、更省内存。
+        "images": {"main": "wordpress:latest", "db": "mariadb:11"},
         "default_port": 8080, "container_port": 80, "db": "mysql",
-        "upload_mb": 32, "websocket": False, "require_domain": False, "min_mem_mb": 512,
+        "upload_mb": 32, "websocket": False, "require_domain": False, "min_mem_mb": 900, "warn_mem_mb": 1800,
         "notes": ["首次访问会进入 WordPress 安装向导（需要人工填写站点标题与管理员账号）",
                   "数据库连接信息已自动注入，无需手填"],
     },
@@ -4939,7 +5078,7 @@ APP_TEMPLATES = {
         "desc": "轻量博客程序，资源占用小",
         "images": {"main": "joyqi/typecho:nightly-php8.2-apache", "db": "mariadb:11"},
         "default_port": 8081, "container_port": 80, "db": "mysql",
-        "upload_mb": 32, "websocket": False, "require_domain": False, "min_mem_mb": 256,
+        "upload_mb": 32, "websocket": False, "require_domain": False, "min_mem_mb": 700, "warn_mem_mb": 1200,
         "notes": ["Typecho 官方作者镜像只有 nightly 标签（无正式版 tag）；如需固定版本可在「镜像」里改成自己的镜像",
                   "首次访问进入 Typecho 安装向导"],
     },
@@ -4948,7 +5087,7 @@ APP_TEMPLATES = {
         "desc": "私有网盘 / 协同办公套件",
         "images": {"main": "nextcloud:stable-apache", "db": "mariadb:11"},
         "default_port": 8082, "container_port": 80, "db": "mysql",
-        "upload_mb": 512, "websocket": False, "require_domain": False, "min_mem_mb": 1024,
+        "upload_mb": 512, "websocket": False, "require_domain": False, "min_mem_mb": 1200, "warn_mem_mb": 2048,
         "notes": ["建议内存 ≥1GB；首次启动初始化数据库需要 1-2 分钟",
                   "已自动配置受信任域名 / 反代协议（HTTPS 由面板反代提供）",
                   "上传大小默认 512MB，可在反代条目里调整"],
@@ -4958,7 +5097,7 @@ APP_TEMPLATES = {
         "desc": "轻量 Bitwarden 兼容密码管理器（Rust 实现）",
         "images": {"main": "vaultwarden/server:latest"},
         "default_port": 8083, "container_port": 80, "db": "sqlite",
-        "upload_mb": 32, "websocket": True, "require_domain": True, "min_mem_mb": 256,
+        "upload_mb": 32, "websocket": True, "require_domain": True, "min_mem_mb": 512, "warn_mem_mb": 900,
         "notes": ["必须绑定域名并签发证书：浏览器加密接口（Web Crypto）要求 HTTPS 安全上下文，纯 IP 访问无法登录",
                   "反代自动开启 WebSocket（实时同步需要）",
                   "后台管理令牌已自动生成，在部署结果页可查看"],
@@ -4991,6 +5130,7 @@ def app_compose_text(tpl_id, ctx):
             "  db:",
             f"    image: {db_img}",
             "    restart: unless-stopped",
+            *(["    command:", "      - " + "\n      - ".join(ctx.get("db_tune") or [])] if ctx.get("db_tune") else []),
             "    environment:",
             "      MYSQL_DATABASE: appdb",
             "      MYSQL_USER: appuser",
@@ -5149,23 +5289,34 @@ class AppStore:
         return None
 
     def add(self, entry):
+        # ⚠ 一律「重新读盘 → 改 → 写回」：部署任务持有的是创建时的快照，
+        # 若直接整表覆写，会把这期间用户删除的记录**复活**（单测已抓到此问题）
+        fresh = AppStore()
         entry = dict(entry)
         entry.setdefault("id", secrets.token_hex(6))
-        self.apps.append(entry)
-        self.save()
+        fresh.apps.append(entry)
+        fresh.save()
+        self.apps = fresh.apps
         return entry
 
     def update(self, aid, **kw):
-        a = self.get(aid)
+        fresh = AppStore()
+        a = fresh.get(aid)
         if not a:
+            self.apps = fresh.apps      # 记录已被删除：不要把它写回去
             return None
         a.update(kw)
-        self.save()
+        fresh.save()
+        self.apps = fresh.apps
         return a
 
     def remove(self, aid):
-        self.apps = [a for a in self.apps if a.get("id") != aid]
-        self.save()
+        fresh = AppStore()
+        keep = [a for a in fresh.apps if a.get("id") != aid]
+        if len(keep) != len(fresh.apps):
+            fresh.apps = keep
+            fresh.save()
+        self.apps = fresh.apps
 
 
 def create_docker_dirs():
@@ -6731,6 +6882,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             "docker": {k: docker_status().get(k) for k in ("installed", "service_active", "version", "compose_version")},
             "defaults": {"upload_mb": UPLOAD_LIMIT_DEFAULT_MB, "data_base": APP_DATA_BASE,
                          "host_ip": get_server_ip() or ""},
+            "mem": mem_info(),
         })
 
     def _api_app_port_check(self):
@@ -6768,6 +6920,14 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not docker_installed():
             self._send(400, {"error": "未安装 Docker：请先到「Docker」页一键安装后再部署应用",
                              "need_docker": True})
+            return
+        # 内存守卫（v3.1.1：先拦后部署，避免一键把机器打爆）
+        mem_ok, mem_level, mem_msg = app_mem_guard(tid, t)
+        if not mem_ok:
+            self._send(400, {"error": mem_msg, "mem_block": True, "mem": mem_info()})
+            return
+        if mem_level == "warn" and not data.get("accept_mem_warning"):
+            self._send(400, {"error": mem_msg, "mem_warning": True, "mem": mem_info()})
             return
         # 端口
         try:
@@ -8685,6 +8845,10 @@ def main():
     # v3.0.1：启动时确保 nginx 兜底守卫配置存在并生效（default_server 444 / 443 ssl_reject_handshake）。
     # 从 v2.1.32 升级上来的机器，该文件在旧版本里被清理逻辑误删过（见 v2.1.33 hotfix），
     # 若不在启动补写，则要等到第一次建站/改反代才恢复，此期间 IP 直连落到第一个 server block。
+    try:
+        repair_stale_jobs()      # v3.1.1：把上次异常退出留下的"执行中/部署中"标为中断
+    except Exception as e:
+        log(f"[main] 残留状态修复异常: {e}")
     try:
         if nginx_available():
             ensure_nginx_default()

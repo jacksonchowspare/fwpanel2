@@ -3019,7 +3019,7 @@ function switchTab(sec) {
 })();
 
 /* ---------- 应用（一键部署，v3.1.0） ---------- */
-let appTpls = [], appList = [], appsLoaded = false;
+let appTpls = [], appList = [], appsLoaded = false, appMem = {};
 let appw = { step: 0, tpl: "", port: null, domain: "", expose: false, name: "", upload: 32,
              imgMain: "", imgDb: "", task: "", result: null, checking: false };
 
@@ -3032,14 +3032,25 @@ async function loadApps() {
     appsLoaded = true;
     const dk = d.docker || {};
     const dd = d.defaults || {};
+    appMem = d.mem || {};
     $("app_datadir_label").textContent = dd.data_base || "/DockerData/apps";
     if (!dk.installed) {
       $("app_status").innerHTML = '未检测到 Docker：应用需要在 Docker 里运行'
         + '<button class="btn mini" style="margin-left:8px" onclick="switchTab(\'dk\')">去 Docker 页一键安装</button>';
     } else {
-      $("app_status").textContent = (dk.service_active ? "Docker 运行中" : "Docker 已安装但未运行（systemctl start docker）")
+      let line = (dk.service_active ? "Docker 运行中" : "Docker 已安装但未运行（systemctl start docker）")
         + (dk.version ? " · " + dk.version : "")
         + " · 已部署 " + appList.length + " 个应用";
+      if (appMem.total_mb) {
+        line += " · 内存 " + appMem.total_mb + "MB" + (appMem.swap_mb ? " / swap " + appMem.swap_mb + "MB" : "（无 swap）");
+      }
+      $("app_status").textContent = line;
+      if (appMem.total_mb && appMem.total_mb < 1800) {
+        $("app_status").innerHTML = esc(line)
+          + '<div style="color:var(--danger);margin-top:4px">⚠ 本机内存偏紧'
+          + (appMem.swap_mb ? "" : "且没有 swap") + '：应用首次启动（数据库初始化）可能很慢甚至失败，'
+          + '建议先加 swap（1-2GB）或升级实例规格；轻量应用（Typecho、Vaultwarden）更稳妥。</div>';
+      }
     }
     renderApps();
   } catch (e) {
@@ -3148,7 +3159,11 @@ function appwRender() {
           + (appw.tpl === x.id ? " checked" : "") + ' onchange="appwPick(' + qjs(x.id) + ')">'
           + "<span><b>" + esc(x.icon + " " + x.name) + "</b>"
           + "<span>" + esc(x.desc) + "　·　默认端口 " + esc(String(x.default_port))
-          + (x.require_domain ? "　·　需要域名" : "") + "</span></span></label>").join("")
+          + (x.require_domain ? "　·　需要域名" : "")
+          + "　·　建议内存 ≥ " + esc(String(x.min_mem_mb || 900)) + "MB"
+          + (appMem.total_mb && appMem.total_mb < (x.min_mem_mb || 900)
+             ? '　<b style="color:var(--danger)">（本机 ' + esc(String(appMem.total_mb)) + "MB，不够）</b>" : "")
+          + "</span></span></label>").join("")
       + "</div>"
       + (t.notes && t.notes.length
           ? '<div style="color:var(--muted);font-size:12px;margin-top:10px">注意：<br>· ' + t.notes.map(esc).join("<br>· ") + "</div>" : "");
@@ -3186,7 +3201,12 @@ function appwRender() {
   }
   if (appw.step === 2) {
     b.innerHTML = '<div id="aw_progress" style="font-size:13px">正在部署…</div>'
-      + '<div id="aw_progress_log" style="color:var(--muted);font-size:12px;margin-top:8px;white-space:pre-wrap"></div>';
+      + '<div id="aw_progress_meta" style="color:var(--muted);font-size:12px;margin-top:6px">'
+      + '首次部署要拉取镜像（几百 MB），通常 5-20 分钟；这段时间可以直接关掉页面，稍后回来点「刷新」看结果。</div>'
+      + '<div id="aw_progress_log" style="color:var(--muted);font-size:12px;margin-top:8px;white-space:pre-wrap;'
+      + 'font-family:\'0xProto\',ui-monospace,monospace;max-height:220px;overflow:auto"></div>'
+      + '<div style="margin-top:10px"><button class="btn mini ghost" onclick="appwShowLogs()">查看容器日志</button>'
+      + ' <span style="color:var(--muted);font-size:12px">（容器起来了才有日志，可随时点）</span></div>';
     return;
   }
   const r = appw.result || {};
@@ -3274,16 +3294,24 @@ function appwStep(d) {
   if (appw.step === 3) { closeAppWizard(); loadApps(); }
 }
 
-async function appDeploy() {
+function appwShowLogs() {
+  const id = (appw.result && appw.result.app && appw.result.app.id) || "";
+  if (!id) { toast("还没有应用 id，稍等几秒再点", "err"); return; }
+  appLogs(id);
+}
+
+async function appDeploy(acceptMem) {
   const logEl = $("aw_progress_log");
   try {
     const d = await api("POST", "/api/apps", {
       template: appw.tpl, name: appw.name, port: appw.port, domain: appw.domain,
       expose_public: appw.expose, upload_mb: appw.upload,
       images: { main: appw.imgMain, db: appw.imgDb },
+      accept_mem_warning: !!acceptMem,
     });
     appw.result = d;
     const tid = d.task;
+    const t0 = Date.now();
     $("aw_progress").textContent = d.msg || "部署中…";
     if (tid) {
       for (;;) {
@@ -3291,9 +3319,15 @@ async function appDeploy() {
         let t;
         try { t = await api("GET", "/api/tasks/" + tid); }
         catch (err) { if (err.message !== "未登录") continue; throw err; }
+        const secs = Math.round((Date.now() - t0) / 1000);
+        const el = $("aw_progress_meta");
+        if (el) el.textContent = "已用时 " + (secs < 60 ? secs + " 秒" : Math.floor(secs / 60) + " 分 " + (secs % 60) + " 秒")
+          + "　·　状态：" + (t.status === "running" ? "进行中" : t.status);
         if (t.msg) $("aw_progress").textContent = t.msg;
+        const lg = $("aw_progress_log");
+        if (lg && t.log && t.log.length) { lg.textContent = t.log.join("\n"); lg.scrollTop = lg.scrollHeight; }
         if (t.status === "ok" || t.status === "error") {
-          if (logEl) logEl.textContent = t.msg || "";
+          if (logEl) logEl.textContent = (t.log || []).slice(-12).join("\n") || t.msg || "";
           break;
         }
       }
@@ -3301,9 +3335,15 @@ async function appDeploy() {
     appw.step = 3; appwRender();
     loadApps();
   } catch (e) {
-    if (logEl) logEl.textContent = e.message;
-    $("aw_progress").innerHTML = '<span style="color:var(--danger)">部署失败：' + esc(e.message) + "</span>"
-      + '<div style="color:var(--muted);font-size:12px;margin-top:8px">修正后可以再点「开始部署」重试（同名目录已存在时请改端口）。</div>';
+    const msg = e.message || "";
+    // 内存警告：让用户确认一次再继续（后端在拿不到 accept_mem_warning 时一律拦下）
+    if (!acceptMem && /内存偏紧|swap/.test(msg)) {
+      if (confirm(msg + "\n\n仍要继续部署吗？")) { appDeploy(true); return; }
+    }
+    if (logEl) logEl.textContent = msg;
+    $("aw_progress").innerHTML = '<span style="color:var(--danger)">部署失败：' + esc(msg) + "</span>"
+      + '<div style="color:var(--muted);font-size:12px;margin-top:8px">修正后可以再点「开始部署」重试（同名目录已存在时请改端口）。</div>'
+      + '<div style="margin-top:8px"><button class="btn mini ghost" onclick="appwShowLogs()">查看容器日志</button></div>';
     $("appw_next").textContent = "重试";
     $("appw_next").setAttribute("onclick", "appDeploy()");
     $("appw_next").style.display = "";

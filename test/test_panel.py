@@ -5766,6 +5766,26 @@ class TestApps(unittest.TestCase):
         self.assertEqual(code, 200, d)
         self.assertFalse(os.path.exists(d2), "purge=1 必须连数据一起删")
 
+    def test_stale_store_cannot_resurrect_deleted_app(self):
+        """删除后，持有旧快照的部署任务 update() 不能把记录写回来（读-改-写）"""
+        a = panel.AppStore().add({"template": "typecho", "name": "race", "folder": "race-1",
+                                  "data_dir": panel.app_data_dir("race-1"), "port": 18099,
+                                  "container_port": 80, "domain": "", "expose_public": False,
+                                  "upload_mb": 32, "images": {}, "status": "deploying",
+                                  "db_pw": "x", "db_root_pw": "y", "admin_pw": "z", "admin_token": "t",
+                                  "proxy_id": "", "created": 0})
+        stale = panel.AppStore()          # 部署任务手里的快照
+        panel.AppStore().remove(a["id"])  # 用户删除
+        self.assertIsNone(panel.AppStore().get(a["id"]))
+        stale.update(a["id"], status="ready")   # 部署任务收尾
+        self.assertIsNone(panel.AppStore().get(a["id"]), "已删除的记录不得被旧快照复活")
+        stale.add({"template": "typecho", "name": "another", "folder": "race-2", "data_dir": "/tmp/x",
+                   "port": 18098, "container_port": 80, "domain": "", "expose_public": False,
+                   "upload_mb": 32, "images": {}, "status": "ready", "db_pw": "x", "db_root_pw": "y",
+                   "admin_pw": "z", "admin_token": "t", "proxy_id": "", "created": 0})
+        ids = [x["id"] for x in panel.AppStore().apps]
+        self.assertIsNone(panel.AppStore().get(a["id"]))
+        self.assertTrue(any(x.get("name") == "another" for x in panel.AppStore().apps), ids)
     def test_deploy_work_updates_status(self):
         """部署任务体：DRY_RUN 下也要把状态推进到 ready 并写出配置文件"""
         app = panel.AppStore().add({"template": "wordpress", "name": "dry", "folder": "wp-dry",
