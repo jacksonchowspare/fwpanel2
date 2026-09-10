@@ -165,17 +165,84 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   console.log("== 场景 5：已申请证书列表 ==");
   await page.evaluate(() => switchTab("px"));
   await page.waitForTimeout(1500);
-  const certs = await page.evaluate(() => {
+  const certs = await page.evaluate(async () => {
     const rows = [...document.querySelectorAll("#cert_rows tr")];
     const txt = (document.getElementById("cert_rows") || {}).textContent || "";
+    let apiCerts = null;
+    try { const r = await fetch(API + "/api/cert", { headers: { Authorization: "Bearer " + token } });
+          apiCerts = (await r.json()).certs || []; } catch (e) { apiCerts = null; }
     return { n: rows.filter(r => r.querySelector("button")).length, empty: /暂无独立申请记录/.test(txt),
              domains: rows.map(r => (r.querySelector("td") || {}).textContent || "").filter(Boolean).slice(0, 6),
-             hasRenew: rows.some(r => /手动续期/.test(r.textContent)) };
+             hasRenew: rows.some(r => /手动续期/.test(r.textContent)),
+             machineCerts: apiCerts === null ? -1 : apiCerts.length };
   });
-  rec("证书列表非空（站点自动申请的证书可见）", certs.n >= 1 && !certs.empty,
-      "行数=" + certs.n + (certs.empty ? " (显示暂无记录)" : "") + " " + JSON.stringify(certs.domains));
-  rec("证书行带管理按钮（手动续期）", certs.hasRenew, "");
+  // 该机器本来就没有证书时，「暂无记录」是正确表现（不能算失败）
+  const noCerts = certs.machineCerts === 0;
+  rec("证书列表与后端一致（有证书则必须列出）", noCerts ? certs.empty : (certs.n >= 1 && !certs.empty),
+      "行数=" + certs.n + " 后端证书=" + certs.machineCerts + (certs.empty ? " (暂无记录)" : "") + " " + JSON.stringify(certs.domains));
+  rec("证书行带管理按钮（手动续期）", noCerts || certs.hasRenew, noCerts ? "（本机无证书，跳过）" : "");
   await page.locator("#cert_rows").screenshot({ path: "/tmp/uicheck/shots2/certs.png" }).catch(() => {});
+
+  // —— 场景 6：应用 tab（v3.1.0 一键部署）——
+  console.log("== 场景 6：应用 tab 与部署向导 ==");
+  await page.evaluate(() => { document.querySelectorAll(".modal-mask").forEach(m => m.classList.add("hidden")); });
+  await page.waitForTimeout(300);
+  await page.evaluate(() => switchTab("app"));
+  await page.waitForTimeout(3000);
+  const ap = await page.evaluate(() => {
+    const cards = [...document.querySelectorAll("#app_cards .site-card")];
+    return {
+      cards: cards.length,
+      status: (document.getElementById("app_status") || {}).textContent || "",
+      rows: cards.map(c => {
+        const row = c.querySelector(".sc-btns");
+        const bs = [...row.querySelectorAll("button")];
+        const tops = bs.map(b => b.getBoundingClientRect().top).sort((a, b) => a - b);
+        let n = tops.length ? 1 : 0;
+        for (let i = 1; i < tops.length; i++) if (tops[i] - tops[i - 1] > 3) n++;
+        return { n: bs.length, rows: n, labels: bs.map(x => x.textContent.trim().slice(0, 6)) };
+      }),
+    };
+  });
+  rec("应用 tab 状态行有结论", !!ap.status && !ap.status.includes("检测中"), JSON.stringify(ap.status.slice(0, 50)));
+  const apRows = ap.rows.length ? Math.max(...ap.rows.map(r => r.rows)) : 0;
+  rec("应用卡片按钮同一行", ap.cards === 0 || apRows === 1,
+      "卡片=" + ap.cards + " 最多行数=" + apRows + (ap.rows[0] ? " [" + ap.rows[0].labels.join("/") + "]" : ""));
+
+  // 部署向导：打开 → 选模板 → 端口检测 → 下一步
+  await page.evaluate(() => { document.querySelectorAll(".modal-mask").forEach(m => m.classList.add("hidden")); });
+  await page.click("button:has-text('部署应用')");
+  await page.waitForTimeout(1200);
+  const wz1 = await page.evaluate(() => ({
+    open: !document.getElementById("appw_modal").classList.contains("hidden"),
+    radios: document.querySelectorAll("#appw_body .wz-radio").length,
+    dots: document.querySelectorAll("#appw_dots .wz-dot").length,
+    radioW: (() => { const i = document.querySelector("#appw_body .wz-radio input[type=radio]");
+                     return i ? Math.round(i.getBoundingClientRect().width) : -1; })(),
+  }));
+  rec("部署向导第 1 步：模板可选（4 个）", wz1.open && wz1.radios >= 4, "模板=" + wz1.radios + " 步骤点=" + wz1.dots);
+  rec("向导单选按钮未被拉满", wz1.radioW > 0 && wz1.radioW <= 20, "radio 宽=" + wz1.radioW + "px");
+
+  await page.click("#appw_next");
+  await page.waitForTimeout(1800);
+  const wz2 = await page.evaluate(() => ({
+    hasPort: !!document.getElementById("aw_port"),
+    port: (document.getElementById("aw_port") || {}).value || "",
+    state: (document.getElementById("aw_port_state") || {}).textContent || "",
+    upload: (document.getElementById("aw_upload") || {}).value || "",
+    domain: !!document.getElementById("aw_domain"),
+  }));
+  rec("向导第 2 步：端口字段可编辑且有检测结论", wz2.hasPort && /🟢|🔴/.test(wz2.state),
+      "端口=" + wz2.port + " 检测=" + JSON.stringify(wz2.state.slice(0, 40)) + " 上传=" + wz2.upload + "MB");
+  // 「用下一个可用端口」按钮
+  await page.click("button:has-text('用下一个可用端口')");
+  await page.waitForTimeout(1500);
+  const wz3 = await page.evaluate(() => ({
+    port: (document.getElementById("aw_port") || {}).value || "",
+    state: (document.getElementById("aw_port_state") || {}).textContent || "",
+  }));
+  rec("「用下一个可用端口」能给出可用端口", !!wz3.port && /🟢/.test(wz3.state), "端口=" + wz3.port + " 状态=" + JSON.stringify(wz3.state.slice(0, 30)));
+  await page.evaluate(() => document.getElementById("appw_modal").classList.add("hidden"));
 
   console.log("\n== 控制台错误 ==");
   const real = errors.filter(e => !/favicon|net::ERR_ABORTED/i.test(e));

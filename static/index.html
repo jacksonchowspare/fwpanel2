@@ -694,6 +694,8 @@ tr:hover td { background: var(--panel-solid); }
       <button class="tab" data-tab="fw" onclick="switchTab('fw')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 5-3 8-7 10-4-2-7-5-7-10V6z"/></svg> 防火墙</button>
       <button class="tab" data-tab="site" onclick="switchTab('site')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 13h.01M11 13h.01M7 17h7"/></svg> 网站</button>
       <button class="tab" data-tab="ssh" onclick="switchTab('ssh')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg> SSH 安全</button>
+      <!-- ===== 应用 tab 按钮（插在 px tab 之前）===== -->
+      <button class="tab" data-tab="app" onclick="switchTab('app')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg> 应用</button>
       <button class="tab" data-tab="px" onclick="switchTab('px')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"/></svg> 反代证书</button>
       <button class="tab" data-tab="dk" onclick="switchTab('dk')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg> Docker</button>
       <button class="tab" id="tab_fed" data-tab="fed" onclick="switchTab('fed')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 18v3M7 8h.01M11 8h.01M15 8h.01"/></svg> 服务器</button>
@@ -797,6 +799,70 @@ tr:hover td { background: var(--panel-solid); }
       </div>
     </div>
 
+
+    <!-- ===== 应用面板（插在 px panel 之前）===== -->
+    <div class="panel" data-sec="app">
+      <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg> 应用</h2>
+      <div id="app_status" style="color:var(--muted);font-size:12px;margin-bottom:10px">检测中...</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn" onclick="openAppWizard()">＋ 部署应用</button>
+          <span style="color:var(--muted);font-size:12px">数据目录：<code id="app_datadir_label" style="font-family:'0xProto',ui-monospace,monospace">/DockerData/apps</code></span>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="app_search" placeholder="🔍 搜索应用（名称 / 域名 / 端口）" style="width:220px" oninput="renderApps()">
+          <button class="btn mini ghost" onclick="loadApps()">刷新</button>
+        </div>
+      </div>
+      <div class="site-cards" id="app_cards"></div>
+      <div id="app_empty" style="color:var(--muted);font-size:13px;display:none">还没有应用。点「＋ 部署应用」一键安装 WordPress / Typecho / Nextcloud / Vaultwarden。</div>
+      <div style="color:var(--muted);font-size:12px;margin-top:12px">应用跑在 Docker 容器里，容器端口只绑 <code style="font-family:'0xProto',ui-monospace,monospace">127.0.0.1</code>，公网访问统一走 80/443 的域名反代（自动签证书 + 强制 HTTPS）；没有域名时默认不暴露公网。数据和数据库都在应用的数据目录里，卸载默认保留。</div>
+    </div>
+
+<!-- ===== 部署向导 ===== -->
+  <div id="appw_modal" class="modal-mask hidden">
+    <div class="modal" style="max-width:720px">
+      <h3 id="appw_title">部署应用</h3>
+      <div class="wz-dots" id="appw_dots"><div class="wz-dot active"></div><div class="wz-dot"></div><div class="wz-dot"></div><div class="wz-dot"></div></div>
+      <div id="appw_body"></div>
+      <div class="btnrow" style="margin-top:14px">
+        <button class="btn ghost" onclick="closeAppWizard()">取消</button>
+        <button class="btn ghost" id="appw_back" onclick="appwStep(-1)" style="display:none">上一步</button>
+        <button class="btn" id="appw_next" onclick="appwStep(1)">下一步</button>
+      </div>
+    </div>
+  </div>
+
+<!-- ===== 应用日志弹窗 ===== -->
+  <div id="applog_modal" class="modal-mask hidden">
+    <div class="modal" style="max-width:900px">
+      <h3 id="applog_title">应用日志</h3>
+      <div class="table-wrap" style="max-height:55vh;overflow:auto;background:var(--input-bg);border-radius:var(--r-sm);padding:10px">
+        <pre id="applog_body" style="margin:0;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all"></pre>
+      </div>
+      <div class="btnrow" style="margin-top:14px">
+        <button class="btn mini ghost" onclick="appLogsReload()">刷新</button>
+        <button class="btn mini ghost" onclick="closeAppLogs()">关闭</button>
+      </div>
+    </div>
+  </div>
+
+<!-- ===== 卸载确认弹窗（默认保数据，可勾选连数据一起删）===== -->
+  <div id="appdel_modal" class="modal-mask hidden">
+    <div class="modal" style="max-width:460px">
+      <h3>卸载应用</h3>
+      <div style="font-size:13px;margin-bottom:10px">即将卸载：<b id="appdel_name"></b></div>
+      <div style="color:var(--muted);font-size:12px;margin-bottom:12px">容器会被移除。数据默认保留，重新部署后可继续使用。</div>
+      <label style="display:flex;align-items:center;gap:8px;font-size:13px">
+        <input type="checkbox" id="appdel_purge" style="width:auto;flex:none">
+        同时删除数据（数据目录与数据库，<span style="color:var(--danger)">不可恢复</span>）
+      </label>
+      <div class="btnrow" style="margin-top:16px">
+        <button class="btn ghost" onclick="closeAppDel()">取消</button>
+        <button class="btn danger" id="appdel_ok" onclick="appDelConfirm()">确认卸载</button>
+      </div>
+    </div>
+  </div>
 
     <div class="panel" data-sec="px">
       <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"/></svg> 反向代理（Nginx）</h2>
@@ -2938,6 +3004,10 @@ function switchTab(sec) {
   if (sec === "site" && token) {
     if (!sitesLoaded) { sitesLoaded = false; loadSites(); }
   }
+  if (sec === "app" && token) {
+    if (!appsLoaded) { appsLoaded = false; loadApps(); }
+    else if (appList.some(a => a.status === "deploying")) loadApps();
+  }
   if (sec === "fed" && token) {
     if (!fedLoaded) renderFed();
     else refreshFedStatus();   // 已渲染过:静默重新探测各节点状态,不重建卡片
@@ -2945,8 +3015,373 @@ function switchTab(sec) {
 }
 (function initSec() {
   const saved = localStorage.getItem("fw_sec");
-  switchTab(saved && ["overview", "fw", "site", "ssh", "px", "dk", "fed"].indexOf(saved) >= 0 ? saved : "overview");
+  switchTab(saved && ["overview", "fw", "site", "app", "ssh", "px", "dk", "fed"].indexOf(saved) >= 0 ? saved : "overview");
 })();
+
+/* ---------- 应用（一键部署，v3.1.0） ---------- */
+let appTpls = [], appList = [], appsLoaded = false;
+let appw = { step: 0, tpl: "", port: null, domain: "", expose: false, name: "", upload: 32,
+             imgMain: "", imgDb: "", task: "", result: null, checking: false };
+
+async function loadApps() {
+  const box = $("app_cards");
+  try {
+    const d = await api("GET", "/api/apps");
+    appTpls = d.templates || [];
+    appList = d.apps || [];
+    appsLoaded = true;
+    const dk = d.docker || {};
+    const dd = d.defaults || {};
+    $("app_datadir_label").textContent = dd.data_base || "/DockerData/apps";
+    if (!dk.installed) {
+      $("app_status").innerHTML = '未检测到 Docker：应用需要在 Docker 里运行'
+        + '<button class="btn mini" style="margin-left:8px" onclick="switchTab(\'dk\')">去 Docker 页一键安装</button>';
+    } else {
+      $("app_status").textContent = (dk.service_active ? "Docker 运行中" : "Docker 已安装但未运行（systemctl start docker）")
+        + (dk.version ? " · " + dk.version : "")
+        + " · 已部署 " + appList.length + " 个应用";
+    }
+    renderApps();
+  } catch (e) {
+    $("app_status").textContent = "状态获取失败：" + e.message + "（点右上「刷新」重试）";
+    box.innerHTML = '<div style="color:var(--danger);font-size:13px">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+
+function renderApps() {
+  const kw = ($("app_search").value || "").trim().toLowerCase();
+  const list = appList.filter(a => !kw || [a.name, a.domain, String(a.port), a.template_name]
+    .join(" ").toLowerCase().indexOf(kw) >= 0);
+  const box = $("app_cards");
+  $("app_empty").style.display = appList.length ? "none" : "";
+  if (!list.length) { box.innerHTML = ""; return; }
+  box.innerHTML = list.map(appCardHtml).join("");
+}
+
+function appCardHtml(a) {
+  const running = !!(a.container || {}).running;
+  const tags = ['<span class="tag site">' + esc(a.icon || "📦") + " " + esc(a.template_name || a.template) + "</span>",
+                running ? '<span class="tag ont">运行中</span>' : '<span class="tag offt">已停止</span>'];
+  if (a.domain) {
+    const c = a.cert || {};
+    if (c.on) {
+      const days = (c.days === null || c.days === undefined) ? null : c.days;
+      tags.push('<span class="tag ' + (days !== null && days <= 14 ? "warnt" : "ont") + '">🔒 '
+        + (days === null ? "证书有效" : "证书剩 " + days + " 天") + "</span>");
+    } else {
+      tags.push('<span class="tag offt">证书待签发</span>');
+    }
+  } else if (a.expose_public) {
+    tags.push('<span class="tag warnt">公网端口开放</span>');
+  } else {
+    tags.push('<span class="tag offt">仅本机访问</span>');
+  }
+  if (a.status === "deploying") tags.push('<span class="tag warnt">部署中</span>');
+  if (a.status === "error") tags.push('<span class="tag offt" style="color:var(--danger)">部署失败</span>');
+  const meta = (a.domain ? esc(a.domain) + "　" : "") + "容器端口 " + esc(String(a.port))
+    + "　数据 " + esc(a.data_dir || "");
+  const btns = [btnHtml("🌐 打开", "appOpen(" + qjs(a.url) + ")", "")];
+  btns.push(btnHtml("📜 日志", "appLogs(" + qjs(a.id) + ")"));
+  btns.push(btnHtml("⬆ 升级", "appAction(" + qjs(a.id) + ",'upgrade')"));
+  btns.push(btnHtml("💾 备份", "appBackup(" + qjs(a.id) + ")"));
+  btns.push(btnHtml(running ? "⏸ 停止" : "▶ 启动", "appAction(" + qjs(a.id) + "," + qjs(running ? "stop" : "start") + ")"));
+  btns.push(btnHtml("✕ 卸载", "appDelete(" + qjs(a.id) + "," + qjs(a.name || a.folder) + ")", "danger"));
+  if (a.status === "error") {
+    btns.unshift(btnHtml("↻ 重试部署", "appAction(" + qjs(a.id) + ",'deploy')", ""));
+  }
+  const sw = '<span style="color:var(--muted);font-size:12px">' + esc((a.container || {}).detail || "") + "</span>";
+  return '<div class="site-card' + (running ? "" : " off") + '">'
+    + '<div class="sc-head"><span class="sc-dom">' + esc(a.name || a.folder) + "</span>"
+    + '<span style="margin-left:auto">' + sw + "</span></div>"
+    + '<div class="sc-tags">' + tags.join("") + "</div>"
+    + '<div class="sc-meta">' + meta + "</div>"
+    + (a.error ? '<div class="sc-meta" style="color:var(--danger)">' + esc(a.error) + "</div>" : "")
+    + (a.backups && a.backups.length
+        ? '<div class="sc-meta">最近备份：' + esc(a.backups[0].name) + "（" + fmtBytes(a.backups[0].size) + "）</div>" : "")
+    + '<div class="sc-btns">' + btns.join("") + "</div>"
+    + "</div>";
+}
+
+function appOpen(url) { if (url) window.open(url, "_blank"); }
+
+/* ---------- 部署向导 ---------- */
+function openAppWizard() {
+  if (!appTpls.length) { toast("应用模板未加载，请先刷新", "err"); return; }
+  appw = { step: 0, tpl: appTpls[0].id, port: null, domain: "", expose: false, name: "",
+           upload: 32, imgMain: "", imgDb: "", task: "", result: null, checking: false };
+  const t = appTpls[0];
+  appw.port = t.default_port; appw.upload = t.upload_mb || 32;
+  $("appw_modal").classList.remove("hidden");
+  appwRender();
+}
+
+function closeAppWizard() { $("appw_modal").classList.add("hidden"); }
+
+function appwTpl() { return appTpls.find(t => t.id === appw.tpl) || appTpls[0] || {}; }
+
+function appwPick(id) {
+  const t = appTpls.find(x => x.id === id);
+  if (!t) return;
+  appw.tpl = id;
+  appw.port = t.default_port;
+  appw.upload = t.upload_mb || 32;
+  appw.imgMain = ""; appw.imgDb = "";
+  appwRender();
+}
+
+function appwDots() {
+  [...document.querySelectorAll("#appw_dots .wz-dot")].forEach((d, i) => {
+    d.classList.toggle("active", i <= appw.step);
+  });
+  $("appw_back").style.display = appw.step === 1 ? "" : "none";
+  $("appw_next").style.display = (appw.step === 0 || appw.step === 1) ? "" : "none";
+  $("appw_next").textContent = appw.step === 1 ? "开始部署" : "下一步";
+}
+
+function appwRender() {
+  appwDots();
+  const b = $("appw_body");
+  const t = appwTpl();
+  if (appw.step === 0) {
+    b.innerHTML = '<div class="form-row" style="display:block">'
+      + appTpls.map(x => '<label class="wz-radio"><input type="radio" name="appw_tpl" value="' + esc(x.id) + '"'
+          + (appw.tpl === x.id ? " checked" : "") + ' onchange="appwPick(' + qjs(x.id) + ')">'
+          + "<span><b>" + esc(x.icon + " " + x.name) + "</b>"
+          + "<span>" + esc(x.desc) + "　·　默认端口 " + esc(String(x.default_port))
+          + (x.require_domain ? "　·　需要域名" : "") + "</span></span></label>").join("")
+      + "</div>"
+      + (t.notes && t.notes.length
+          ? '<div style="color:var(--muted);font-size:12px;margin-top:10px">注意：<br>· ' + t.notes.map(esc).join("<br>· ") + "</div>" : "");
+    return;
+  }
+  if (appw.step === 1) {
+    b.innerHTML =
+      '<div class="form-row"><label>名称</label><input id="aw_name" value="' + esc(appw.name) + '" placeholder="'
+        + esc(t.name) + '（可留空，仅用于显示）"></div>'
+      + '<div class="form-row"><label>容器端口</label>'
+        + '<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">'
+        + '<input id="aw_port" value="' + esc(String(appw.port)) + '" inputmode="numeric" style="width:110px" oninput="appwPortTyped()">'
+        + '<button class="btn mini ghost" onclick="appwNextFreePort()">用下一个可用端口</button>'
+        + '<span id="aw_port_state" style="font-size:12px;color:var(--muted)">检测中…</span>'
+        + "</div></div>"
+      + '<div style="color:var(--muted);font-size:12px;margin:-4px 0 10px">容器端口只绑 127.0.0.1，不对公网开放；对外访问看下面的域名反代。</div>'
+      + '<div class="form-row"><label>域名</label><input id="aw_domain" value="' + esc(appw.domain) + '" placeholder="'
+        + (t.require_domain ? "必填，如 vault.example.com" : "可留空：留空则仅本机/内网访问") + '" oninput="appwDomainTyped()"></div>'
+      + '<div style="color:var(--muted);font-size:12px;margin:-4px 0 10px" id="aw_domain_hint"></div>'
+      + '<div class="form-row" id="aw_expose_row"><label style="display:flex;align-items:center;gap:6px">'
+        + '<input type="checkbox" id="aw_expose"' + (appw.expose ? " checked" : "")
+        + ' style="width:auto;flex:none" onchange="appwExposeTyped()"> 无域名时也对外开放（公网 IP:端口，会放行防火墙）</label></div>'
+      + '<div class="form-row"><label>上传大小 (MB)</label><input id="aw_upload" value="' + esc(String(appw.upload))
+        + '" inputmode="numeric" style="width:110px"><span style="color:var(--muted);font-size:12px;margin-left:8px">0 = 不限制；Nextcloud 建议 512</span></div>'
+      + '<details style="margin-top:6px"><summary style="cursor:pointer;color:var(--muted);font-size:12px">高级：自定义镜像</summary>'
+      + '<div class="form-row" style="margin-top:8px"><label>主镜像</label><input id="aw_img_main" value="'
+        + esc(appw.imgMain) + '" placeholder="' + esc((t.images || {}).main || "") + '"></div>'
+      + (t.images && t.images.db
+          ? '<div class="form-row"><label>数据库镜像</label><input id="aw_img_db" value="' + esc(appw.imgDb)
+            + '" placeholder="' + esc(t.images.db) + '"></div>' : "")
+      + "</details>";
+    appwPortCheck();
+    appwDomainTyped();
+    return;
+  }
+  if (appw.step === 2) {
+    b.innerHTML = '<div id="aw_progress" style="font-size:13px">正在部署…</div>'
+      + '<div id="aw_progress_log" style="color:var(--muted);font-size:12px;margin-top:8px;white-space:pre-wrap"></div>';
+    return;
+  }
+  const r = appw.result || {};
+  const c = r.credentials || {};
+  const rows = [];
+  rows.push(["访问地址", r.url || ""]);
+  if (c.db_password) rows.push(["数据库地址", "容器内 db:3306（应用已自动配置，无需手填）"]);
+  if (c.db_user) rows.push(["数据库账号", c.db_user + " / 库名 " + c.db_name]);
+  if (c.db_password) rows.push(["数据库密码", c.db_password]);
+  if (c.admin_password) rows.push(["后台管理员密码", c.admin_password + "（用户名 admin）"]);
+  if (c.admin_token) rows.push(["管理令牌 ADMIN_TOKEN", c.admin_token]);
+  b.innerHTML = '<div style="font-size:13px;margin-bottom:8px">✅ 部署完成</div>'
+    + '<div style="color:var(--muted);font-size:12px;margin-bottom:10px">下面这些凭据<b>只显示这一次</b>，请现在复制保存。</div>'
+    + rows.map(x => '<div class="form-row" style="align-items:center"><label style="min-width:120px">' + esc(x[0]) + "</label>"
+        + '<code style="font-family:\'0xProto\',ui-monospace,monospace;font-size:12px;word-break:break-all">' + esc(x[1]) + "</code></div>").join("")
+    + '<div style="margin-top:12px"><button class="btn mini" onclick="appOpen(' + qjs(r.url || "") + ')">打开应用</button></div>';
+  $("appw_next").textContent = "完成";
+  $("appw_next").setAttribute("onclick", "closeAppWizard();loadApps()");
+}
+
+async function appwPortCheck() {
+  const el = $("aw_port_state");
+  if (!el) return;
+  const port = parseInt(($("aw_port").value || "").trim(), 10);
+  if (!port) { el.textContent = "端口无效"; el.style.color = "var(--danger)"; return; }
+  el.textContent = "检测中…"; el.style.color = "var(--muted)";
+  try {
+    const d = await api("GET", "/api/apps/port-check?port=" + port);
+    if (d.ok) { el.textContent = "🟢 可用"; el.style.color = "var(--accent2)"; }
+    else {
+      el.textContent = "🔴 " + (d.reason || "不可用") + (d.next_free ? "（下一个可用：" + d.next_free + "）" : "");
+      el.style.color = "var(--danger)";
+    }
+  } catch (e) { el.textContent = "检测失败：" + e.message; el.style.color = "var(--danger)"; }
+}
+
+function appwPortTyped() {
+  clearTimeout(appw._pt);
+  appw._pt = setTimeout(appwPortCheck, 350);
+}
+
+async function appwNextFreePort() {
+  const port = parseInt(($("aw_port").value || "").trim(), 10) || (appwTpl().default_port || 8080);
+  try {
+    const d = await api("GET", "/api/apps/port-check?port=" + port);
+    if (d.next_free) { $("aw_port").value = d.next_free; appwPortCheck(); }
+    else toast("没找到可用端口，请手动填写", "err");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function appwDomainTyped() {
+  const t = appwTpl();
+  const v = ($("aw_domain").value || "").trim();
+  const hint = $("aw_domain_hint");
+  if (hint) {
+    hint.textContent = t.require_domain && !v
+      ? "⚠ " + t.name + " 必须绑定域名：浏览器加密接口要求 HTTPS，纯 IP 访问无法登录"
+      : (v ? "将自动创建反代并申请证书（域名需已解析到本机）" : "留空则只绑 127.0.0.1，仅本机/内网可访问");
+  }
+  const row = $("aw_expose_row");
+  if (row) row.style.display = v ? "none" : "";
+}
+
+function appwExposeTyped() { appw.expose = !!($("aw_expose") && $("aw_expose").checked); }
+
+function appwStep(d) {
+  if (appw.step === 0) {
+    const t = appwTpl();
+    appw.port = t.default_port; appw.upload = t.upload_mb || 32;
+    appw.step = 1; appwRender(); return;
+  }
+  if (appw.step === 1) {
+    const port = parseInt(($("aw_port").value || "").trim(), 10);
+    if (!port) { toast("容器端口必须是数字", "err"); return; }
+    appw.port = port;
+    appw.name = ($("aw_name").value || "").trim();
+    appw.domain = ($("aw_domain").value || "").trim().toLowerCase();
+    appw.upload = parseInt(($("aw_upload").value || "").trim(), 10) || 0;
+    appw.imgMain = ($("aw_img_main").value || "").trim();
+    appw.imgDb = ($("aw_img_db") ? $("aw_img_db").value || "" : "").trim();
+    appw.expose = !!($("aw_expose") && $("aw_expose").checked);
+    if (appwTpl().require_domain && !appw.domain) { toast("该应用必须绑定域名", "err"); return; }
+    appw.step = 2; appwRender(); appDeploy(); return;
+  }
+  if (appw.step === 3) { closeAppWizard(); loadApps(); }
+}
+
+async function appDeploy() {
+  const logEl = $("aw_progress_log");
+  try {
+    const d = await api("POST", "/api/apps", {
+      template: appw.tpl, name: appw.name, port: appw.port, domain: appw.domain,
+      expose_public: appw.expose, upload_mb: appw.upload,
+      images: { main: appw.imgMain, db: appw.imgDb },
+    });
+    appw.result = d;
+    const tid = d.task;
+    $("aw_progress").textContent = d.msg || "部署中…";
+    if (tid) {
+      for (;;) {
+        await new Promise(r => setTimeout(r, 2500));
+        let t;
+        try { t = await api("GET", "/api/tasks/" + tid); }
+        catch (err) { if (err.message !== "未登录") continue; throw err; }
+        if (t.msg) $("aw_progress").textContent = t.msg;
+        if (t.status === "ok" || t.status === "error") {
+          if (logEl) logEl.textContent = t.msg || "";
+          break;
+        }
+      }
+    }
+    appw.step = 3; appwRender();
+    loadApps();
+  } catch (e) {
+    if (logEl) logEl.textContent = e.message;
+    $("aw_progress").innerHTML = '<span style="color:var(--danger)">部署失败：' + esc(e.message) + "</span>"
+      + '<div style="color:var(--muted);font-size:12px;margin-top:8px">修正后可以再点「开始部署」重试（同名目录已存在时请改端口）。</div>';
+    $("appw_next").textContent = "重试";
+    $("appw_next").setAttribute("onclick", "appDeploy()");
+    $("appw_next").style.display = "";
+  }
+}
+
+async function appAction(id, action) {
+  const names = { start: "启动", stop: "停止", upgrade: "升级" };
+  try {
+    const d = await api("POST", "/api/apps/" + id, { action: action });
+    if (d.task) {
+      toast((names[action] || "操作") + "中…", "");
+      for (;;) {
+        await new Promise(r => setTimeout(r, 2500));
+        const t = await api("GET", "/api/tasks/" + d.task).catch(() => null);
+        if (!t) continue;
+        if (t.status === "ok") { toast(t.msg || (names[action] || "操作") + "完成", "okk"); break; }
+        if (t.status === "error") { toast(t.msg || "操作失败", "err"); break; }
+      }
+    } else toast(d.msg || (names[action] || "操作") + "完成", "okk");
+  } catch (e) { toast(e.message, "err"); }
+  loadApps();
+}
+
+function appBackup(id) {
+  confirmPanel("现在备份这个应用？（导出数据库 + 打包数据目录，可重复执行）", async () => {
+    try {
+      const d = await api("POST", "/api/apps/" + id, { action: "backup" });
+      if (d.task) {
+        toast("备份中…", "");
+        for (;;) {
+          await new Promise(r => setTimeout(r, 2500));
+          const t = await api("GET", "/api/tasks/" + d.task).catch(() => null);
+          if (!t) continue;
+          if (t.status === "ok") { toast(t.msg || "备份完成", "okk"); break; }
+          if (t.status === "error") { toast(t.msg || "备份失败", "err"); break; }
+        }
+      } else toast(d.msg || "备份完成", "okk");
+    } catch (e) { toast(e.message, "err"); }
+    loadApps();
+  }, "💾 备份应用");
+}
+
+function appDelete(id, label) {
+  appDelId = id;
+  $("appdel_name").textContent = label || "";
+  $("appdel_purge").checked = false;
+  $("appdel_modal").classList.remove("hidden");
+}
+let appDelId = "";
+function closeAppDel() { $("appdel_modal").classList.add("hidden"); }
+async function appDelConfirm() {
+  const purge = !!($("appdel_purge") && $("appdel_purge").checked);
+  const btn = $("appdel_ok"); btn.disabled = true; btn.textContent = "卸载中…";
+  try {
+    const d = await api("DELETE", "/api/apps/" + appDelId + (purge ? "?purge=1" : ""));
+    toast(d.msg || "已卸载", "okk");
+    closeAppDel(); loadApps();
+  } catch (e) { toast(e.message, "err"); }
+  btn.disabled = false; btn.textContent = "确认卸载";
+}
+
+async function appLogs(id) {
+  appwLogId = id;
+  $("applog_title").textContent = "应用日志";
+  $("applog_body").textContent = "加载中…";
+  $("applog_modal").classList.remove("hidden");
+  await appLogsReload();
+}
+let appwLogId = "";
+async function appLogsReload() {
+  if (!appwLogId) return;
+  try {
+    const d = await api("GET", "/api/apps/" + appwLogId + "/logs?lines=300");
+    $("applog_body").textContent = d.logs || "（暂无日志）";
+  } catch (e) { $("applog_body").textContent = "读取失败：" + e.message; }
+}
+function closeAppLogs() { $("applog_modal").classList.add("hidden"); }
 
 /* ---------- 网卡流量统计 ---------- */
 let trCurrent = "";   // 当前选中网卡

@@ -4,6 +4,7 @@
 import json
 import os
 import shutil
+import stat
 import sys
 import tempfile
 import threading
@@ -5558,6 +5559,229 @@ class TestCertUnmanaged(unittest.TestCase):
         # ③ 磁盘和记录都没有 → 400
         code, d = self._req("POST", "/api/cert/nope.invalid", {"action": "renew"})
         self.assertEqual(code, 400, d)
+
+
+class TestApps(unittest.TestCase):
+    """v3.1.0 应用一键部署：模板渲染 / 端口检测 / 部署接口 / 上传大小 / 卸载语义"""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile as _tf
+        cls.tmp = _tf.mkdtemp(prefix="fwapps-")
+        cls.old = (panel.APPS_FILE, panel.APP_DATA_BASE, panel.COMPOSE_BASE)
+        panel.APPS_FILE = os.path.join(cls.tmp, "apps.json")
+        panel.APP_DATA_BASE = os.path.join(cls.tmp, "apps")
+        panel.COMPOSE_BASE = os.path.join(cls.tmp, "dockercompose")
+        cls.cfg = make_cfg()
+        cls._docker_installed = panel.docker_installed
+        panel.docker_installed = lambda: True      # 测试机不一定装了 docker，统一打桩
+        cls.store = panel.RuleStore(); cls.store.rules = []
+        cls.nft = panel.NFTManager(cls.store, cls.cfg)
+        cls.server = panel.PanelServer(("127.0.0.1", 17989), panel.PanelHandler,
+                                       cls.cfg, cls.store, cls.nft, panel.Auth(cls.cfg))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.token = ""
+        code, d = cls._req("POST", "/api/login", {"username": TEST_USER, "password": TEST_PASS})
+        cls.token = d.get("token", "")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown(); cls.server.server_close()
+        panel.docker_installed = cls._docker_installed
+        panel.APPS_FILE, panel.APP_DATA_BASE, panel.COMPOSE_BASE = cls.old
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def _req(cls, method, path, data=None):
+        r = urllib.request.Request("http://127.0.0.1:17989" + path, method=method)
+        if cls.token:
+            r.add_header("Authorization", "Bearer " + cls.token)
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode(); r.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(r, body) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read())
+            except Exception:
+                return e.code, {}
+
+    def test_templates_render(self):
+        """四个模板都能渲染出 compose：绑定地址/端口映射/数据目录正确"""
+        for tid, tpl in panel.APP_TEMPLATES.items():
+            ctx = {"port": tpl["default_port"], "container_port": tpl["container_port"],
+                   "domain": "demo.example.com", "data_dir": "/DockerData/apps/%s" % tid,
+                   "images": {}, "db_pw": "p1", "db_root_pw": "p2", "admin_pw": "p3",
+                   "admin_token": "tok", "bind": "127.0.0.1"}
+            yml = panel.app_compose_text(tid, ctx)
+            self.assertIn("127.0.0.1:%d:%d" % (tpl["default_port"], tpl["container_port"]), yml, tid)
+            self.assertIn("/DockerData/apps/%s" % tid, yml, tid)
+            self.assertNotIn("0.0.0.0:", yml, tid)
+            if tpl.get("require_domain"):
+                self.assertTrue(tpl.get("notes"), tid)
+        # 勾选公网暴露后绑 0.0.0.0
+        ctx["bind"] = "0.0.0.0"
+        self.assertIn("0.0.0.0:", panel.app_compose_text("wordpress", ctx))
+
+    def test_upload_limit_in_nginx(self):
+        """client_max_body_size 必须出现在反代与站点模板（默认 32m，可自定义）"""
+        pr = {"domain": "a.example.com", "target_host": "127.0.0.1", "target_port": 8080,
+              "scheme": "http", "ssl": False, "cert_ref": "", "block_ip": False}
+        conf = panel.render_proxy_conf(pr)
+        self.assertIn("client_max_body_size 32m;", conf)
+        pr["client_max_body_size"] = 512
+        self.assertIn("client_max_body_size 512m;", panel.render_proxy_conf(pr))
+        site = {"domain": "s.example.com", "type": "static", "root": "/var/www/s",
+                "cert_mode": "none", "block_ip": False, "client_max_body_size": 128}
+        self.assertIn("client_max_body_size 128m;", panel.render_site_conf(site))
+
+    def test_port_check_and_next_free(self):
+        """端口检测：被监听端口判不可用、给出下一个可用端口；面板/SSH 端口硬冲突"""
+        import socket
+        s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", 18099)); s.listen(1)
+        try:
+            ok, why, owners = panel.app_port_check(18099, self.cfg)
+            self.assertFalse(ok, "被监听端口应判为不可用")
+            self.assertTrue(owners)
+            nxt = panel.next_free_port(18099, self.cfg)
+            self.assertNotEqual(nxt, 18099)
+            self.assertTrue(nxt and nxt > 18099)
+        finally:
+            s.close()
+        # 面板端口与 SSH 端口硬冲突
+        pp = int(self.cfg.get("port", 0) or 0)
+        if pp:
+            ok, why, _ = panel.app_port_check(pp, self.cfg)
+            self.assertFalse(ok)
+            self.assertIn("面板", why)
+        sp = int(self.cfg.get("ssh_port", 0) or 0)
+        if sp:
+            ok, why, _ = panel.app_port_check(sp, self.cfg)
+            self.assertFalse(ok)
+            self.assertIn("SSH", why)
+        # 范围校验
+        self.assertFalse(panel.app_port_check(80, self.cfg)[0])
+        self.assertFalse(panel.app_port_check("abc", self.cfg)[0])
+
+    def test_create_app_api(self):
+        """部署接口：写入记录 + 返回一次性凭据 + 端口冲突拒绝"""
+        code, d = self._req("GET", "/api/apps")
+        self.assertEqual(code, 200, d)
+        self.assertIn("templates", d)
+        self.assertEqual(len(d["templates"]), len(panel.APP_TEMPLATES))
+        code, d = self._req("POST", "/api/apps",
+                            {"template": "wordpress", "name": "测试博客", "port": 18081,
+                             "domain": "", "images": {}})
+        self.assertEqual(code, 200, d)
+        self.assertTrue(d.get("task"))
+        app = d["app"]
+        self.assertNotIn("db_pw", app, "接口回显里不能带数据库密码")
+        self.assertTrue(d["credentials"]["db_password"])
+        aid = app["id"]
+        # 记录已落盘且带密码
+        saved = panel.AppStore().get(aid)
+        self.assertTrue(saved["db_pw"] and saved["db_root_pw"])
+        # 同端口再次部署 → 拒绝
+        code, d2 = self._req("POST", "/api/apps", {"template": "wordpress", "port": 18081})
+        self.assertEqual(code, 400, d2)
+        # 列表里能看到
+        code, d3 = self._req("GET", "/api/apps")
+        self.assertIn(aid, [a["id"] for a in d3["apps"]])
+        return aid
+
+    def test_vaultwarden_requires_domain(self):
+        code, d = self._req("POST", "/api/apps", {"template": "vaultwarden", "port": 18082})
+        self.assertEqual(code, 400, d)
+        self.assertIn("域名", d.get("error", ""))
+
+    def test_container_status_parses_all_shapes(self):
+        """容器状态解析要兼容 NDJSON / JSON 数组 / v1 表格三种输出"""
+        ndjson = ('{"Service":"app","State":"running","Health":""}\n'
+                  '{"Service":"db","State":"running","Health":"healthy"}')
+        arr = '[{"Service":"app","State":"running","Health":""},{"Service":"db","State":"running"}]'
+        table = "NAME        IMAGE     COMMAND   SERVICE   CREATED   STATUS         PORTS\n" \
+                "wp-app-1    wordpress  ...       app       1 min     Up 1 minute    127.0.0.1:8080->80/tcp"
+        real = panel.app_compose_cmd
+        real_dry, real_dk = panel.DRY_RUN, panel.docker_installed
+        panel.DRY_RUN, panel.docker_installed = False, lambda: True
+        try:
+            for out, expect_total in ((ndjson, 2), (arr, 2), (table, 1)):
+                panel.app_compose_cmd = lambda folder, *a, **k: (True, out)
+                st = panel.app_container_status("x")
+                self.assertEqual(st["total"], expect_total, out[:40])
+                self.assertTrue(st["running"], out[:40])
+            # 空输出 → 未启动
+            panel.app_compose_cmd = lambda folder, *a, **k: (True, "")
+            st = panel.app_container_status("x")
+            self.assertFalse(st["running"])
+            self.assertEqual(st["detail"], "未启动")
+        finally:
+            panel.app_compose_cmd = real
+            panel.DRY_RUN, panel.docker_installed = real_dry, real_dk
+
+    def test_compose_cmd_truncation_only_for_messages(self):
+        """展示用输出截断 400 字符，full=True 必须完整（备份 SQL 被砍过）"""
+        import types
+        long_out = "x" * 5000
+        class _R:
+            returncode = 0; stdout = long_out; stderr = ""
+        real_run, real_dry, real_dk = panel.subprocess.run, panel.DRY_RUN, panel.docker_installed
+        panel.DRY_RUN = False
+        panel.docker_installed = lambda: True
+        panel.subprocess.run = lambda *a, **k: _R()
+        try:
+            os.makedirs(panel.app_compose_dir("trunc-test"), exist_ok=True)
+            with open(panel.app_compose_file("trunc-test"), "w") as f:
+                f.write("services: {}\n")
+            ok, short = panel.app_compose_cmd("trunc-test", "ps")
+            ok2, full = panel.app_compose_cmd("trunc-test", "ps", full=True)
+        finally:
+            panel.subprocess.run, panel.DRY_RUN, panel.docker_installed = real_run, real_dry, real_dk
+        self.assertEqual(len(short), 400)
+        self.assertEqual(len(full), 5000)
+
+    def test_delete_keeps_data_by_default(self):
+        code, d = self._req("POST", "/api/apps",
+                            {"template": "typecho", "name": "light", "port": 18083, "domain": ""})
+        self.assertEqual(code, 200, d)
+        aid = d["app"]["id"]
+        data_dir = panel.AppStore().get(aid)["data_dir"]
+        os.makedirs(os.path.join(data_dir, "html"), exist_ok=True)
+        with open(os.path.join(data_dir, "html", "index.php"), "w") as f:
+            f.write("<?php")
+        code, d = self._req("DELETE", "/api/apps/%s" % aid)
+        self.assertEqual(code, 200, d)
+        self.assertTrue(os.path.isdir(data_dir), "默认卸载必须保留数据目录")
+        self.assertIsNone(panel.AppStore().get(aid))
+        # 再来一个：purge=1 连数据删
+        code, d = self._req("POST", "/api/apps",
+                            {"template": "typecho", "name": "light2", "port": 18084, "domain": ""})
+        aid2 = d["app"]["id"]
+        d2 = panel.AppStore().get(aid2)["data_dir"]
+        os.makedirs(os.path.join(d2, "html"), exist_ok=True)
+        code, d = self._req("DELETE", "/api/apps/%s?purge=1" % aid2)
+        self.assertEqual(code, 200, d)
+        self.assertFalse(os.path.exists(d2), "purge=1 必须连数据一起删")
+
+    def test_deploy_work_updates_status(self):
+        """部署任务体：DRY_RUN 下也要把状态推进到 ready 并写出配置文件"""
+        app = panel.AppStore().add({"template": "wordpress", "name": "dry", "folder": "wp-dry",
+                                    "data_dir": panel.app_data_dir("wp-dry"), "port": 18085,
+                                    "container_port": 80, "domain": "", "expose_public": False,
+                                    "upload_mb": 32, "images": {}, "status": "deploying",
+                                    "db_pw": "x", "db_root_pw": "y", "admin_pw": "z", "admin_token": "t",
+                                    "proxy_id": "", "created": 0})
+        ok, msg = panel.app_deploy_work(app["id"])
+        self.assertTrue(ok, msg)
+        got = panel.AppStore().get(app["id"])
+        self.assertEqual(got["status"], "ready")
+        self.assertTrue(os.path.isfile(panel.app_compose_file("wp-dry")), "compose 文件应已生成")
+        env = os.path.join(panel.app_compose_dir("wp-dry"), ".env")
+        self.assertTrue(os.path.isfile(env))
+        self.assertEqual(stat.S_IMODE(os.stat(env).st_mode), 0o600, ".env 必须是 600")
 
 
 if __name__ == "__main__":

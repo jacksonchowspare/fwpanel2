@@ -36,6 +36,7 @@ import json
 import os
 import re
 import secrets
+import tarfile
 import select
 import shutil
 import socket
@@ -51,7 +52,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.0.5"
+CURRENT_VERSION = "3.1.0"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -2078,6 +2079,201 @@ def cert_files_exist(domain):
     return os.path.isfile(os.path.join(LE_LIVE, domain, "fullchain.pem"))
 
 
+# ------------------------------- 上传大小（v3.1.0，应用一键部署前置） -------------------------------
+# ⚠ 背景：全项目此前没有任何 client_max_body_size，nginx 默认 1MB —— WordPress/Nextcloud 上传媒体
+# 一律 413（实测确认）。这里统一给反代与站点两种 server block 输出该指令。
+UPLOAD_LIMIT_DEFAULT_MB = 32        # 默认 32MB
+UPLOAD_LIMIT_MAX_MB = 102400        # 上限 100GB（0 = 不限制，交给用户显式选择）
+
+
+def _norm_upload_mb(v, default=UPLOAD_LIMIT_DEFAULT_MB):
+    """把上传限制归一化成 MB 整数；None/空 → 默认；0 → 不限制；非法 → 默认"""
+    if v is None or str(v).strip() == "":
+        return default
+    try:
+        n = int(str(v).strip())
+    except (TypeError, ValueError):
+        return default
+    if n < 0:
+        return default
+    return min(n, UPLOAD_LIMIT_MAX_MB)
+
+
+def upload_limit_line(v, ind="    "):
+    """生成 client_max_body_size 指令行（0 = nginx 的“不限制”）"""
+    mb = _norm_upload_mb(v)
+    return f"{ind}client_max_body_size {mb}m;"
+
+
+# ------------------------------- 端口占用汇总（v3.1.0 应用部署用） -------------------------------
+def listening_ports():
+    """系统当前 LISTEN 的 TCP 端口集合（ss 优先，退化 netstat）"""
+    out = set()
+    try:
+        r = subprocess.run(["ss", "-lntH"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if len(parts) >= 4:
+                    addr = parts[3]
+                    if ":" in addr:
+                        try:
+                            out.add(int(addr.rsplit(":", 1)[1]))
+                        except ValueError:
+                            pass
+            return out
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["netstat", "-lnt"], capture_output=True, text=True, timeout=10)
+        for line in r.stdout.splitlines():
+            parts = line.split()
+            if len(parts) >= 4 and ":" in parts[3]:
+                try:
+                    out.add(int(parts[3].rsplit(":", 1)[1]))
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return out
+
+
+def docker_installed():
+    """Docker 是否可用（所有 docker 相关入口统一走这里，便于测试打桩）"""
+    return bool(shutil.which("docker"))
+
+
+def container_published_ports():
+    """Docker 已发布到宿主机的端口集合 {port: 容器名}"""
+    res = {}
+    if not docker_installed():
+        return res
+    try:
+        r = subprocess.run(["docker", "ps", "--format", "{{.Names}}\t{{.Ports}}"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return res
+        for line in r.stdout.splitlines():
+            if "\t" not in line:
+                continue
+            name, ports = line.split("\t", 1)
+            for seg in re.findall(r":(\d+)->", ports):
+                try:
+                    res[int(seg)] = name
+                except ValueError:
+                    pass
+    except Exception:
+        pass
+    return res
+
+
+def used_ports_summary(cfg=None, fresh=True):
+    """汇总端口占用来源 {port: [来源描述...]} —— 应用部署向导的端口检测与校验依据
+
+    ⚠ 性能：本函数会调用 docker ps / ss（各几十~几百毫秒）。端口检测、next_free_port
+    会反复用到同一份快照，所以支持 fresh=False 复用进程内缓存（默认 3 秒 TTL）。"""
+    global _USED_PORTS_CACHE
+    now = time.time()
+    if not fresh and _USED_PORTS_CACHE and (now - _USED_PORTS_CACHE[0]) < 3.0:
+        return _USED_PORTS_CACHE[1]
+    cfg = cfg or Config()
+    used = {}
+
+    def add(port, why):
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            return
+        if port <= 0:
+            return
+        used.setdefault(port, [])
+        if why not in used[port]:
+            used[port].append(why)
+
+    add(cfg.get("port", 0), "面板自身端口")
+    add(cfg.get("ssh_port", 0), "SSH 保护端口")
+    try:
+        for s in SiteStore().sites:
+            if s.get("type") == "port":
+                add(s.get("port"), f"端口站 {s.get('id')}")
+            else:
+                add(80, f"站点 {s.get('domain')}（HTTP）")
+                if s.get("cert_mode") == "auto":
+                    add(443, f"站点 {s.get('domain')}（HTTPS）")
+    except Exception:
+        pass
+    try:
+        for pr in ProxyStore().proxies:
+            add(pr.get("target_port"), f"反代目标 {pr.get('domain')}")
+            add(80, "反代入口 HTTP")
+            if pr.get("ssl") or pr.get("cert_ref"):
+                add(443, "反代入口 HTTPS")
+    except Exception:
+        pass
+    try:
+        for a in AppStore().apps:
+            add(a.get("port"), f"应用 {a.get('name') or a.get('folder')}")
+    except Exception:
+        pass
+    for port, name in container_published_ports().items():
+        add(port, f"容器 {name}")
+    for port in listening_ports():
+        add(port, "系统正在监听")
+    _USED_PORTS_CACHE = (now, used)
+    return used
+
+
+_USED_PORTS_CACHE = None
+
+
+def used_ports_cache_reset():
+    """让下一次端口快照重新计算（增删应用/反代/站点后必须调用，否则 3 秒 TTL 内会误判端口冲突）"""
+    global _USED_PORTS_CACHE
+    _USED_PORTS_CACHE = None
+
+
+def app_port_check(port, cfg=None, exclude_app=None, used=None):
+    """应用容器端口可用性检查 → (ok, reason, owners)"""
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        return False, "端口必须是数字", []
+    cfg = cfg or Config()
+    # 身份冲突先判（面板/SSH 端口即使落在保留区也要给出准确原因）
+    if port == int(cfg.get("port", 0) or 0):
+        return False, "该端口是面板自身端口", ["面板自身端口"]
+    if port == int(cfg.get("ssh_port", 0) or 0):
+        return False, "该端口是 SSH 保护端口", ["SSH 保护端口"]
+    if not (1024 <= port <= 65535):
+        return False, "端口范围 1024-65535（1024 以下为系统保留）", []
+    snap = used if used is not None else used_ports_summary(cfg, fresh=False)
+    owners = [w for w in snap.get(port, []) if not (exclude_app and w == f"应用 {exclude_app}")]
+    if owners:
+        return False, f"端口 {port} 已被占用：" + "、".join(owners), owners
+    if port not in snap and port_in_use_py(port):
+        return False, f"端口 {port} 实际已被监听（系统报告）", ["系统正在监听"]
+    return True, "", []
+
+
+def next_free_port(base, cfg=None, limit=200):
+    """从 base 起向上找第一个可用端口（最多找 limit 个），找不到返回 None
+
+    ⚠ 只取一次占用快照，循环内只做便宜的 bind 测试（否则每次迭代都跑 docker ps/ss，
+    200 个端口能跑出分钟级耗时——实测过）。"""
+    try:
+        base = int(base)
+    except (TypeError, ValueError):
+        base = 8080
+    base = max(1024, min(base, 65535))
+    cfg = cfg or Config()
+    snap = used_ports_summary(cfg, fresh=False)
+    for port in range(base, min(65536, base + limit)):
+        ok, _why, _owners = app_port_check(port, cfg, used=snap)
+        if ok:
+            return port
+    return None
+
+
 def discover_disk_certs():
     """扫描 LE_LIVE 下所有已签发证书（返回域名集合）。
 
@@ -2220,11 +2416,13 @@ def render_proxy_conf(p):
            "        proxy_set_header X-Real-IP $remote_addr;\n"
            "        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n"
            "        proxy_set_header X-Forwarded-Proto $scheme;\n")
+    body_limit = upload_limit_line(p.get("client_max_body_size"))
     lines = [f"# FW-Panel2 管理: {p['domain']}"]
     # HTTP server（ACME 挑战；有证书时跳转 HTTPS）
     lines.append("server {")
     lines.append("    listen 80;")
     lines.append(f"    server_name {p['domain']};")
+    lines.append(body_limit)          # v3.1.0：上传大小（默认 32m，避免 WordPress 413）
     lines.append(f"    location /.well-known/acme-challenge/ {{ root {ACME_WEBROOT}; }}")
     if guard:
         lines.extend(x for x in guard.splitlines() if x)
@@ -2242,6 +2440,7 @@ def render_proxy_conf(p):
         lines.append("server {")
         lines.append("    listen 443 ssl;")
         lines.append(f"    server_name {p['domain']};")
+        lines.append(body_limit)      # v3.1.0：上传大小（默认 32m）
         lines.append(f"    ssl_certificate {ssl_fc};")
         lines.append(f"    ssl_certificate_key {ssl_key};")
         if hsts:
@@ -2256,6 +2455,321 @@ def render_proxy_conf(p):
         lines.append("    }")
         lines.append("}")
     return "\n".join(lines) + "\n"
+
+
+def app_compose_file(folder):
+    return os.path.join(COMPOSE_BASE, folder, "docker-compose.yml")
+
+
+def app_compose_cmd(folder, *args, timeout=300, full=False):
+    """在应用 compose 项目目录执行 docker compose 子命令
+
+    ⚠ full=False 时输出截断到 400 字符，仅用于「给人看的提示」；
+    需要解析输出（容器状态 JSON、日志、mysqldump 内容）必须 full=True ——
+    否则 JSON 被截断导致状态解析失败、备份 SQL 被砍成半截（实测踩过）。"""
+    if DRY_RUN:
+        return True, "DRY_RUN: docker compose " + " ".join(str(a) for a in args)
+    f = app_compose_file(folder)
+    if not os.path.isfile(f):
+        return False, f"未找到应用容器配置：{f}"
+    if not docker_installed():
+        return False, "docker 不可用（请先在「Docker」页一键安装）"
+    try:
+        r = subprocess.run(["docker", "compose", "-f", f, *args],
+                           capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return False, "命令超时（%ss）" % timeout
+    except Exception as e:
+        return False, str(e)[:200]
+    out = (r.stdout or r.stderr).strip()
+    return r.returncode == 0, out if full else out[:400]
+
+
+def app_container_status(folder):
+    """容器状态：{running: bool, total: int, detail: "app=running db=running"}
+
+    兼容三种输出形态：compose v2 的 NDJSON（一行一对象）、JSON 数组（部分版本）、
+    compose v1 的表格文本。"""
+    if DRY_RUN:
+        return {"running": True, "total": 1, "running_count": 1, "detail": "DRY_RUN"}
+    ok, out = app_compose_cmd(folder, "ps", "--format", "json", timeout=30, full=True)
+    if not ok:
+        return {"running": False, "total": 0, "detail": out[:120] or "未启动"}
+
+    def _one(d):
+        name = d.get("Service") or d.get("Name") or d.get("Names") or "?"
+        state = str(d.get("State") or d.get("Status") or "").strip().lower()
+        health = str(d.get("Health") or "").strip().lower()
+        return str(name), state + (("/" + health) if health else "")
+
+    items = []
+    txt = out.strip()
+    if txt.startswith("["):
+        try:
+            arr = json.loads(txt)
+            items = [_one(x) for x in arr if isinstance(x, dict)]
+        except Exception:
+            items = []
+    if not items:
+        for line in txt.splitlines():
+            line = line.strip()
+            if line.startswith("{"):
+                try:
+                    items.append(_one(json.loads(line)))
+                except Exception:
+                    continue
+            elif line and not line.upper().startswith("NAME"):
+                # compose v1 表格：列位置不稳定，按关键词识别状态（最后一列常常是端口映射）
+                parts = line.split()
+                if len(parts) >= 3:
+                    low = " " + line.lower() + " "
+                    if " up " in low or "running" in low:
+                        state = "running"
+                    elif "exited" in low or "dead" in low:
+                        state = "exited"
+                    elif "created" in low:
+                        state = "created"
+                    else:
+                        state = "unknown"
+                    items.append((parts[0], state))
+    total = len(items)
+    running = sum(1 for _n, s in items if "running" in s or "up" in s)
+    return {"running": total > 0 and running == total, "total": total, "running_count": running,
+            "detail": " ".join("%s=%s" % (n, s) for n, s in items) or "未启动"}
+
+
+def app_write_files(app):
+    """生成 .env + docker-compose.yml：compose/.env 落 COMPOSE_BASE/<folder>/（compose 插值需要同目录）"""
+    t = app_template(app["template"])
+    folder = app["folder"]
+    d = app_compose_dir(folder)
+    os.makedirs(d, exist_ok=True)
+    data_dir = app["data_dir"]
+    for sub in app_data_subdirs(app["template"]):
+        os.makedirs(os.path.join(data_dir, sub), exist_ok=True)
+    ctx = {"port": app["port"], "container_port": t["container_port"], "domain": app.get("domain") or "",
+           "data_dir": data_dir, "images": app.get("images") or {},
+           "db_pw": app["db_pw"], "db_root_pw": app["db_root_pw"],
+           "admin_pw": app.get("admin_pw", ""), "admin_token": app.get("admin_token", ""),
+           "bind": "0.0.0.0" if app.get("expose_public") else "127.0.0.1"}
+    compose = app_compose_text(app["template"], ctx)
+    env = app_env_text(app["template"], ctx)
+    with open(os.path.join(d, "docker-compose.yml"), "w") as f:
+        f.write(compose)
+    env_path = os.path.join(d, ".env")
+    with open(env_path, "w") as f:
+        f.write(env)
+    os.chmod(env_path, 0o600)
+    return True, "配置已写入 " + d
+
+
+def app_data_subdirs(tpl_id):
+    t = app_template(tpl_id) or {}
+    if t.get("db") == "sqlite":
+        return ("data",)
+    if tpl_id == "typecho":
+        return ("db", "html", "data")
+    return ("db", "html")
+
+
+def app_url(app):
+    """访问地址（有域名走 https，无域名走 IP:端口）"""
+    if app.get("domain"):
+        return "https://" + app["domain"] + "/"
+    ip = get_server_ip() or "服务器IP"
+    return "http://%s:%s/" % (ip, app.get("port"))
+
+
+def app_view(app):
+    t = app_template(app["template"]) or {}
+    st = app_container_status(app["folder"]) if not DRY_RUN else {"running": False, "total": 0, "detail": "DRY_RUN"}
+    cert = site_cert_info({"cert_ref": app.get("domain") or "", "cert_mode": "auto",
+                           "domain": app.get("domain") or ""}) if app.get("domain") else {}
+    return {**{k: v for k, v in app.items() if k not in ("db_pw", "db_root_pw", "admin_pw", "admin_token")},
+            "template_name": t.get("name", app["template"]), "icon": t.get("icon", "📦"),
+            "port_ok": not app_port_check(app.get("port"), None, exclude_app=app.get("folder"))[0],
+            "container": st, "url": app_url(app), "cert": cert,
+            "backups": app_backup_list(app),
+            "upload_mb": app.get("upload_mb")}
+
+
+def app_backup_list(app):
+    d = os.path.join(app["data_dir"], "backups")
+    out = []
+    try:
+        for n in sorted(os.listdir(d), reverse=True)[:10]:
+            fp = os.path.join(d, n)
+            if os.path.isfile(fp):
+                out.append({"name": n, "size": os.path.getsize(fp),
+                            "time": int(os.path.getmtime(fp))})
+    except OSError:
+        pass
+    return out
+
+
+def app_backup_work(aid):
+    """一键备份：数据库 dump（容器内执行）+ 打包数据目录"""
+    app = AppStore().get(aid)
+    if not app:
+        return False, "应用不存在"
+    t = app_template(app["template"]) or {}
+    bdir = os.path.join(app["data_dir"], "backups")
+    os.makedirs(bdir, exist_ok=True)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    staging = os.path.join(bdir, "staging-" + ts)
+    os.makedirs(staging, exist_ok=True)
+    logs = []
+    if t.get("db") == "mysql":
+        dump = os.path.join(staging, "database.sql")
+        ok, out = app_compose_cmd(app["folder"], "exec", "-T", "db",
+                                  "sh", "-c",
+                                  'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --all-databases',
+                                  timeout=900, full=True)
+        if ok:
+            with open(dump, "w") as f:
+                f.write(out)
+            logs.append("数据库已导出")
+        else:
+            logs.append("数据库导出失败：" + out[:160])
+    # 打包数据目录（排除 backups 自身）
+    tar_path = os.path.join(bdir, "backup-%s.tar.gz" % ts)
+    try:
+        with tarfile.open(tar_path, "w:gz") as tf:
+            for sub in app_data_subdirs(app["template"]):
+                p = os.path.join(app["data_dir"], sub)
+                if os.path.exists(p):
+                    tf.add(p, arcname=sub)
+            if os.path.isdir(staging):
+                for n in os.listdir(staging):
+                    tf.add(os.path.join(staging, n), arcname=n)
+        size = os.path.getsize(tar_path)
+        logs.append("已打包 %s（%.1f MB）" % (os.path.basename(tar_path), size / 1048576))
+    except Exception as e:
+        return False, "打包失败：" + str(e)[:200]
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    return True, "；".join(logs)
+
+
+def app_remove(app, purge=False):
+    """卸载应用：停容器 → 删容器（compose down）；purge=True 才删数据目录"""
+    ok, msg = app_compose_cmd(app["folder"], "down", "--remove-orphans", timeout=300)
+    logs = ["容器已停止并移除" if ok else "容器停止失败：" + msg[:160]]
+    if purge:
+        try:
+            shutil.rmtree(app["data_dir"], ignore_errors=True)
+            logs.append("数据目录已删除")
+        except Exception as e:
+            logs.append("数据删除失败：" + str(e)[:120])
+    else:
+        logs.append("数据已保留（%s）" % app["data_dir"])
+    # 反代条目联动清理（证书文件保留，避免影响其它引用）
+    if app.get("proxy_id"):
+        try:
+            ps = ProxyStore()
+            if ps.get(app["proxy_id"]):
+                ps.remove(app["proxy_id"])
+                apply_proxies(ps)
+                logs.append("反代条目已清理")
+        except Exception as e:
+            logs.append("反代清理失败：" + str(e)[:120])
+    try:
+        os.remove(app_compose_file(app["folder"]))
+        envf = os.path.join(app_compose_dir(app["folder"]), ".env")
+        if os.path.exists(envf):
+            os.remove(envf)
+        os.rmdir(app_compose_dir(app["folder"]))
+    except OSError:
+        pass
+    return True, "；".join(logs)
+
+
+def app_deploy_work(aid):
+    """部署长任务：写配置 → 起容器 → 等健康 → 建反代 → 放行端口 → 签证书"""
+    store = AppStore()
+    app = store.get(aid)
+    if not app:
+        return False, "应用记录不存在"
+    t = app_template(app["template"]) or {}
+    logs = []
+    # 1) 写配置
+    ok, msg = app_write_files(app)
+    if not ok:
+        return False, msg
+    logs.append("配置已生成")
+    # 2) 起容器（首次会拉镜像，可能十几分钟；up 本身就会先 pull）
+    ok, out = app_compose_cmd(app["folder"], "up", "-d", timeout=1800, full=True)
+    if not ok:
+        tail = (out or "").strip().splitlines()[-6:]
+        store.update(aid, status="error", deploy_log=logs + ["容器启动失败", *tail[-4:]],
+                     error="容器启动失败：" + " | ".join(t.strip() for t in tail)[:400])
+        return False, "容器启动失败：" + " | ".join(t.strip() for t in tail)[:300]
+    logs.append("容器已启动")
+    # 3) 等健康（最多 240 秒；容器没起来不算部署失败，后续步骤继续，日志里写明）
+    st = app_container_status(app["folder"])
+    if not DRY_RUN and not st.get("running"):
+        deadline = time.time() + 240
+        while time.time() < deadline:
+            st = app_container_status(app["folder"])
+            if st.get("running"):
+                break
+            time.sleep(5)
+    logs.append("容器状态：" + str(st.get("detail", ""))[:120])
+    # 4) 有域名 → 建反代 + 放行 80/443（+ 签证书）
+    domain = (app.get("domain") or "").strip()
+    if domain:
+        ps = ProxyStore()
+        entry = ps.get(app["proxy_id"]) if app.get("proxy_id") else None
+        if not entry:
+            entry = ps.add({"domain": domain, "target_host": "127.0.0.1", "target_port": app["port"],
+                            "scheme": "http", "websocket": bool(t.get("websocket")),
+                            "hsts": False, "ssl": True, "cert_ref": domain,
+                            "client_max_body_size": _norm_upload_mb(app.get("upload_mb")),
+                            "note": "应用：%s" % (app.get("name") or t.get("name"))})
+            store.update(aid, proxy_id=entry.get("id"))
+            logs.append("反代已创建（%s → 127.0.0.1:%s）" % (domain, app["port"]))
+        try:
+            # 反代入口端口放行（严格模式必需；幂等补齐 80/443）
+            rst = RuleStore()
+            changed = False
+            for _port, _c in ((80, "反代:HTTP"), (443, "反代:HTTPS")):
+                if not any(r.get("type") == "port_allow" and r.get("port") == _port for r in rst.rules):
+                    rst.add({"type": "port_allow", "proto": "tcp", "port": _port, "comment": _c})
+                    changed = True
+            if changed:
+                NFTManager(rst, Config()).apply()
+        except Exception:
+            pass
+        okp, msgp = apply_all_nginx(ProxyStore(), SiteStore(), None)
+        logs.append("nginx：" + msgp[:100])
+        # 5) 证书：DNS 预检 → 后台签发（失败不回滚部署，仅提示）
+        okdns, why = site_dns_precheck(domain, domain)
+        if okdns:
+            okc, msgc = issue_cert(domain, str(Config().get("acme_email", "") or ""))
+            logs.append("证书：" + msgc[:140])
+            if okc:
+                cert_record(domain, email=str(Config().get("acme_email", "") or ""),
+                            method="http", provider="certbot", source="app")
+                apply_all_nginx(ProxyStore(), SiteStore(), None)
+        else:
+            logs.append("证书跳过：" + why[:140])
+    else:
+        # 无域名：默认只绑 127.0.0.1（本机/内网可用）；勾选 expose_public 才放行公网
+        if app.get("expose_public"):
+            try:
+                rst = RuleStore()
+                if not any(r.get("type") == "port_allow" and r.get("port") == app["port"] for r in rst.rules):
+                    rst.add({"type": "port_allow", "proto": "tcp", "port": app["port"],
+                             "comment": "应用:%s" % (app.get("name") or t.get("name"))})
+                    rs = dict(rst.rules)   # RuleStore.add 已落盘
+                    NFTManager(rst, Config()).apply()
+                logs.append("已放行公网端口 %s" % app["port"])
+            except Exception as e:
+                logs.append("放行端口失败：" + str(e)[:120])
+        else:
+            logs.append("未绑定域名：仅 127.0.0.1:%s 可访问（未暴露公网）" % app["port"])
+    store.update(aid, status="ready", deployed=int(time.time()), deploy_log=logs[-8:], error="")
+    return True, "部署完成：" + "；".join(logs[-4:])
 
 
 # ------------------------------- 网站（站点管理，v3.0.0） -------------------------------
@@ -2464,6 +2978,7 @@ def site_validate(data, pstore, sstore, cfg, exclude_id=None):
         "block_ip": bool(data.get("block_ip", True)),
         "note": str(data.get("note", "") or "").strip()[:120],
         "enabled": bool(data.get("enabled", True)),
+        "client_max_body_size": _norm_upload_mb(data.get("client_max_body_size")),
     }
     if t == "port":
         site["port"] = port
@@ -3029,10 +3544,13 @@ def render_site_conf(s):
     acc = f"/var/log/nginx/{log_name}.access.log"
     err = f"/var/log/nginx/{log_name}.error.log"
 
+    body_limit = upload_limit_line(s.get("client_max_body_size"))
+
     def body(ind="    "):
         return [
             ind + f"root {root};",
             ind + "index index.html index.htm;",
+            body_limit,
             ind + "location / { try_files $uri $uri/ =404; }",
             ind + f"access_log {acc};",
             ind + f"error_log {err};",
@@ -4392,6 +4910,264 @@ DOCKER_DAEMON_JSON = os.environ.get("FW_DOCKER_DAEMON_JSON", "/etc/docker/daemon
 COMPOSE_BASE = os.environ.get("FW_COMPOSE_BASE", os.path.join(DOCKER_DATA_BASE, "dockercompose"))
 
 
+# ------------------------------- 应用一键部署（v3.1.0） -------------------------------
+# 设计要点：
+# 1) 容器端口只绑 127.0.0.1，公网访问统一走反代的 80/443（证书/防火墙都由反代模块管）
+# 2) compose 与 .env 放 /DockerData/dockercompose/<folder>/（复用既有 compose 能力），
+#    数据卷放 /DockerData/apps/<folder>/<sub>（便于一键备份与整机迁移）
+# 3) 数据库密码等敏感值只写 .env（权限 600），前端只在部署结果页一次性展示，不回显
+APPS_FILE = os.path.join(BASE_DIR, "apps.json")
+APP_DATA_BASE = os.environ.get("FW_APP_DATA_BASE", os.path.join(DOCKER_DATA_BASE, "apps"))
+
+
+def _app_pw(n=24):
+    return secrets.token_urlsafe(n)
+
+
+APP_TEMPLATES = {
+    "wordpress": {
+        "name": "WordPress", "icon": "📝",
+        "desc": "最流行的博客 / 建站程序，PHP + MySQL",
+        "images": {"main": "wordpress:latest", "db": "mysql:8.0"},
+        "default_port": 8080, "container_port": 80, "db": "mysql",
+        "upload_mb": 32, "websocket": False, "require_domain": False, "min_mem_mb": 512,
+        "notes": ["首次访问会进入 WordPress 安装向导（需要人工填写站点标题与管理员账号）",
+                  "数据库连接信息已自动注入，无需手填"],
+    },
+    "typecho": {
+        "name": "Typecho", "icon": "🪶",
+        "desc": "轻量博客程序，资源占用小",
+        "images": {"main": "joyqi/typecho:nightly-php8.2-apache", "db": "mariadb:11"},
+        "default_port": 8081, "container_port": 80, "db": "mysql",
+        "upload_mb": 32, "websocket": False, "require_domain": False, "min_mem_mb": 256,
+        "notes": ["Typecho 官方作者镜像只有 nightly 标签（无正式版 tag）；如需固定版本可在「镜像」里改成自己的镜像",
+                  "首次访问进入 Typecho 安装向导"],
+    },
+    "nextcloud": {
+        "name": "Nextcloud", "icon": "☁️",
+        "desc": "私有网盘 / 协同办公套件",
+        "images": {"main": "nextcloud:stable-apache", "db": "mariadb:11"},
+        "default_port": 8082, "container_port": 80, "db": "mysql",
+        "upload_mb": 512, "websocket": False, "require_domain": False, "min_mem_mb": 1024,
+        "notes": ["建议内存 ≥1GB；首次启动初始化数据库需要 1-2 分钟",
+                  "已自动配置受信任域名 / 反代协议（HTTPS 由面板反代提供）",
+                  "上传大小默认 512MB，可在反代条目里调整"],
+    },
+    "vaultwarden": {
+        "name": "Vaultwarden", "icon": "🔐",
+        "desc": "轻量 Bitwarden 兼容密码管理器（Rust 实现）",
+        "images": {"main": "vaultwarden/server:latest"},
+        "default_port": 8083, "container_port": 80, "db": "sqlite",
+        "upload_mb": 32, "websocket": True, "require_domain": True, "min_mem_mb": 256,
+        "notes": ["必须绑定域名并签发证书：浏览器加密接口（Web Crypto）要求 HTTPS 安全上下文，纯 IP 访问无法登录",
+                  "反代自动开启 WebSocket（实时同步需要）",
+                  "后台管理令牌已自动生成，在部署结果页可查看"],
+    },
+}
+APP_IDS = tuple(APP_TEMPLATES.keys())
+
+
+def app_template(tid):
+    return APP_TEMPLATES.get(str(tid or "").strip().lower())
+
+
+def app_compose_text(tpl_id, ctx):
+    """按模板生成 docker-compose.yml。ctx: {port, container_port, domain, data_dir, images, db_pw, db_root_pw, admin_token}"""
+    t = app_template(tpl_id)
+    if not t:
+        raise ValueError("未知应用模板: %s" % tpl_id)
+    port, cport = int(ctx["port"]), int(t["container_port"])
+    bind = (ctx.get("bind") or "127.0.0.1").strip()
+    img = ctx.get("images") or {}
+    main_img = (img.get("main") or t["images"]["main"]).strip()
+    db_img = (img.get("db") or t["images"].get("db") or "").strip()
+    data_dir = ctx["data_dir"]
+    dom = (ctx.get("domain") or "").strip()
+    lines = ["# FW-Panel2 应用: %s（由面板自动生成，手工修改会被下次部署覆盖）" % t["name"],
+             "services:"]
+    db = t.get("db")
+    if db in ("mysql",):
+        lines += [
+            "  db:",
+            f"    image: {db_img}",
+            "    restart: unless-stopped",
+            "    environment:",
+            "      MYSQL_DATABASE: appdb",
+            "      MYSQL_USER: appuser",
+            "      MYSQL_PASSWORD: ${DB_PASSWORD}",
+            "      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD}",
+            "    volumes:",
+            f"      - {data_dir}/db:/var/lib/mysql",
+            "    healthcheck:",
+            # ⚠ mariadb 官方镜像里没有 mysqladmin（只有 mariadb-admin/healthcheck.sh）——
+            # 2026-09-11 实测：给 mariadb 用 mysqladmin 会一直 unhealthy，依赖它的应用起不来。
+            # 用 $$ 转义让容器内部展开自己的 MYSQL_ROOT_PASSWORD（compose 解析期不插值）。
+            ("      test: [\"CMD-SHELL\", \"mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent\"]"
+             if db_img.startswith("mysql")
+             else "      test: [\"CMD-SHELL\", \"mariadb-admin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent || mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent\"]"),
+            "      interval: 10s",
+            "      timeout: 5s",
+            "      retries: 12",
+            "    networks: [appnet]",
+        ]
+    if tpl_id == "wordpress":
+        lines += [
+            "  app:",
+            f"    image: {main_img}",
+            "    restart: unless-stopped",
+            "    depends_on:",
+            "      db:",
+            "        condition: service_healthy",
+            "    environment:",
+            "      WORDPRESS_DB_HOST: db:3306",
+            "      WORDPRESS_DB_NAME: appdb",
+            "      WORDPRESS_DB_USER: appuser",
+            "      WORDPRESS_DB_PASSWORD: ${DB_PASSWORD}",
+            "    volumes:",
+            f"      - {data_dir}/html:/var/www/html",
+            "    ports:",
+            "      - %s:%d:%d" % (bind, port, cport),
+            "    networks: [appnet]",
+        ]
+    elif tpl_id == "typecho":
+        lines += [
+            "  app:",
+            f"    image: {main_img}",
+            "    restart: unless-stopped",
+            "    depends_on:",
+            "      db:",
+            "        condition: service_healthy",
+            "    environment:",
+            "      TYPECHO_DB_HOST: db",
+            '      TYPECHO_DB_PORT: "3306"',
+            "      TYPECHO_DB_USER: appuser",
+            "      TYPECHO_DB_PASSWORD: ${DB_PASSWORD}",
+            "      TYPECHO_DB_NAME: appdb",
+            "      TYPECHO_SITE_URL: " + ("https://" + dom if dom else ""),
+            "    volumes:",
+            f"      - {data_dir}/html:/var/www/html",
+            "      - {d}/data:/data".format(d=data_dir),
+            "    ports:",
+            "      - %s:%d:%d" % (bind, port, cport),
+            "    networks: [appnet]",
+        ]
+    elif tpl_id == "nextcloud":
+        lines += [
+            "  app:",
+            f"    image: {main_img}",
+            "    restart: unless-stopped",
+            "    depends_on:",
+            "      db:",
+            "        condition: service_healthy",
+            "    environment:",
+            "      MYSQL_HOST: db",
+            "      MYSQL_DATABASE: appdb",
+            "      MYSQL_USER: appuser",
+            "      MYSQL_PASSWORD: ${DB_PASSWORD}",
+            "      NEXTCLOUD_ADMIN_USER: admin",
+            "      NEXTCLOUD_ADMIN_PASSWORD: ${ADMIN_PASSWORD}",
+            "      NEXTCLOUD_TRUSTED_DOMAINS: " + (dom or "localhost"),
+            "      TRUSTED_PROXIES: 172.16.0.0/12 10.0.0.0/8 127.0.0.1",
+            "      OVERWRITEPROTOCOL: https" if dom else "      OVERWRITEPROTOCOL: http",
+            "      OVERWRITEHOST: " + dom if dom else "      OVERWRITEHOST: """,
+            "      NEXTCLOUD_DATA_DIR: /var/www/html/data",
+            "    volumes:",
+            f"      - {data_dir}/html:/var/www/html",
+            "    ports:",
+            "      - %s:%d:%d" % (bind, port, cport),
+            "    networks: [appnet]",
+        ]
+    elif tpl_id == "vaultwarden":
+        lines += [
+            "  app:",
+            f"    image: {main_img}",
+            "    restart: unless-stopped",
+            "    environment:",
+            "      DOMAIN: " + ("https://" + dom if dom else "http://localhost"),
+            '      SIGNUPS_ALLOWED: "true"',
+            "      ADMIN_TOKEN: ${ADMIN_TOKEN}",
+            '      WEBSOCKET_ENABLED: "true"',
+            "    volumes:",
+            f"      - {data_dir}/data:/data",
+            "    ports:",
+            "      - %s:%d:%d" % (bind, port, cport),
+            "    networks: [appnet]",
+        ]
+    lines += ["networks:", "  appnet:", "    driver: bridge"]
+    return "\n".join(lines) + "\n"
+
+
+def app_env_text(tpl_id, ctx):
+    t = app_template(tpl_id)
+    rows = []
+    if t.get("db") == "mysql":
+        rows += ["DB_PASSWORD=%s" % ctx["db_pw"], "DB_ROOT_PASSWORD=%s" % ctx["db_root_pw"]]
+    if tpl_id == "nextcloud":
+        rows += ["ADMIN_PASSWORD=%s" % ctx["admin_pw"]]
+    if tpl_id == "vaultwarden":
+        rows += ["ADMIN_TOKEN=%s" % ctx["admin_token"]]
+    return "\n".join(rows) + "\n"
+
+
+def app_compose_dir(folder):
+    return os.path.join(COMPOSE_BASE, folder)
+
+
+def app_data_dir(folder):
+    return os.path.join(APP_DATA_BASE, folder)
+
+
+class AppStore:
+    """应用记录：/etc/fwpanel/apps.json（权限 600）"""
+
+    def __init__(self):
+        self.apps = self._load()
+
+    def _load(self):
+        try:
+            with open(APPS_FILE) as f:
+                d = json.load(f)
+            return d.get("apps", []) if isinstance(d, dict) else []
+        except Exception:
+            return []
+
+    def save(self):
+        try:
+            os.makedirs(BASE_DIR, exist_ok=True)
+            tmp = APPS_FILE + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump({"apps": self.apps}, f, indent=2, ensure_ascii=False)
+            os.chmod(tmp, 0o600)
+            os.replace(tmp, APPS_FILE)
+        except OSError:
+            pass
+
+    def get(self, aid):
+        for a in self.apps:
+            if a.get("id") == aid:
+                return a
+        return None
+
+    def add(self, entry):
+        entry = dict(entry)
+        entry.setdefault("id", secrets.token_hex(6))
+        self.apps.append(entry)
+        self.save()
+        return entry
+
+    def update(self, aid, **kw):
+        a = self.get(aid)
+        if not a:
+            return None
+        a.update(kw)
+        self.save()
+        return a
+
+    def remove(self, aid):
+        self.apps = [a for a in self.apps if a.get("id") != aid]
+        self.save()
+
+
 def create_docker_dirs():
     """在根目录创建 /DockerData 及三个核心子目录（幂等，已存在不报错）"""
     if DRY_RUN:
@@ -4771,6 +5547,12 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_bruteforce()
         elif path == "/api/proxy":
             self._api_proxy()
+        elif path == "/api/apps":
+            self._api_apps()
+        elif path == "/api/apps/port-check":
+            self._api_app_port_check()
+        elif path.startswith("/api/apps/") and path.endswith("/logs"):
+            self._api_app_logs(path[len("/api/apps/"):].strip("/").split("/")[0])
         elif path == "/api/sites":
             self._api_sites()
         elif path.startswith("/api/sites/"):
@@ -5429,6 +6211,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_cert_action(path.rsplit("/", 1)[1])
         elif path == "/api/proxy":
             self._api_proxy_add()
+        elif path == "/api/apps":
+            self._api_app_create()
+        elif path.startswith("/api/apps/"):
+            self._api_app_action(path[len("/api/apps/"):].strip("/").split("/"))
         elif path == "/api/sites":
             self._api_site_add()
         elif path == "/api/sites/root":
@@ -5499,6 +6285,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_bruteforce_unban(path.rsplit("/", 1)[1])
         elif path.startswith("/api/proxy/"):
             self._api_proxy_delete(path.rsplit("/", 1)[1])
+        elif path.startswith("/api/apps/"):
+            self._api_app_delete(path[len("/api/apps/"):].strip("/").split("/")[0])
         elif path.startswith("/api/sites/"):
             self._api_site_delete(path[len("/api/sites/"):].strip("/").split("/")[0])
         elif path == "/api/term/key":
@@ -5927,6 +6715,205 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not s:
             self._send(404, {"error": "站点不存在"})
         return s
+
+    # ---------------- 应用（一键部署，v3.1.0） ----------------
+    def _api_apps(self):
+        """GET /api/apps → 应用模板 + 已部署应用 + 环境状态"""
+        token = self._require_auth()
+        if token is None:
+            return
+        store = AppStore()
+        apps = [app_view(a) for a in store.apps]
+        self._send(200, {
+            "templates": [{"id": k, **{kk: vv for kk, vv in v.items() if kk != "images"},
+                           "images": v.get("images", {})} for k, v in APP_TEMPLATES.items()],
+            "apps": apps,
+            "docker": {k: docker_status().get(k) for k in ("installed", "service_active", "version", "compose_version")},
+            "defaults": {"upload_mb": UPLOAD_LIMIT_DEFAULT_MB, "data_base": APP_DATA_BASE,
+                         "host_ip": get_server_ip() or ""},
+        })
+
+    def _api_app_port_check(self):
+        """GET /api/apps/port-check?port=N[&exclude=<folder>] → 实时端口可用性"""
+        token = self._require_auth()
+        if token is None:
+            return
+        q = parse_qs(urlparse(self.path).query)
+        raw = (q.get("port") or [""])[0]
+        exclude = (q.get("exclude") or [""])[0] or None
+        if raw == "":
+            self._send(400, {"error": "缺少 port 参数"})
+            return
+        try:
+            port = int(raw)
+        except ValueError:
+            self._send(400, {"error": "端口必须是数字"})
+            return
+        ok, reason, owners = app_port_check(port, self.server.config, exclude_app=exclude)
+        nxt = next_free_port(port if ok else port + 1, self.server.config)
+        self._send(200, {"ok": ok, "reason": reason, "owners": owners,
+                         "port": port, "next_free": nxt})
+
+    def _api_app_create(self):
+        """POST /api/apps → 一键部署（长任务）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        data = self._read_json()
+        tid = str(data.get("template", "")).strip().lower()
+        t = app_template(tid)
+        if not t:
+            self._send(400, {"error": "未知应用模板：%s（可选：%s）" % (tid, "、".join(APP_IDS))})
+            return
+        if not docker_installed():
+            self._send(400, {"error": "未安装 Docker：请先到「Docker」页一键安装后再部署应用",
+                             "need_docker": True})
+            return
+        # 端口
+        try:
+            port = int(data.get("port") or t["default_port"])
+        except (TypeError, ValueError):
+            self._send(400, {"error": "容器端口必须是数字"})
+            return
+        used_ports_cache_reset()
+        ok, why, owners = app_port_check(port, self.server.config)
+        if not ok:
+            self._send(400, {"error": why, "owners": owners,
+                             "next_free": next_free_port(port + 1, self.server.config)})
+            return
+        # 域名（可选，Vaultwarden 必填）
+        domain = str(data.get("domain", "") or "").strip().lower()
+        if domain:
+            if not re.fullmatch(r"[a-zA-Z0-9.*_-]+", domain):
+                self._send(400, {"error": "域名格式无效（如 blog.example.com）"})
+                return
+            if domain.startswith("*."):
+                self._send(400, {"error": "应用不能使用泛域名（HTTP-01 无法签发），请填具体子域"})
+                return
+            for pr in ProxyStore().proxies:
+                if (pr.get("domain") or "").lower() != domain:
+                    continue
+                if pr.get("target_port") == int(self.server.config.get("port", 0) or 0):
+                    self._send(400, {"error": "该域名是面板自身的访问域名，不可占用（防面板失联）"})
+                    return
+                self._send(400, {"error": f"域名 {domain} 已在反向代理中使用（请到反代模块管理）"})
+                return
+            for s in SiteStore().sites:
+                if (s.get("domain") or "").lower() == domain:
+                    self._send(400, {"error": f"域名 {domain} 已被其它站点占用"})
+                    return
+        elif t.get("require_domain"):
+            self._send(400, {"error": "%s 必须绑定域名：需要一个可签发证书的域名（浏览器加密接口要求 HTTPS）" % t["name"]})
+            return
+        expose = bool(data.get("expose_public")) and not domain
+        # 名称与目录名
+        name = str(data.get("name", "") or "").strip()[:40] or t["name"]
+        base = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(data.get("folder", "") or tid)).strip("-")[:24] or tid
+        folder = "%s-%d" % (base, port)
+        if os.path.exists(app_compose_dir(folder)):
+            self._send(400, {"error": f"目录名 {folder} 已存在（换个端口或改目录名）"})
+            return
+        images = {}
+        im = data.get("images") or {}
+        if str(im.get("main", "")).strip():
+            images["main"] = str(im["main"]).strip()[:120]
+        if str(im.get("db", "")).strip():
+            images["db"] = str(im["db"]).strip()[:120]
+        upload_mb = _norm_upload_mb(data.get("upload_mb"), t.get("upload_mb") or UPLOAD_LIMIT_DEFAULT_MB)
+        entry = {
+            "template": tid, "name": name, "folder": folder,
+            "data_dir": app_data_dir(folder), "port": port,
+            "container_port": t["container_port"], "domain": domain,
+            "expose_public": expose, "upload_mb": upload_mb, "images": images,
+            "status": "deploying", "created": int(time.time()), "proxy_id": "",
+            "db_pw": _app_pw(), "db_root_pw": _app_pw(), "admin_pw": _app_pw(12),
+            "admin_token": _app_pw(24),
+        }
+        app = AppStore().add(entry)
+        tid_task = start_task("app/deploy", app_deploy_work, app["id"])
+        # 敏感信息只在创建响应里回一次（前端展示后即丢弃）
+        self._send(200, {
+            "ok": True, "task": tid_task, "app": app_view(app), "url": app_url(app),
+            "credentials": {"db_user": "appuser", "db_name": "appdb",
+                            "db_password": app["db_pw"], "db_root_password": app["db_root_pw"],
+                            "admin_password": app.get("admin_pw", ""),
+                            "admin_token": app.get("admin_token", "")},
+            "msg": f"{t['name']} 部署已开始（首次需要拉取镜像，可能要几分钟）",
+        })
+
+    def _api_app_action(self, parts):
+        """POST /api/apps/<id> {action: start|stop|restart|upgrade|backup} 或 /api/apps/<id>/backup"""
+        token = self._require_auth()
+        if token is None:
+            return
+        aid = parts[0] if parts else ""
+        app = AppStore().get(aid)
+        if not app:
+            self._send(404, {"error": "应用不存在"})
+            return
+        sub = parts[1] if len(parts) > 1 else ""
+        data = self._read_json()
+        action = (sub or str(data.get("action", "")) or "").strip().lower()
+        if action == "deploy":
+            # 重试部署（失败后修复配置再跑一次；数据目录与密码保持原样）
+            AppStore().update(aid, status="deploying", error="")
+            tid_task = start_task("app/deploy", app_deploy_work, aid)
+            self._send(200, {"ok": True, "task": tid_task, "msg": "已重新开始部署"})
+            return
+        if action == "start":
+            ok, msg = app_compose_cmd(app["folder"], "up", "-d")
+        elif action == "stop":
+            ok, msg = app_compose_cmd(app["folder"], "stop")
+        elif action == "restart":
+            ok, msg = app_compose_cmd(app["folder"], "restart")
+        elif action == "upgrade":
+            tid_task = start_task("app/upgrade", docker_compose_upgrade, app["folder"])
+            self._send(200, {"ok": True, "task": tid_task, "msg": "已开始升级（拉取最新镜像并重建容器，数据不动）"})
+            return
+        elif action == "backup":
+            tid_task = start_task("app/backup", app_backup_work, aid)
+            self._send(200, {"ok": True, "task": tid_task, "msg": "已开始备份"})
+            return
+        else:
+            self._send(400, {"error": "action 必须是 start / stop / restart / upgrade / backup"})
+            return
+        self._send(200 if ok else 500, {"ok": bool(ok), "msg": msg[:200] if ok else "操作失败：" + msg[:200]})
+
+    def _api_app_delete(self, aid):
+        """DELETE /api/apps/<id>?purge=1 → 卸载（默认保留数据）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        store = AppStore()
+        app = store.get(aid)
+        if not app:
+            self._send(404, {"error": "应用不存在"})
+            return
+        q = parse_qs(urlparse(self.path).query)
+        purge = (q.get("purge") or ["0"])[0] in ("1", "true", "yes")
+        ok, msg = app_remove(app, purge=purge)
+        store.remove(aid)
+        used_ports_cache_reset()
+        self._send(200 if ok else 500, {"ok": bool(ok), "purged": purge,
+                                        "msg": ("%s 已卸载；%s" % (app.get("name") or app["folder"], msg))})
+
+    def _api_app_logs(self, aid):
+        """GET /api/apps/<id>/logs?lines=N"""
+        token = self._require_auth()
+        if token is None:
+            return
+        app = AppStore().get(aid)
+        if not app:
+            self._send(404, {"error": "应用不存在"})
+            return
+        q = parse_qs(urlparse(self.path).query)
+        try:
+            lines = max(10, min(int((q.get("lines") or ["200"])[0]), 2000))
+        except ValueError:
+            lines = 200
+        ok, out = app_compose_cmd(app["folder"], "logs", "--tail", str(lines), "--no-color",
+                                  timeout=60, full=True)
+        self._send(200, {"ok": ok, "logs": out})
 
     def _api_sites(self):
         """GET /api/sites → 网站列表（本站点 + 反代站合并视图）"""
@@ -7111,6 +8098,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             "hsts": bool(data.get("hsts")),
             "ssl": bool(data.get("ssl")),
             "cert_ref": cert_ref,
+            "client_max_body_size": _norm_upload_mb(data.get("client_max_body_size")),
         })
         # 防火墙放行反代入口端口（幂等）：有证书（ssl 或 cert_ref）→ 80+443，http 反代 → 80
         # ⚠ v1.24.64 修复：http 反代（ssl:false）nginx 监听 80，若不放行 80，
