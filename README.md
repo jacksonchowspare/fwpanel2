@@ -116,6 +116,27 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
   - 自动禁用发行版自带默认站点（移出 sites-enabled，避免 default_server 冲突）
 - **修改面板端口自动联动**：指向旧面板端口的反代目标端口自动同步，域名访问不受影响
 
+### 本机系统设置（3.2 新增）
+
+独立「系统」tab 收口所有**本机（主机级）**设置，避免散落在防火墙 / SSH / 反代页里找不到。
+
+| 卡片 | 能力 |
+| --- | --- |
+| 本机信息 | 发行版 / 内核 / CPU / 负载 / 运行时长 / 时区时间 / 磁盘 / 内存 / swap（只读总览） |
+| 内存与 Swap | 一键加 512M/1G/2G/4G 或自定义；调整大小；关闭并删除；`vm.swappiness` 可调 |
+| DNS | 自动识别管理方式（systemd-resolved / NetworkManager / netplan / 直接 resolv.conf）、修改、解析测试、还原上次备份 |
+| 时间与主机名 | 查看/设置时区、NTP 自动同步开关、修改主机名（同步 /etc/hosts） |
+| 网络优化 | 一键开启 BBR、IPv6 优先策略（IPv4 优先 / 禁用 / 开启） |
+| 面板端口 | 修改面板监听端口（改后自动同步反代与防火墙放行） |
+
+安全设计（主机级改动统一套路）：
+
+- **改前备份 → 执行 → 立刻验证 → 失败自动回滚**：改 `/etc/fstab`、`resolv.conf`、`resolved.conf`、`/etc/hosts` 前都留备份（`/etc/fwpanel/backups/`）
+- **DNS 改错会连带证书签发与软件源失效**，所以写完立即做真实解析测试，全部失败会自动回滚并说明原因；另外给「还原上次备份」
+- **swap** 只管理自己创建的 `/swapfile`：创建前查磁盘余量（留 1GB），写入 fstab 幂等，`swapon` 后校验真实生效，失败自动清理；btrfs 等不支持场景明确报原因
+- **调整/关闭 swap 前先比对「swap 已用」与「可用内存」**，避免关闭 swap 触发 OOM
+- systemd-resolved 环境会额外显示「链路实际生效的 DNS」（DHCP/netplan 提供的），不谎报改动已生效
+
 ### 应用一键部署（3.1 新增）
 
 内置应用模板，选模板 → 填端口/域名 → 一键部署。面板会自动拉镜像、起容器、建反代、放行 80/443、

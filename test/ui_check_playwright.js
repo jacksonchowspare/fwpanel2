@@ -33,6 +33,22 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   page.on("console", m => { if (m.type() === "error") errors.push("console: " + m.text().slice(0, 160)); });
 
   // —— 场景 1：上次停在「网站」tab，登录后应自动加载（不刷新页面）——
+
+  // ---- v3.2.0 系统页（本机设置收口）----
+  await page.click('.tab[data-tab="sys"]');
+  await page.waitForTimeout(2500);
+  ok(await page.$eval('[data-sec="sys"]', e => getComputedStyle(e).display !== "none"), "系统页可见");
+  const sysInfo = (await page.$eval("#sys_info", e => e.innerText)).trim();
+  ok(!/检测中/.test(sysInfo) && /内核/.test(sysInfo), "本机信息已渲染", sysInfo.slice(0, 40));
+  ok(/当前 swap/.test(await page.$eval("#sys_mem", e => e.innerText)), "Swap 卡片已渲染");
+  ok(/管理方式/.test(await page.$eval("#sys_dns", e => e.innerText)), "DNS 卡片已渲染");
+  ok(/当前主机名/.test(await page.$eval("#sys_host", e => e.innerText)), "主机名卡片已渲染");
+  ok(!(await page.$("#fw_bbr_status")), "BBR/IPv6 已从防火墙页搬走");
+  const fwTx = await page.$eval('[data-sec="fw"]', e => e.innerText);
+  ok(/已移至/.test(fwTx), "防火墙页有搬家提示");
+  const sshTx = await page.$eval('[data-sec="ssh"]', e => e.innerText);
+  ok(/面板端口已移至/.test(sshTx), "SSH 页有面板端口搬家提示");
+
   console.log("== 场景 1：登录后当前板块自动加载（模拟用户上次停在网站 tab）==");
   await page.goto(URL, { waitUntil: "load" });
   await page.evaluate(() => localStorage.setItem("fw_sec", "site"));

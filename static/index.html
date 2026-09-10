@@ -698,6 +698,8 @@ tr:hover td { background: var(--panel-solid); }
       <button class="tab" data-tab="app" onclick="switchTab('app')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l8 4.5v9L12 21l-8-4.5v-9z"/><path d="M12 12l8-4.5M12 12v9M12 12L4 7.5"/></svg> 应用</button>
       <button class="tab" data-tab="px" onclick="switchTab('px')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"/></svg> 反代证书</button>
       <button class="tab" data-tab="dk" onclick="switchTab('dk')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg> Docker</button>
+      <!-- ===== 系统 tab 按钮（插在「服务器」之前）===== -->
+      <button class="tab" data-tab="sys" onclick="switchTab('sys')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> 系统</button>
       <button class="tab" id="tab_fed" data-tab="fed" onclick="switchTab('fed')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 18v3M7 8h.01M11 8h.01M15 8h.01"/></svg> 服务器</button>
     </div>
     <div class="panel" data-sec="overview">
@@ -1071,21 +1073,7 @@ tr:hover td { background: var(--panel-solid); }
             <button class="btn danger" onclick="quickClose()">一键删除</button>
           </div>
           <div style="color:var(--muted);font-size:12px">删除该端口对应协议的放行规则（TCP 会连 TCP+UDP 一起删）</div>
-          <div style="border-top:1px dashed var(--border);margin:12px 0 10px"></div>
-          <div class="form-row" style="margin-bottom:8px">
-            <button class="btn" onclick="toggleBbr()">一键开启 BBR</button>
-            <button class="btn ghost" onclick="showKernel()">内核版本</button>
-            <span id="bbr_status" style="color:var(--muted);font-size:12px;align-self:center">检测中...</span>
-          </div>
-          <div style="color:var(--muted);font-size:12px">BBR 为 Google 的 TCP 拥塞控制算法，可提升网络传输速度（需 Linux 4.9+ 内核）</div>
-          <div style="border-top:1px dashed var(--border);margin:12px 0 10px"></div>
-          <div class="form-row" style="margin-bottom:8px">
-            <button class="btn ghost" onclick="setIpv6('v4_first')">IPv4 优先</button>
-            <button class="btn ghost" onclick="setIpv6('disable')">禁用 IPv6</button>
-            <button class="btn ghost" onclick="setIpv6('enable')">开启 IPv6</button>
-            <span id="ipv6_status" style="color:var(--muted);font-size:12px;align-self:center">检测中...</span>
-          </div>
-          <div style="color:var(--muted);font-size:12px">IPv4 优先 = IPv6 保持开启但优先走 IPv4；禁用/开启立即生效（sysctl + gai.conf）</div>
+          <div style="color:var(--muted);font-size:12px">BBR 加速与 IPv6 优先策略已移至「<a onclick="switchTab('sys')" style="cursor:pointer;color:var(--accent2)">系统</a>」页</div>
         </div>
       </div>
     </div>
@@ -1104,13 +1092,7 @@ tr:hover td { background: var(--panel-solid); }
           <div style="color:var(--muted);font-size:12px;margin-bottom:14px">
             保护规则永远存在防锁死；切换端口时旧端口会临时放行，检测到新端口连接后自动清理旧规则
           </div>
-          <div style="border-top:1px dashed var(--border);margin:12px 0 10px"></div>
-          <div style="display:flex;align-items:center;font-size:13px;font-weight:600;margin-bottom:6px"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg> 面板端口</div>
-          <div class="form-row" style="margin-bottom:6px">
-            <input id="panel_port_input" placeholder="端口" style="width:90px" inputmode="numeric">
-            <button class="btn" onclick="setPanelPort()">修改面板端口</button>
-          </div>
-          <div style="color:var(--muted);font-size:12px;margin-bottom:14px">改后自动删除旧端口放行并放行新端口、重启服务；通过反代域名访问时目标端口自动同步，无需手动调整</div>
+          <div style="color:var(--muted);font-size:12px">面板端口已移至「<a onclick="switchTab('sys')" style="cursor:pointer;color:var(--accent2)">系统</a>」页</div>
           <div style="border-top:1px dashed var(--border);margin:12px 0 10px"></div>
           <div style="display:flex;align-items:center;font-size:13px;font-weight:600;margin-bottom:6px"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg> SSH 白名单</div>
           <div style="color:var(--muted);font-size:12px;margin-bottom:6px">仅允许以下 IP/CIDR 访问 SSH 端口（留空 = 所有 IP 可访问）</div>
@@ -1262,7 +1244,108 @@ tr:hover td { background: var(--panel-solid); }
     </div>
 
     <!-- 服务器管理（2.0 联邦） -->
-    <div class="panel" data-sec="fed">
+    <!-- ===== 系统页（插在 fed 页之前）===== -->
+    <div class="grid2" data-sec="sys">
+      <div class="col">
+        <div class="panel">
+          <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg> 本机信息</h2>
+          <div id="sys_info" style="color:var(--muted);font-size:13px">检测中...</div>
+        </div>
+        <div class="panel">
+          <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"/></svg> DNS</h2>
+          <div id="sys_dns" style="font-size:13px;margin-bottom:10px">检测中...</div>
+          <div class="form-row" style="flex-wrap:wrap;gap:6px">
+            <button class="btn mini ghost" onclick="sysDnsQuick('aliyun')">阿里 223.5.5.5</button>
+            <button class="btn mini ghost" onclick="sysDnsQuick('tencent')">腾讯 119.29.29.29</button>
+            <button class="btn mini ghost" onclick="sysDnsQuick('google')">Google 8.8.8.8</button>
+            <button class="btn mini ghost" onclick="sysDnsQuick('cf')">Cloudflare 1.1.1.1</button>
+          </div>
+          <div class="form-row" style="margin-top:8px">
+            <input id="sys_dns_servers" placeholder="DNS 服务器，逗号分隔（如 223.5.5.5,119.29.29.29）" style="flex:1;min-width:200px">
+          </div>
+          <div class="form-row" style="margin-top:6px">
+            <input id="sys_dns_search" placeholder="搜索域（可选，如 example.com）" style="flex:1;min-width:200px">
+          </div>
+          <div class="form-row" style="margin-top:8px">
+            <button class="btn" onclick="sysDnsSave()">应用 DNS</button>
+            <button class="btn ghost" onclick="sysDnsTest()">解析测试</button>
+            <button class="btn ghost" onclick="sysDnsRestore()">还原上次备份</button>
+          </div>
+          <div id="sys_dns_test" style="color:var(--muted);font-size:12px;margin-top:8px"></div>
+          <div style="color:var(--muted);font-size:12px;margin-top:8px">改前自动备份、改完立即做解析测试，<b>测试失败会自动回滚</b>（DNS 改错会导致证书签发与软件源失效，所以必须验证）。</div>
+        </div>
+        <div class="panel">
+          <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"/></svg> 面板端口</h2>
+          <div id="sys_panel_port" style="font-size:13px;margin-bottom:10px">检测中...</div>
+          <div class="form-row" style="margin-bottom:6px">
+            <input id="sys_panel_port_input" placeholder="端口" style="width:90px" inputmode="numeric">
+            <button class="btn" onclick="sysPanelPortSave()">修改面板端口</button>
+          </div>
+          <div style="color:var(--muted);font-size:12px;margin-bottom:14px">改后自动删除旧端口放行并放行新端口、重启服务；通过反代域名访问时目标端口自动同步，无需手动调整</div>
+        </div>
+      </div>
+      <div class="col">
+        <div class="panel">
+          <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="7" rx="2"/><rect x="3" y="14" width="18" height="7" rx="2"/><path d="M7 6.5h.01M7 17.5h.01"/></svg> 内存与 Swap</h2>
+          <div id="sys_mem" style="font-size:13px;margin-bottom:10px">检测中...</div>
+          <div class="form-row" style="flex-wrap:wrap;gap:6px">
+            <button class="btn ghost" onclick="sysSwapOp('create',512)">加 512M</button>
+            <button class="btn" onclick="sysSwapOp('create',1024)">加 1G swap</button>
+            <button class="btn ghost" onclick="sysSwapOp('create',2048)">加 2G</button>
+            <button class="btn ghost" onclick="sysSwapOp('create',4096)">加 4G</button>
+          </div>
+          <div class="form-row" style="margin-top:8px">
+            <label style="min-width:76px">自定义 (MB)</label>
+            <input id="sys_swap_size" placeholder="例如 1024" style="width:110px" inputmode="numeric">
+            <button class="btn ghost" onclick="sysSwapOp('create',0)">创建</button>
+            <button class="btn ghost" onclick="sysSwapOp('resize',0)">调整到该大小</button>
+            <button class="btn danger" onclick="sysSwapOp('off',0)">关闭并删除</button>
+          </div>
+          <div class="form-row" style="margin-top:8px">
+            <label style="min-width:76px">swappiness</label>
+            <input id="sys_swappiness" style="width:80px" inputmode="numeric" placeholder="10-60">
+            <button class="btn ghost" onclick="sysSwappinessSave()">保存</button>
+            <span style="color:var(--muted);font-size:12px;align-self:center">内存小时建议 10-60（默认 60）</span>
+          </div>
+          <div style="color:var(--muted);font-size:12px;margin-top:8px">面板只管理自己创建的 <code style="font-family:'0xProto',ui-monospace,monospace">/swapfile</code>；创建前会检查磁盘余量，创建后自动写入 fstab（开机自动挂载），失败自动回滚。</div>
+        </div>
+        <div class="panel">
+          <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg> 时间与主机名</h2>
+          <div id="sys_time" style="font-size:13px;margin-bottom:10px">检测中...</div>
+          <div class="form-row">
+            <input id="sys_tz" placeholder="时区（如 Asia/Shanghai）" style="width:190px">
+            <button class="btn ghost" onclick="sysTimeSave()">设置时区</button>
+            <button class="btn ghost" onclick="sysNtpToggle(true)">开启 NTP</button>
+            <button class="btn ghost" onclick="sysNtpToggle(false)">关闭</button>
+          </div>
+          <div style="border-top:1px dashed var(--border);margin:12px 0 10px"></div>
+          <div id="sys_host" style="font-size:13px;margin-bottom:10px">检测中...</div>
+          <div class="form-row">
+            <input id="sys_hostname" placeholder="新主机名" style="width:190px">
+            <button class="btn ghost" onclick="sysHostSave()">修改主机名</button>
+            <span style="color:var(--muted);font-size:12px;align-self:center">同步 /etc/hosts 的 127.0.1.1 行</span>
+          </div>
+        </div>
+        <div class="panel">
+          <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7z"/></svg> 网络优化（BBR / IPv6）</h2>
+          <div id="sys_bbr" style="font-size:13px;margin-bottom:8px">检测中...</div>
+          <div class="form-row" style="margin-bottom:8px">
+            <button class="btn" onclick="sysBbrToggle()">一键开启 BBR</button>
+            <button class="btn ghost" onclick="showKernel()">内核版本</button>
+          </div>
+          <div style="color:var(--muted);font-size:12px;margin-bottom:10px">BBR 为 Google 的 TCP 拥塞控制算法，可提升网络传输速度（需 Linux 4.9+ 内核）</div>
+          <div id="sys_ipv6" style="font-size:13px;margin-bottom:8px">检测中...</div>
+          <div class="form-row" style="margin-bottom:8px">
+            <button class="btn ghost" onclick="sysIpv6('v4_first')">IPv4 优先</button>
+            <button class="btn ghost" onclick="sysIpv6('disable')">禁用 IPv6</button>
+            <button class="btn ghost" onclick="sysIpv6('enable')">开启 IPv6</button>
+          </div>
+          <div style="color:var(--muted);font-size:12px">IPv4 优先 = IPv6 保持开启但优先走 IPv4；禁用/开启立即生效（sysctl + gai.conf）</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="grid2" data-sec="fed">
       <h2 style="margin-bottom:4px"><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg> 服务器管理</h2>
       <div style="color:var(--muted);font-size:12px;margin:0 0 14px;line-height:1.7">
         在主面板登录一次，即可 HTTPS 管理所有已接入的服务器节点（全功能）。被管节点需 2.0+，并在其「服务器 → 本机联邦令牌」处开启；添加时主面板会立即校验地址与令牌。
@@ -2017,7 +2100,9 @@ async function refreshStatusCards() {
   if (_ui && _ui.current_channel === "beta") _chan = " 测试版";
   else if (_ui && _ui.current_channel === "stable") _chan = " 正式版";
   $("st_ver").textContent = "v" + status.version + _chan;
-    $("panel_port_input").value = status.panel_port || "";
+    // v3.2.0：面板端口输入框已搬到「系统」页，元素不存在时必须守卫（否则顶部弹 JS 报错）
+    const _ppi = $("panel_port_input") || $("sys_panel_port_input");
+    if (_ppi) _ppi.value = status.panel_port || "";
   } catch (e) { if (e.message !== "未登录") toast(e.message, "err"); }
 }
 async function refreshAll() {
@@ -2188,10 +2273,16 @@ async function showCertPathsSolo(domain) {
 /* ---------- IPv6 设置 ---------- */
 const IPV6_LABEL = { v4_first: "🌐 IPv4 优先", disabled: "🚫 已禁用", enabled: "✅ 已开启（默认）" };
 async function loadIpv6() {
+  // v3.2.0：IPv6 控件已搬到「系统」页（#sys_ipv6），这里只在系统页在场时刷新它。
+  // 旧写法直接写 #ipv6_status，元素搬走后会抛 null 异常（真浏览器回归抓到）
+  const el = $("sys_ipv6");
+  if (!el) return;
   try {
     const d = await api("GET", "/api/ipv6");
-    $("ipv6_status").textContent = "当前：" + (IPV6_LABEL[d.status] || d.status);
-  } catch (e) { $("ipv6_status").textContent = "状态获取失败"; }
+    if (sysData.ipv6 !== undefined) sysData.ipv6 = d;
+    el.innerHTML = '<div style="display:flex;gap:8px"><span style="color:var(--muted);min-width:88px">IPv6</span><span>'
+      + esc(IPV6_LABEL[d.status] || d.status || "-") + "</span></div>";
+  } catch (e) { el.textContent = "状态获取失败"; }
 }
 function setIpv6(mode) {
   const tip = { v4_first: "确认设置 IPv4 优先？\n\nIPv6 保持开启，但域名解析优先返回 IPv4 地址（gai.conf precedence）。\n立即生效，无需重启。",
@@ -3004,6 +3095,9 @@ function switchTab(sec) {
   if (sec === "site" && token) {
     if (!sitesLoaded) { sitesLoaded = false; loadSites(); }
   }
+  if (sec === "sys" && token) {
+    if (!sysLoaded) loadSystem();
+  }
   if (sec === "app" && token) {
     if (!appsLoaded) { appsLoaded = false; loadApps(); }
     else if (appList.some(a => a.status === "deploying")) loadApps();
@@ -3015,8 +3109,233 @@ function switchTab(sec) {
 }
 (function initSec() {
   const saved = localStorage.getItem("fw_sec");
-  switchTab(saved && ["overview", "fw", "site", "app", "ssh", "px", "dk", "fed"].indexOf(saved) >= 0 ? saved : "overview");
+  switchTab(saved && ["overview", "fw", "site", "app", "sys", "ssh", "px", "dk", "fed"].indexOf(saved) >= 0 ? saved : "overview");
 })();
+
+/* ---------- 系统页（v3.2.0，本机设置统一入口） ---------- */
+let sysData = {}, sysLoaded = false;
+
+async function loadSystem(withTest) {
+  if (!token) return;              // 未登录不打接口（否则首屏会出现一次 401）
+  try {
+    const d = await api("GET", "/api/system" + (withTest ? "?dns_test=1" : ""));
+    sysData = d;
+    sysLoaded = true;
+    renderSysInfo(d);
+    renderSysSwap(d);
+    renderSysDns(d);
+    renderSysTime(d);
+    renderSysHost(d);
+    renderSysNet(d);
+  } catch (e) {
+    // 取不到就明确写出来，别让卡片永远停在"检测中..."（用户看不出来是没加载还是没数据）
+    ["sys_info", "sys_mem", "sys_dns", "sys_time", "sys_host", "sys_bbr", "sys_ipv6", "sys_panel_port"]
+      .forEach(id => { const el = $(id); if (el) el.textContent = "状态获取失败：" + e.message + "（点「刷新」重试）"; });
+  }
+}
+
+function renderSysInfo(d) {
+  const i = d.info || {}, m = d.mem || {}, s = d.swap || {};
+  const row = (k, v) => '<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">'
+    + esc(k) + '</span><span style="word-break:break-all">' + esc(String(v)) + "</span></div>";
+  const memPct = m.total_mb ? Math.round((m.total_mb - m.available_mb) * 100 / m.total_mb) : 0;
+  const bar = (pct, color) => '<div style="height:6px;background:var(--input-bg);border-radius:3px;overflow:hidden;margin:2px 0 8px">'
+    + '<div style="height:100%;width:' + Math.min(100, pct) + '%;background:' + color + '"></div></div>';
+  $("sys_info").innerHTML =
+    row("主机名", d.hostname || "-") + row("系统", i.os || "-") + row("内核", i.kernel || "-")
+    + row("CPU / 负载", (i.cpu || "-") + " 核 ／ " + (i.load || "-"))
+    + row("运行时长", i.uptime || "-") + row("时区 / 时间", (i.timezone || "-") + " ／ " + (i.time || "-"))
+    + row("磁盘", (i.disk ? i.disk.used_gb + "G / " + i.disk.total_gb + "G（用 " + i.disk.percent + "%，剩 " + i.disk.free_gb + "G）" : "-"))
+    + (m.total_mb ? row("内存", m.total_mb + "MB（可用 " + m.available_mb + "MB）" ) + bar(memPct, memPct > 85 ? "var(--danger)" : "var(--accent2)") : "")
+    + row("Swap", (s.total_mb || 0) + "MB（已用 " + (s.used_mb || 0) + "MB）"
+        + ((s.other_swaps && s.other_swaps.length) ? "　+ 系统自带：" + s.other_swaps.join(" ") : ""));
+}
+
+function renderSysSwap(d) {
+  const s = d.swap || {};
+  const parts = [];
+  parts.push('<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">当前 swap</span><span>'
+    + (s.total_mb ? s.total_mb + "MB（已用 " + s.used_mb + "MB）" : '<span style="color:var(--warning,#f59e0b)">未启用</span>') + "</span></div>");
+  parts.push('<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">面板文件</span><span>'
+    + esc(s.file || "/swapfile") + "　" + (s.file_exists ? (s.in_use ? "已启用" : "存在但未启用") : "不存在")
+    + "　" + (s.fstab_ok ? "已写入 fstab（开机自动挂载）" : "未写入 fstab（重启后失效）") + "</span></div>");
+  if (s.other_swaps && s.other_swaps.length) {
+    parts.push('<div style="color:var(--muted);font-size:12px;margin-bottom:4px">检测到系统自带的交换设备：'
+      + esc(s.other_swaps.join(" ")) + "（面板不接管，只管理自己的 /swapfile）</div>");
+  }
+  if (!s.supported && s.reason) {
+    parts.push('<div style="color:var(--danger);font-size:12px">' + esc(s.reason) + "</div>");
+  }
+  if (s.disk_free_mb) {
+    parts.push('<div style="color:var(--muted);font-size:12px">磁盘可用 ' + s.disk_free_mb + "MB</div>");
+  }
+  $("sys_mem").innerHTML = parts.join("");
+  if ($("sys_swappiness") && !$("sys_swappiness").value) $("sys_swappiness").value = s.swappiness || 60;
+}
+
+function renderSysDns(d) {
+  const n = d.dns || {};
+  const modeName = { "systemd-resolved": "systemd-resolved", "networkmanager": "NetworkManager",
+                     "netplan": "netplan（面板不会改写 netplan 配置）", "resolv.conf": "直接写 /etc/resolv.conf" }[n.mode] || n.mode;
+  const parts = [];
+  parts.push('<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">管理方式</span><span>' + esc(modeName) + "</span></div>");
+  parts.push('<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">生效解析器</span><span>'
+    + esc((n.servers || []).join(", ") || "（未读到）") + "</span></div>");
+  if (n.search && n.search.length) {
+    parts.push('<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">搜索域</span><span>' + esc(n.search.join(" ")) + "</span></div>");
+  }
+  if (n.resolved_dns && n.resolved_dns.length) {
+    parts.push('<div style="color:var(--muted);font-size:12px">resolved 配置：' + esc(n.resolved_dns.join(" ")) + "</div>");
+  }
+  $("sys_dns").innerHTML = parts.join("");
+  if ($("sys_dns_servers") && !$("sys_dns_servers").value && n.servers && n.servers.length) {
+    const real = n.servers.filter(x => x !== "127.0.0.53");
+    if (real.length) $("sys_dns_servers").value = real.join(",");
+  }
+  if (n.test) renderSysDnsTest(n.test);
+}
+
+function renderSysDnsTest(list) {
+  $("sys_dns_test").innerHTML = (list || []).map(t =>
+    (t.ok ? '<span style="color:var(--accent2)">✓ ' : '<span style="color:var(--danger)">✗ ')
+    + esc(t.domain) + " " + esc(t.ok ? (t.addrs || []).join("/") + "　" + t.ms + "ms" : (t.error || "")) + "</span>").join("　");
+}
+
+function renderSysTime(d) {
+  const t = d.time || {};
+  $("sys_time").innerHTML = '<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">当前</span><span>'
+    + esc((t.timezone || "-") + "　" + (t.time || "")) + "</span></div>"
+    + '<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">NTP</span><span>'
+    + (t.ntp === null || t.ntp === undefined ? "-" : (t.ntp ? "已开启" : "已关闭"))
+    + (t.ntp_synced ? "（已同步）" : "") + "</span></div>";
+  if ($("sys_tz") && !$("sys_tz").value) $("sys_tz").value = t.timezone || "";
+}
+
+function renderSysHost(d) {
+  $("sys_host").innerHTML = '<div style="display:flex;gap:8px"><span style="color:var(--muted);min-width:88px">当前主机名</span><span>'
+    + esc(d.hostname || "-") + "</span></div>";
+  if ($("sys_hostname") && !$("sys_hostname").value) $("sys_hostname").value = d.hostname || "";
+}
+
+function renderSysNet(d) {
+  const b = d.bbr || {}, v6 = d.ipv6 || {};
+  $("sys_bbr").innerHTML = '<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">BBR</span><span>'
+    + (b.enabled ? '<span style="color:var(--accent2)">已开启</span>' : "未开启")
+    + (b.supported ? "" : '　<span style="color:var(--danger)">内核不支持（需 4.9+）</span>')
+    + "　内核 " + esc(b.kernel || "") + "</span></div>";
+  const modeTxt = v6.mode === "disable" ? "已禁用 IPv6"
+    : (v6.mode === "v4_first" ? "IPv4 优先（IPv6 仍开启）" : (v6.mode === "enable" ? "IPv6 已开启" : "-"));
+  $("sys_ipv6").innerHTML = '<div style="display:flex;gap:8px"><span style="color:var(--muted);min-width:88px">IPv6</span><span>'
+    + esc(modeTxt) + (v6.gai_conf || v6.sysctl ? "" : "") + "</span></div>";
+  if ($("sys_panel_port")) {
+    $("sys_panel_port").innerHTML = '<div style="display:flex;gap:8px"><span style="color:var(--muted);min-width:88px">当前端口</span><span>'
+      + esc(String(d.panel_port || "-")) + "</span></div>";
+    const ppi = $("sys_panel_port_input");
+    if (ppi && !ppi.value) ppi.value = d.panel_port || "";
+  }
+}
+
+/* ---- 操作 ---- */
+async function sysRun(path, body, okMsg) {
+  try {
+    const d = await api("POST", path, body || {});
+    if (d.task) {
+      toast((d.msg || "已开始") + "…", "");
+      for (;;) {
+        await new Promise(r => setTimeout(r, 2000));
+        const t = await api("GET", "/api/tasks/" + d.task).catch(() => null);
+        if (!t) continue;
+        if (t.msg) toast(t.msg, "");
+        if (t.status === "ok") { toast(t.msg || okMsg || "完成", "okk"); break; }
+        if (t.status === "error") { toast(t.msg || "失败", "err"); break; }
+      }
+    } else {
+      toast(d.msg || okMsg || "完成", "okk");
+    }
+  } catch (e) { toast(e.message, "err"); }
+  loadSystem();
+}
+
+function sysSwapOp(action, size) {
+  let mb = size;
+  if (!mb) {
+    mb = parseInt(($("sys_swap_size").value || "").trim(), 10);
+    if (!mb) { toast("请先填大小（MB）", "err"); return; }
+  }
+  if (action === "off") {
+    if (!confirm("确定关闭并删除 swap？\n\n会先检查可用内存是否足够，然后 swapoff + 删除 /swapfile + 清理 fstab。")) return;
+    sysRun("/api/system/swap", { action: "off", purge: true });
+  } else if (action === "resize") {
+    sysRun("/api/system/swap", { action: "resize", size_mb: mb });
+  } else {
+    sysRun("/api/system/swap", { size_mb: mb });
+  }
+}
+
+function sysSwappinessSave() {
+  const v = parseInt(($("sys_swappiness").value || "").trim(), 10);
+  if (isNaN(v)) { toast("请填 0-100 的数字", "err"); return; }
+  sysRun("/api/system/swappiness", { value: v });
+}
+
+function sysDnsQuick(which) {
+  const map = { aliyun: "223.5.5.5,223.6.6.6", tencent: "119.29.29.29,183.60.83.19",
+                google: "8.8.8.8,8.8.4.4", cf: "1.1.1.1,1.0.0.1" };
+  $("sys_dns_servers").value = map[which] || "";
+  toast("已填入，点「应用 DNS」生效", "");
+}
+
+function sysDnsSave() {
+  const servers = ($("sys_dns_servers").value || "").split(/[,\s]+/).filter(Boolean);
+  const search = ($("sys_dns_search").value || "").split(/[,\s]+/).filter(Boolean);
+  if (!servers.length) { toast("请至少填一个 DNS 服务器", "err"); return; }
+  sysRun("/api/system/dns", { servers, search });
+}
+
+async function sysDnsTest() {
+  try {
+    const d = await api("GET", "/api/system/dns/test");
+    renderSysDnsTest(d.results);
+    toast("解析测试完成", "okk");
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function sysDnsRestore() {
+  if (!confirm("还原最近一次 DNS 备份？")) return;
+  sysRun("/api/system/dns", { action: "restore" });
+}
+
+function sysTimeSave() {
+  const tz = ($("sys_tz").value || "").trim();
+  if (!tz) { toast("请填时区，如 Asia/Shanghai", "err"); return; }
+  sysRun("/api/system/time", { tz });
+}
+
+function sysNtpToggle(on) { sysRun("/api/system/time", { action: "ntp", enable: !!on }); }
+
+function sysHostSave() {
+  const n = ($("sys_hostname").value || "").trim();
+  if (!n) { toast("请填新主机名", "err"); return; }
+  sysRun("/api/system/hostname", { name: n });
+}
+
+async function sysBbrToggle() {
+  const on = !((sysData.bbr || {}).enabled);
+  if (!on && !confirm("关闭 BBR？（恢复默认拥塞控制算法）")) return;
+  sysRun("/api/system/bbr", { enable: on });
+}
+
+function sysIpv6(mode) {
+  if (mode === "disable" && !confirm("禁用 IPv6？部分服务可能受影响，确认继续？")) return;
+  sysRun("/api/system/ipv6", { mode: mode });
+}
+
+function sysPanelPortSave() {
+  const p = parseInt(($("sys_panel_port_input").value || "").trim(), 10);
+  if (!p) { toast("请填端口", "err"); return; }
+  if (!confirm("修改面板端口为 " + p + "？服务会重启，请用新端口访问。")) return;
+  sysRun("/api/system/panel-port", { port: p }, "面板端口已修改");
+}
 
 /* ---------- 应用（一键部署，v3.1.0） ---------- */
 let appTpls = [], appList = [], appsLoaded = false, appMem = {};
@@ -3789,13 +4108,17 @@ document.addEventListener("click", (e) => {
 });
 
 async function loadBbr() {
+  // v3.2.0：BBR 控件已搬到「系统」页（#sys_bbr）——元素搬走时必须守卫，否则 null 异常
+  const el = $("sys_bbr");
+  if (!el) return;
   try {
     const d = await api("GET", "/api/bbr");
-    bbrInfo = d;
-    $("bbr_status").textContent = d.enabled
-      ? "✅ 已开启"
-      : (d.supported ? "未开启（点击按钮开启）" : "⚠ 内核不支持");
-  } catch (e) { $("bbr_status").textContent = "状态获取失败"; }
+    if (sysData.bbr) { sysData.bbr.enabled = !!d.enabled; sysData.bbr.supported = d.supported !== false; }
+    el.innerHTML = '<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">BBR</span><span>'
+      + (d.enabled ? '<span style="color:var(--accent2)">已开启</span>' : "未开启")
+      + (d.supported === false ? '　<span style="color:var(--danger)">内核不支持（需 4.9+）</span>' : "")
+      + "　内核 " + esc(d.kernel || "") + "</span></div>";
+  } catch (e) { el.textContent = "状态获取失败"; }
 }
 function showKernel() {
   const k = (bbrInfo && bbrInfo.kernel) || "未知";
@@ -4156,7 +4479,7 @@ async function unban(ip) {
 
 /* ---------- 面板设置 ---------- */
 async function setPanelPort() {
-  const port = $("panel_port_input").value.trim();
+  const port = ($("panel_port_input") || $("sys_panel_port_input") || {}).value?.trim?.() || "";
   if (!port || !/^\d+$/.test(port)) { toast("请输入有效端口", "err"); return; }
   confirmPanel(`确认将面板端口修改为 ${port}？\n\n将自动：删除旧端口放行规则 → 放行新端口 → 重启服务。\n直连访问将跳转到新地址；通过反代域名访问则无需变化（反代目标端口自动同步）。\n如使用 SSH 隧道访问，请先断开并重新建立新端口隧道。`, async () => {
     try {

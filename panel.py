@@ -44,6 +44,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import functools
 import threading
 import time
 import urllib.request
@@ -52,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.1.1"
+CURRENT_VERSION = "3.2.0"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -4990,6 +4991,636 @@ DOCKER_DAEMON_JSON = os.environ.get("FW_DOCKER_DAEMON_JSON", "/etc/docker/daemon
 COMPOSE_BASE = os.environ.get("FW_COMPOSE_BASE", os.path.join(DOCKER_DATA_BASE, "dockercompose"))
 
 
+# ------------------------------- 系统设置（v3.2.0） -------------------------------
+# 本机系统级设置的统一出口：本机信息 / swap / DNS / 时间与时区 / 主机名 / BBR / IPv6。
+# 设计原则（主机级改动统一套路，改动前必读）：
+# 1) 改前备份到 BASE_DIR/backups/ → 执行 → 立刻验证 → 失败自动回滚 → 全程返回明确结果
+# 2) 幂等：fstab / sysctl 写入前先检查，不重复追加
+# 3) 长任务：swap 创建/调整、DNS 变更走 start_task（含 task_progress 进度）
+# 4) 不猜环境：DNS 管理方式（systemd-resolved / NetworkManager / netplan / 直接 resolv.conf）先探测再动手
+SYS_BACKUP_DIR = os.path.join(BASE_DIR, "backups")
+SWAP_FILE = "/swapfile"
+FSTAB_FILE = "/etc/fstab"          # 抽成常量便于测试打桩（swap 行写入/清理都走它）
+SWAP_SYSCTL_FILE = "/etc/sysctl.d/99-fwpanel-swap.conf"
+
+
+def _sys_backup(path):
+    """备份系统文件（保留时间戳），返回备份路径；文件不存在返回 "" """
+    try:
+        if not os.path.isfile(path):
+            return ""
+        os.makedirs(SYS_BACKUP_DIR, exist_ok=True)
+        # 名字带随机后缀：同一秒内多次备份不能互相覆盖（否则「还原上次备份」会还原到刚产生的那个）
+        dst = os.path.join(SYS_BACKUP_DIR, os.path.basename(path).strip("/").replace("/", "_")
+                           + "." + time.strftime("%Y%m%d-%H%M%S") + "-" + os.urandom(2).hex())
+        shutil.copy2(path, dst)
+        return dst
+    except Exception as e:
+        log(f"[sys_backup] {path} 备份失败: {e}")
+        return ""
+
+
+def _read_text(path, default=""):
+    try:
+        with open(path) as f:
+            return f.read()
+    except Exception:
+        return default
+
+
+def _root_fstype():
+    """根分区文件系统类型（btrfs 上 swapfile 需要特殊处理）"""
+    try:
+        r = subprocess.run(["findmnt", "-no", "FSTYPE", "/"], capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            return r.stdout.strip()
+    except Exception:
+        pass
+    try:
+        for line in _read_text("/proc/mounts").splitlines():
+            parts = line.split()
+            if len(parts) > 2 and parts[1] == "/":
+                return parts[2]
+    except Exception:
+        pass
+    return ""
+
+
+def system_info():
+    """本机信息总览（只读）"""
+    info = {"hostname": "", "os": "", "kernel": "", "cpu": 0, "load": "", "uptime": "",
+            "disk": {}, "timezone": "", "time": "", "arch": ""}
+    try:
+        info["hostname"] = os.uname().nodename
+        info["kernel"] = os.uname().release
+        info["arch"] = os.uname().machine
+        info["cpu"] = os.cpu_count() or 0
+        info["load"] = ", ".join(f"{x:.2f}" for x in os.getloadavg())
+        up = float(_read_text("/proc/uptime").split()[0] or 0)
+        d, h, m = int(up // 86400), int(up % 86400 // 3600), int(up % 3600 // 60)
+        info["uptime"] = (f"{d} 天 " if d else "") + f"{h} 小时 {m} 分"
+    except Exception:
+        pass
+    try:
+        for line in _read_text("/etc/os-release").splitlines():
+            if line.startswith("PRETTY_NAME="):
+                info["os"] = line.split("=", 1)[1].strip().strip('"')
+                break
+    except Exception:
+        pass
+    try:
+        du = shutil.disk_usage("/")
+        info["disk"] = {"total_gb": round(du.total / 2 ** 30, 1), "used_gb": round(du.used / 2 ** 30, 1),
+                        "free_gb": round(du.free / 2 ** 30, 1),
+                        "percent": int(du.used * 100 / du.total) if du.total else 0}
+    except Exception:
+        pass
+    ts = time_status()
+    info["timezone"] = ts.get("timezone", "")
+    info["time"] = ts.get("time", "")
+    return info
+
+
+# ---------- swap ----------
+def swap_status():
+    """swap 现状：总量/已用/文件/是否写入 fstab/swappiness/磁盘余量"""
+    st = {"total_mb": 0, "used_mb": 0, "file": SWAP_FILE, "file_exists": False, "in_use": False,
+          "fstab_ok": False, "swappiness": 60, "disk_free_mb": 0, "fstype": _root_fstype(),
+          "supported": True, "reason": "", "persistent": []}
+    try:
+        mi = mem_info()
+        # /proc/meminfo 的 SwapTotal 已包含全部 swap 设备
+        st["total_mb"] = int(_read_text("/proc/meminfo").split("SwapTotal:")[1].split()[0]) // 1024
+        st["used_mb"] = int(_read_text("/proc/meminfo").split("SwapFree:")[1].split()[0]) // 1024
+        st["used_mb"] = max(0, st["total_mb"] - st["used_mb"])
+        st["mem_total_mb"] = mi.get("total_mb", 0)
+        st["mem_available_mb"] = mi.get("available_mb", 0)
+    except Exception:
+        pass
+    st["file_exists"] = os.path.isfile(SWAP_FILE)
+    st["fstab_ok"] = any(SWAP_FILE in ln and "swap" in ln
+                         for ln in _read_text(FSTAB_FILE).splitlines() if not ln.strip().startswith("#"))
+    # swap 设备清单：优先 swapon --show（新旧版本参数不同，两级退化），也解析 /proc/swaps
+    devs = []
+    try:
+        r = subprocess.run(["swapon", "--show=NAME,TYPE,SIZE,USED", "--noheadings"],
+                           capture_output=True, text=True, timeout=10)
+        for ln in (r.stdout or "").splitlines():
+            parts = ln.split()
+            if parts and not parts[0].startswith("NAME"):
+                devs.append(parts[0])
+    except Exception:
+        pass
+    if not devs:
+        try:
+            r = subprocess.run(["swapon", "-s"], capture_output=True, text=True, timeout=10)
+            for ln in (r.stdout or "").splitlines():
+                parts = ln.split()
+                if parts and not parts[0].lower().startswith("filename"):
+                    devs.append(parts[0])
+        except Exception:
+            pass
+    if not devs:
+        devs = [ln.split()[0] for ln in _read_text("/proc/swaps").splitlines()[1:] if ln.split()]
+    st["devices"] = devs
+    st["in_use"] = SWAP_FILE in devs
+    st["other_swaps"] = [d for d in devs if d != SWAP_FILE]
+    try:
+        st["swappiness"] = int(_read_text("/proc/sys/vm/swappiness").strip() or 60)
+    except Exception:
+        pass
+    try:
+        st["disk_free_mb"] = shutil.disk_usage("/").free // 1048576
+    except Exception:
+        pass
+    if st["fstype"] == "btrfs":
+        st["supported"] = False
+        st["reason"] = "根分区是 btrfs：swapfile 需要 nodatacow 等额外属性，面板不做自动创建"
+    elif not shutil.which("mkswap"):
+        st["supported"] = False
+        st["reason"] = "系统缺少 mkswap（util-linux 未安装）"
+    return st
+
+
+def _fstab_add_swap(path=None):
+    path = path or SWAP_FILE
+    """幂等写入 swap 行 → 返回 (ok, 备份路径或错误)"""
+    txt = _read_text(FSTAB_FILE)
+    if any(path in ln and "swap" in ln for ln in txt.splitlines() if not ln.strip().startswith("#")):
+        return True, ""
+    bak = _sys_backup(FSTAB_FILE)
+    if not bak:
+        return False, "/etc/fstab 备份失败，已中止"
+    try:
+        with open(FSTAB_FILE, "a") as f:
+            f.write(("\n" if txt and not txt.endswith("\n") else "") + f"{path} none swap sw 0 0\n")
+        return True, bak
+    except Exception as e:
+        return False, f"写入 /etc/fstab 失败：{e}"
+
+
+def _fstab_remove_swap(path=None):
+    path = path or SWAP_FILE
+    bak = _sys_backup(FSTAB_FILE)
+    txt = _read_text(FSTAB_FILE)
+    keep = [ln for ln in txt.splitlines()
+            if not (path in ln and "swap" in ln and not ln.strip().startswith("#"))]
+    try:
+        with open(FSTAB_FILE, "w") as f:
+            f.write("\n".join(keep).rstrip("\n") + "\n")
+        return True, bak
+    except Exception as e:
+        return False, f"清理 /etc/fstab 失败：{e}"
+
+
+def swap_create(size_mb):
+    """创建 swap 文件并启用（长任务体）→ (ok, msg)"""
+    try:
+        size_mb = int(size_mb)
+    except (TypeError, ValueError):
+        return False, "swap 大小必须是数字（MB）"
+    if not (256 <= size_mb <= 65536):
+        return False, "swap 大小范围 256MB - 64GB"
+    st = swap_status()
+    if not st["supported"]:
+        return False, st["reason"]
+    if st["total_mb"] > 0 and st["file_exists"] and not st["in_use"]:
+        return False, "已有 swap 文件但未启用：请先「关闭并删除」再创建"
+    if st["in_use"]:
+        return False, "已有 swap 正在使用：如需改大小请用「调整大小」"
+    need = size_mb + 1024
+    if st["disk_free_mb"] < need:
+        return False, f"磁盘余量不足：可用 {st['disk_free_mb']}MB，需要 {size_mb}MB + 1GB 余量"
+    task_progress(f"正在创建 {size_mb}MB swap 文件…", f"fallocate -l {size_mb}M {SWAP_FILE}")
+    bak = ""
+    try:
+        r = subprocess.run(["fallocate", "-l", f"{size_mb}M", SWAP_FILE], capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            # 某些文件系统不支持 fallocate → 退化 dd
+            task_progress("fallocate 不支持，改用 dd 写入（会慢一些）…", "dd if=/dev/zero")
+            r = subprocess.run(["dd", "if=/dev/zero", f"of={SWAP_FILE}", "bs=1M", f"count={size_mb}"],
+                               capture_output=True, text=True, timeout=1800)
+            if r.returncode != 0:
+                return False, "创建 swap 文件失败：" + (r.stderr or r.stdout).strip()[:200]
+        os.chmod(SWAP_FILE, 0o600)
+        for cmd in (["mkswap", SWAP_FILE], ["swapon", SWAP_FILE]):
+            rr = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if rr.returncode != 0:
+                _swap_cleanup_file()
+                return False, f"{cmd[0]} 失败：" + (rr.stderr or rr.stdout).strip()[:200]
+        ok, bak_or_err = _fstab_add_swap()
+        st2 = swap_status()
+        if st2["total_mb"] < size_mb * 0.9:
+            _swap_cleanup_file()
+            if bak:
+                shutil.copy2(bak, FSTAB_FILE)
+            return False, f"启用后校验失败（当前 swap {st2['total_mb']}MB，期望约 {size_mb}MB），已回滚"
+        perf = f"swap 已创建并启用：{st2['total_mb']}MB（开机自动挂载{'已写入' if ok else '未写入'} fstab）"
+        if not ok:
+            perf += "；注意：" + str(bak_or_err)
+        return True, perf
+    except Exception as e:
+        _swap_cleanup_file()
+        return False, f"创建 swap 异常：{e}"
+
+
+def _swap_cleanup_file():
+    try:
+        subprocess.run(["swapoff", SWAP_FILE], capture_output=True, text=True, timeout=180)
+    except Exception:
+        pass
+    try:
+        if os.path.isfile(SWAP_FILE):
+            os.remove(SWAP_FILE)
+    except Exception:
+        pass
+
+
+def swap_resize(size_mb):
+    """调整 swap 大小（长任务体）：先 swapoff（要求可用内存足够）→ 重设 → swapon"""
+    try:
+        size_mb = int(size_mb)
+    except (TypeError, ValueError):
+        return False, "swap 大小必须是数字（MB）"
+    if not (256 <= size_mb <= 65536):
+        return False, "swap 大小范围 256MB - 64GB"
+    st = swap_status()
+    if not st["supported"]:
+        return False, st["reason"]
+    if not st["file_exists"]:
+        return False, "没有由面板创建的 swap 文件（/swapfile 不存在），请用「创建」"
+    # 关闭 swap 会把已用页面换回内存，可用内存必须够
+    if st["in_use"] and st["used_mb"] > st["mem_available_mb"]:
+        return False, (f"当前 swap 已用 {st['used_mb']}MB，而可用内存只有 {st['mem_available_mb']}MB："
+                       f"直接关闭 swap 有 OOM 风险，请先释放内存")
+    if st["disk_free_mb"] + (st["total_mb"] if st["file_exists"] else 0) < size_mb + 1024:
+        return False, f"磁盘余量不足（可用 {st['disk_free_mb']}MB）"
+    task_progress(f"正在把 swap 调整为 {size_mb}MB…", "swapoff → 重设大小 → swapon")
+    try:
+        if st["in_use"]:
+            r = subprocess.run(["swapoff", SWAP_FILE], capture_output=True, text=True, timeout=600)
+            if r.returncode != 0:
+                return False, "swapoff 失败：" + (r.stderr or r.stdout).strip()[:200]
+        r = subprocess.run(["fallocate", "-l", f"{size_mb}M", SWAP_FILE], capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            r = subprocess.run(["dd", "if=/dev/zero", f"of={SWAP_FILE}", "bs=1M", f"count={size_mb}"],
+                               capture_output=True, text=True, timeout=1800)
+            if r.returncode != 0:
+                return False, "重设大小失败：" + (r.stderr or r.stdout).strip()[:200]
+        os.chmod(SWAP_FILE, 0o600)
+        for cmd in (["mkswap", SWAP_FILE], ["swapon", SWAP_FILE]):
+            rr = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+            if rr.returncode != 0:
+                return False, f"{cmd[0]} 失败：" + (rr.stderr or rr.stdout).strip()[:200]
+        st2 = swap_status()
+        return True, f"swap 已调整为 {st2['total_mb']}MB（已启用）"
+    except Exception as e:
+        return False, f"调整 swap 异常：{e}"
+
+
+def swap_off(purge=True):
+    """关闭 swap（purge=True 时同时删除文件与 fstab 行）"""
+    st = swap_status()
+    if st["in_use"] and st["used_mb"] > st["mem_available_mb"]:
+        return False, (f"当前 swap 已用 {st['used_mb']}MB，可用内存 {st['mem_available_mb']}MB："
+                       f"关闭有 OOM 风险，请先释放内存")
+    task_progress("正在关闭 swap…", "swapoff" + (" + 删除文件" if purge else ""))
+    try:
+        if st["in_use"]:
+            r = subprocess.run(["swapoff", SWAP_FILE], capture_output=True, text=True, timeout=600)
+            if r.returncode != 0 and SWAP_FILE in (r.stderr or ""):
+                return False, "swapoff 失败：" + (r.stderr or r.stdout).strip()[:200]
+        if purge:
+            if os.path.isfile(SWAP_FILE):
+                os.remove(SWAP_FILE)
+            _fstab_remove_swap()
+        st2 = swap_status()
+        return True, ("swap 已关闭并删除（%s）" % SWAP_FILE) if purge else ("swap 已关闭（保留文件）")
+    except Exception as e:
+        return False, f"关闭 swap 异常：{e}"
+
+
+def set_swappiness(value):
+    """设置 vm.swappiness（写 /etc/sysctl.d/99-fwpanel-swap.conf，持久生效）"""
+    try:
+        v = int(value)
+    except (TypeError, ValueError):
+        return False, "swappiness 必须是 0-100 的整数"
+    if not (0 <= v <= 100):
+        return False, "swappiness 必须是 0-100 的整数"
+    try:
+        if os.path.isfile(SWAP_SYSCTL_FILE):
+            _sys_backup(SWAP_SYSCTL_FILE)
+        os.makedirs(os.path.dirname(SWAP_SYSCTL_FILE), exist_ok=True)
+        with open(SWAP_SYSCTL_FILE, "w") as f:
+            f.write(f"# 由 FW-Panel2 写入\nvm.swappiness = {v}\n")
+        r = subprocess.run(["sysctl", "-w", f"vm.swappiness={v}"], capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return False, "写入后立即生效失败：" + (r.stderr or r.stdout).strip()[:200]
+        now = int(_read_text("/proc/sys/vm/swappiness").strip() or 0)
+        return True, f"swappiness 已设为 {now}（持久化于 {SWAP_SYSCTL_FILE}）"
+    except Exception as e:
+        return False, f"设置 swappiness 异常：{e}"
+
+
+# ---------- DNS ----------
+def _dns_mode():
+    """探测本机 DNS 的管理方式"""
+    try:
+        r = subprocess.run(["systemctl", "is-active", "systemd-resolved"],
+                           capture_output=True, text=True, timeout=10)
+        if r.stdout.strip() == "active":
+            return "systemd-resolved"
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["systemctl", "is-active", "NetworkManager"], capture_output=True, text=True, timeout=10)
+        if r.stdout.strip() == "active" and shutil.which("nmcli"):
+            return "networkmanager"
+    except Exception:
+        pass
+    try:
+        import glob
+        if glob.glob("/etc/netplan/*.yaml"):
+            return "netplan"
+    except Exception:
+        pass
+    return "resolv.conf"
+
+
+def _resolv_servers():
+    out, search = [], []
+    for line in _read_text("/etc/resolv.conf").splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "nameserver" and len(parts) > 1:
+            out.append(parts[1])
+        elif parts[0] == "search" and len(parts) > 1:
+            # 过滤根域 "."（systemd-resolved 常见占位，显示成 "." 很怪）
+            search = [x for x in parts[1:] if x not in (".", "")]
+    return out, search
+
+
+def dns_status(with_test=False):
+    """DNS 现状：管理方式、生效解析器、搜索域、是否软链到 resolved、可选解析测试"""
+    mode = _dns_mode()
+    servers, search = _resolv_servers()
+    st = {"mode": mode, "servers": servers, "search": search,
+          "resolv_conf_target": "", "resolved_dns": [], "nm_conns": [],
+          "backups": sorted([f for f in os.listdir(SYS_BACKUP_DIR) if f.startswith("resolv.conf.")],
+                            reverse=True)[:5] if os.path.isdir(SYS_BACKUP_DIR) else []}
+    try:
+        st["resolv_conf_target"] = os.path.realpath("/etc/resolv.conf") if os.path.islink("/etc/resolv.conf") else ""
+    except Exception:
+        pass
+    if mode == "systemd-resolved":
+        for line in _read_text("/etc/systemd/resolved.conf").splitlines():
+            if line.strip().startswith("DNS="):
+                st["resolved_dns"] = [x for x in line.split("=", 1)[1].split() if x]
+        # 关键：resolved 生效的解析器常来自「链路」(DHCP/netplan/网卡)，不是 resolved.conf —— 不显示就会骗人
+        try:
+            r = subprocess.run(["resolvectl", "dns"], capture_output=True, text=True, timeout=10)
+            st["effective"] = sorted({x for ln in (r.stdout or "").splitlines()
+                                      for x in ln.split() if is_valid_ip_or_net(x)})
+        except Exception:
+            pass
+    if mode == "networkmanager":
+        try:
+            r = subprocess.run(["nmcli", "-t", "-f", "NAME,DEVICE", "con", "show", "--active"],
+                               capture_output=True, text=True, timeout=15)
+            st["nm_conns"] = [ln.split(":")[0] for ln in (r.stdout or "").splitlines() if ln.strip()]
+        except Exception:
+            pass
+    if with_test:
+        st["test"] = dns_test()
+    return st
+
+
+def dns_test(domains=None):
+    """真实解析测试（不走外部命令，用 getaddrinfo），返回每项耗时与结果"""
+    domains = domains or ["www.aliyun.com", "www.baidu.com", "github.com"]
+    results = []
+    for d in domains:
+        t0 = time.time()
+        try:
+            import socket
+            infos = socket.getaddrinfo(d, None)
+            addrs = sorted({i[4][0] for i in infos})[:3]
+            results.append({"domain": d, "ok": True, "addrs": addrs,
+                            "ms": int((time.time() - t0) * 1000)})
+        except Exception as e:
+            results.append({"domain": d, "ok": False, "error": str(e)[:80],
+                            "ms": int((time.time() - t0) * 1000)})
+    return results
+
+
+def dns_apply(servers, search=None):
+    """应用 DNS：备份 → 按管理方式写入 → 解析测试 → 失败自动回滚（长任务体）"""
+    servers = [str(s).strip() for s in (servers or []) if str(s).strip()]
+    search = [str(s).strip() for s in (search or []) if str(s).strip()]
+    if not servers:
+        return False, "至少需要一个 DNS 服务器地址"
+    for s in servers:
+        if not is_valid_ip_or_net(s):
+            return False, f"DNS 地址格式无效：{s}"
+    mode = _dns_mode()
+    task_progress(f"正在应用 DNS（管理方式：{mode}）…", "备份 → 写入 → 解析测试")
+    rolled = []
+    try:
+        if mode == "systemd-resolved":
+            path = "/etc/systemd/resolved.conf"
+            bak = _sys_backup(path)
+            txt = _read_text(path)
+            lines = [ln for ln in txt.splitlines() if not ln.strip().startswith("DNS=")
+                     and not ln.strip().startswith("Domains=")]
+            # 确保 [Resolve] 段存在
+            if not any(ln.strip() == "[Resolve]" for ln in lines):
+                lines.append("[Resolve]")
+            lines.append("DNS=" + " ".join(servers))
+            if search:
+                lines.append("Domains=" + " ".join(search))
+            with open(path, "w") as f:
+                f.write("\n".join(lines).rstrip("\n") + "\n")
+            subprocess.run(["systemctl", "restart", "systemd-resolved"], capture_output=True, text=True, timeout=60)
+        elif mode == "networkmanager":
+            r = subprocess.run(["nmcli", "-t", "-f", "NAME,DEVICE", "con", "show", "--active"],
+                               capture_output=True, text=True, timeout=15)
+            conns = [ln.split(":")[0] for ln in (r.stdout or "").splitlines() if ln.strip()]
+            if not conns:
+                return False, "未找到活动的 NetworkManager 连接"
+            for c in conns:
+                subprocess.run(["nmcli", "con", "mod", c, "ipv4.dns", ",".join(servers)],
+                               capture_output=True, text=True, timeout=30)
+                if search:
+                    subprocess.run(["nmcli", "con", "mod", c, "ipv4.dns-search", ",".join(search)],
+                                   capture_output=True, text=True, timeout=30)
+                subprocess.run(["nmcli", "con", "up", c], capture_output=True, text=True, timeout=60)
+        else:
+            path = "/etc/resolv.conf"
+            bak = _sys_backup(path)
+            body = "".join(f"nameserver {s}\n" for s in servers)
+            if search:
+                body += "search " + " ".join(search) + "\n"
+            try:
+                with open(path, "w") as f:
+                    f.write("# 由 FW-Panel2 写入（原文件已备份到 %s）\n" % (bak or SYS_BACKUP_DIR) + body)
+            except PermissionError:
+                return False, "写入 /etc/resolv.conf 被拒（可能被 chattr +i 锁定或受 systemd-resolved 管理）"
+        # 测试（DNS 改错会导致证书签发/apt 全挂，必须验证）
+        task_progress("DNS 已写入，正在验证解析…", "解析测试")
+        tests = dns_test()
+        ok_any = any(t["ok"] for t in tests)
+        if not ok_any:
+            if bak and os.path.isfile(bak):
+                shutil.copy2(bak, path if mode != "networkmanager" else path)
+                rolled.append("已回滚 resolv.conf/systemd 配置")
+            if mode == "systemd-resolved":
+                subprocess.run(["systemctl", "restart", "systemd-resolved"], capture_output=True, text=True, timeout=60)
+            return False, ("新 DNS 无法解析任何测试域名，已回滚原配置。" + "；".join(rolled) +
+                           "；测试详情：" + "; ".join(f"{t['domain']}={'OK' if t['ok'] else t.get('error', '')}" for t in tests))
+        eff = dns_status().get("effective") or []
+        tip = ("；注意：本机实际生效的解析器来自链路配置，仍是 " + ", ".join(eff) +
+               "（面板已写入配置，但被 DHCP/netplan 覆盖，需在网卡配置里改）") \
+              if (mode == "systemd-resolved" and eff and set(eff) & set(servers) == set()) else ""
+        return True, ("DNS 已更新：" + ", ".join(servers) + "；测试通过：" +
+                      "; ".join(f"{t['domain']}={t['ms']}ms" for t in tests) + tip)
+    except Exception as e:
+        return False, f"应用 DNS 异常：{e}"
+
+
+def dns_restore():
+    """还原最近一次 DNS 备份（resolv.conf / resolved.conf 取其最新）"""
+    if not os.path.isdir(SYS_BACKUP_DIR):
+        return False, "没有备份目录"
+    cands = sorted([f for f in os.listdir(SYS_BACKUP_DIR)
+                    if f.startswith("resolv.conf.") or f.startswith("resolved.conf.")], reverse=True)
+    if not cands:
+        return False, "没有可还原的 DNS 备份"
+    name = cands[0]
+    src = os.path.join(SYS_BACKUP_DIR, name)
+    mode = _dns_mode()
+    target = "/etc/systemd/resolved.conf" if name.startswith("resolved.conf.") else "/etc/resolv.conf"
+    _sys_backup(target)
+    try:
+        shutil.copy2(src, target)
+        if name.startswith("resolved.conf."):
+            subprocess.run(["systemctl", "restart", "systemd-resolved"], capture_output=True, text=True, timeout=60)
+        tests = dns_test()
+        return True, f"已还原 {src} → {target}；解析测试：" + "; ".join(
+            f"{t['domain']}={'OK' if t['ok'] else '失败'}" for t in tests)
+    except Exception as e:
+        return False, f"还原失败：{e}"
+
+
+# ---------- 时间与时区 ----------
+def time_status():
+    st = {"timezone": "", "time": "", "ntp": None, "ntp_synced": None, "rtc": ""}
+    try:
+        st["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["timedatectl", "show", "-p", "Timezone", "-p", "NTP", "-p", "NTPSynchronized"],
+                           capture_output=True, text=True, timeout=10)
+        if r.returncode == 0:
+            for ln in r.stdout.splitlines():
+                if "=" not in ln:
+                    continue
+                k, v = ln.split("=", 1)
+                if k == "Timezone":
+                    st["timezone"] = v.strip()
+                elif k == "NTP":
+                    st["ntp"] = v.strip() == "yes"
+                elif k == "NTPSynchronized":
+                    st["ntp_synced"] = v.strip() == "yes"
+    except Exception:
+        pass
+    if not st["timezone"]:
+        st["timezone"] = _read_text("/etc/timezone").strip()
+    if not st["timezone"]:
+        try:
+            st["timezone"] = os.path.basename(os.path.realpath("/etc/localtime"))
+        except Exception:
+            pass
+    return st
+
+
+def set_timezone(tz):
+    tz = str(tz or "").strip()
+    if not tz or "/" not in tz and tz.upper() != "UTC":
+        return False, "时区格式无效（如 Asia/Shanghai）"
+    if not os.path.isfile(os.path.join("/usr/share/zoneinfo", tz)):
+        return False, f"系统没有该时区数据：{tz}"
+    if os.path.isfile("/etc/timezone"):
+        _sys_backup("/etc/timezone")
+    try:
+        r = subprocess.run(["timedatectl", "set-timezone", tz], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            # 退化：软链 /etc/localtime
+            try:
+                if os.path.lexists("/etc/localtime"):
+                    os.remove("/etc/localtime")
+                os.symlink(os.path.join("/usr/share/zoneinfo", tz), "/etc/localtime")
+                with open("/etc/timezone", "w") as f:
+                    f.write(tz + "\n")
+            except Exception as e:
+                return False, f"设置时区失败：{(r.stderr or '').strip()[:120]} / {e}"
+        now = time_status().get("timezone", "")
+        return True, f"时区已设为 {now}（当前时间 {time_status().get('time')}）"
+    except Exception as e:
+        return False, f"设置时区异常：{e}"
+
+
+def set_ntp(enable):
+    try:
+        r = subprocess.run(["timedatectl", "set-ntp", "true" if enable else "false"],
+                           capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return False, "设置失败（可能需要 systemd-timesyncd/chrony 支持）：" + (r.stderr or r.stdout).strip()[:160]
+        st = time_status()
+        return True, f"NTP 自动同步已{'开启' if enable else '关闭'}（同步状态：{'已同步' if st.get('ntp_synced') else '未同步'})"
+    except Exception as e:
+        return False, f"设置 NTP 异常：{e}"
+
+
+# ---------- 主机名 ----------
+def set_hostname(name):
+    name = str(name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9]([A-Za-z0-9\-]{0,61}[A-Za-z0-9])?", name):
+        return False, "主机名无效（字母数字与连字符，不超过 63 字符，不能以连字符开头/结尾）"
+    old = os.uname().nodename
+    bak = _sys_backup("/etc/hosts") if os.path.isfile("/etc/hosts") else ""
+    try:
+        r = subprocess.run(["hostnamectl", "set-hostname", name], capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            subprocess.run(["hostname", name], capture_output=True, text=True, timeout=15)
+            try:
+                with open("/etc/hostname", "w") as f:
+                    f.write(name + "\n")
+            except Exception as e:
+                return False, f"写入 /etc/hostname 失败：{e}"
+        # 同步 /etc/hosts 里 127.0.1.1 行（Debian 系）
+        try:
+            txt = _read_text("/etc/hosts")
+            lines, hit = [], False
+            for ln in txt.splitlines():
+                if ln.startswith("127.0.1.1"):
+                    lines.append(f"127.0.1.1 {name}")
+                    hit = True
+                else:
+                    lines.append(ln)
+            if not hit:
+                lines.append(f"127.0.1.1 {name}")
+            with open("/etc/hosts", "w") as f:
+                f.write("\n".join(lines).rstrip("\n") + "\n")
+        except Exception:
+            pass
+        return True, f"主机名已从 {old} 改为 {name}" + ("（/etc/hosts 已备份）" if bak else "")
+    except Exception as e:
+        return False, f"设置主机名异常：{e}"
+
+
 # ------------------------------- 应用一键部署（v3.1.0） -------------------------------
 # 设计要点：
 # 1) 容器端口只绑 127.0.0.1，公网访问统一走反代的 80/443（证书/防火墙都由反代模块管）
@@ -5042,7 +5673,13 @@ def app_mem_guard(tpl_id=None, tpl=None):
             f"贸然部署会把机器打爆（实测会整机失联，连 SSH 都连不上）。"
             f"建议：① 先加 swap（推荐 1-2GB）；② 改用更轻的应用（如 Typecho）；③ 升级实例规格。")
     if total < soft or (swap == 0 and total < soft + 512):
-        tip = "本机没有 swap，建议先加 1-2GB swap" if swap == 0 else f"swap 仅 {swap}MB"
+        # 措辞要跟上现实：已经有 swap 就别再叫用户去加 swap（否则像没读自己的数据）
+        if swap == 0:
+            tip = "本机没有 swap，建议先加 1-2GB swap（「系统」页可一键加）"
+        elif swap < total:
+            tip = f"swap 仅 {swap}MB，可用内存 {mi.get('available_mb', 0)}MB"
+        else:
+            tip = f"已有 {swap}MB swap 兜底，可用内存 {mi.get('available_mb', 0)}MB"
         return True, "warn", (
             f"内存偏紧：本机 {total}MB、{tip}。{name} 在这种配置上首次启动（数据库初始化）会比较慢、"
             f"也可能因内存不足失败。建议加 swap 或升级规格；确认要继续吗？")
@@ -5257,6 +5894,12 @@ def app_data_dir(folder):
     return os.path.join(APP_DATA_BASE, folder)
 
 
+# ⚠ 单进程多线程（ThreadingHTTPServer + 后台任务线程）里，任何 store 的「读盘 → 改 → 写盘」
+# 都必须互斥：否则 A 线程读完快照、B 线程把记录删了，A 再整表写回 → **已删记录被复活**。
+# 这是 v3.1.1「用户删掉的应用又回来了」的同一类问题，v3.2.0 用全局锁收口。
+STORE_LOCK = threading.RLock()
+
+
 class AppStore:
     """应用记录：/etc/fwpanel/apps.json（权限 600）"""
 
@@ -5272,6 +5915,10 @@ class AppStore:
             return []
 
     def save(self):
+        with STORE_LOCK:
+            self._save_unlocked()
+
+    def _save_unlocked(self):
         try:
             os.makedirs(BASE_DIR, exist_ok=True)
             tmp = APPS_FILE + ".tmp"
@@ -5289,34 +5936,63 @@ class AppStore:
         return None
 
     def add(self, entry):
-        # ⚠ 一律「重新读盘 → 改 → 写回」：部署任务持有的是创建时的快照，
+        # ⚠ 一律「重新读盘 → 改 → 写回」+ 全程持锁：部署任务持有的是创建时的快照，
         # 若直接整表覆写，会把这期间用户删除的记录**复活**（单测已抓到此问题）
-        fresh = AppStore()
-        entry = dict(entry)
-        entry.setdefault("id", secrets.token_hex(6))
-        fresh.apps.append(entry)
-        fresh.save()
-        self.apps = fresh.apps
-        return entry
+        with STORE_LOCK:
+            fresh = AppStore()
+            entry = dict(entry)
+            entry.setdefault("id", secrets.token_hex(6))
+            fresh.apps.append(entry)
+            fresh._save_unlocked()
+            self.apps = fresh.apps
+            return entry
 
     def update(self, aid, **kw):
-        fresh = AppStore()
-        a = fresh.get(aid)
-        if not a:
-            self.apps = fresh.apps      # 记录已被删除：不要把它写回去
-            return None
-        a.update(kw)
-        fresh.save()
-        self.apps = fresh.apps
-        return a
+        with STORE_LOCK:
+            fresh = AppStore()
+            a = fresh.get(aid)
+            if not a:
+                self.apps = fresh.apps      # 记录已被删除：不要把它写回去
+                return None
+            a.update(kw)
+            # 落盘前再确认一次：本函数执行期间若记录已消失，宁可放弃写入也不要复活它
+            again = AppStore()
+            if not again.get(aid):
+                self.apps = again.apps
+                return None
+            fresh._save_unlocked()
+            self.apps = fresh.apps
+            return a
 
     def remove(self, aid):
-        fresh = AppStore()
-        keep = [a for a in fresh.apps if a.get("id") != aid]
-        if len(keep) != len(fresh.apps):
-            fresh.apps = keep
-            fresh.save()
-        self.apps = fresh.apps
+        with STORE_LOCK:
+            fresh = AppStore()
+            keep = [a for a in fresh.apps if a.get("id") != aid]
+            if len(keep) != len(fresh.apps):
+                fresh.apps = keep
+                fresh._save_unlocked()
+            self.apps = fresh.apps
+
+
+def _locked(fn):
+    """把 store 的写操作串行化：单进程多线程里「读盘→改→写盘」必须互斥（否则复活已删记录）"""
+    @functools.wraps(fn)
+    def wrapper(*a, **kw):
+        with STORE_LOCK:
+            return fn(*a, **kw)
+    return wrapper
+
+
+# 其余 store 同样存在「读-改-写」模式（规则/反代/站点），统一套锁
+for _cls, _meths in ((RuleStore, ("save", "add", "remove")),
+                     (ProxyStore, ("save", "add", "remove")),
+                     (SiteStore, ("save", "add", "update", "remove"))):
+    for _m in _meths:
+        _f = getattr(_cls, _m, None)
+        if _f is not None and not getattr(_f, "__wrapped_locked__", False):
+            _g = _locked(_f)
+            _g.__wrapped_locked__ = True
+            setattr(_cls, _m, _g)
 
 
 def create_docker_dirs():
@@ -5698,6 +6374,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_bruteforce()
         elif path == "/api/proxy":
             self._api_proxy()
+        elif path == "/api/system":
+            self._api_system()
+        elif path == "/api/system/dns/test":
+            self._api_system_dns_test()
         elif path == "/api/apps":
             self._api_apps()
         elif path == "/api/apps/port-check":
@@ -6362,6 +7042,22 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_cert_action(path.rsplit("/", 1)[1])
         elif path == "/api/proxy":
             self._api_proxy_add()
+        elif path == "/api/system/swap":
+            self._api_system_swap()
+        elif path == "/api/system/swappiness":
+            self._api_system_swappiness()
+        elif path == "/api/system/dns":
+            self._api_system_dns()
+        elif path == "/api/system/time":
+            self._api_system_time()
+        elif path == "/api/system/hostname":
+            self._api_system_hostname()
+        elif path == "/api/system/bbr":
+            self._api_bbr_enable()
+        elif path == "/api/system/ipv6":
+            self._api_ipv6()
+        elif path == "/api/system/panel-port":
+            self._api_panel_port()
         elif path == "/api/apps":
             self._api_app_create()
         elif path.startswith("/api/apps/"):
@@ -6868,6 +7564,94 @@ class PanelHandler(BaseHTTPRequestHandler):
         return s
 
     # ---------------- 应用（一键部署，v3.1.0） ----------------
+    # ---------------- 系统设置（v3.2.0） ----------------
+    def _api_system(self):
+        """GET /api/system → 本机设置总览"""
+        token = self._require_auth()
+        if token is None:
+            return
+        q = parse_qs(urlparse(self.path).query)
+        with_test = (q.get("dns_test") or ["0"])[0] in ("1", "true", "yes")
+        self._send(200, {
+            "info": system_info(),
+            "mem": mem_info(),
+            "swap": swap_status(),
+            "dns": dns_status(with_test=with_test),
+            "time": time_status(),
+            "hostname": os.uname().nodename,
+            "bbr": {"enabled": bbr_status(), "supported": bbr_available(), "kernel": os.uname().release},
+            "ipv6": ipv6_status(),
+            "panel_port": int(self.server.config.get("port", 0) or 0),
+            "backup_dir": SYS_BACKUP_DIR,
+        })
+
+    def _api_system_swap(self):
+        """POST /api/system/swap {size_mb} | {action: resize|off, size_mb?, purge?} → 长任务"""
+        token = self._require_auth()
+        if token is None:
+            return
+        data = self._read_json()
+        action = str(data.get("action", "create")).strip().lower()
+        if action == "create":
+            tid = start_task("system/swap", swap_create, data.get("size_mb"))
+        elif action == "resize":
+            tid = start_task("system/swap", swap_resize, data.get("size_mb"))
+        elif action == "off":
+            tid = start_task("system/swap", swap_off, bool(data.get("purge", True)))
+        else:
+            self._send(400, {"error": "action 必须是 create / resize / off"})
+            return
+        self._send(200, {"ok": True, "task": tid, "msg": "swap 操作已开始（后台执行）"})
+
+    def _api_system_swappiness(self):
+        token = self._require_auth()
+        if token is None:
+            return
+        data = self._read_json()
+        ok, msg = set_swappiness(data.get("value"))
+        self._send(200 if ok else 400, {"ok": ok, "msg": msg, "error": "" if ok else msg})
+
+    def _api_system_dns(self):
+        """POST /api/system/dns {servers, search} | {action:"restore"}"""
+        token = self._require_auth()
+        if token is None:
+            return
+        data = self._read_json()
+        if str(data.get("action", "")).lower() == "restore":
+            ok, msg = dns_restore()
+            self._send(200 if ok else 400, {"ok": ok, "msg": msg, "error": "" if ok else msg})
+            return
+        servers = data.get("servers") or []
+        search = data.get("search") or []
+        tid = start_task("system/dns", dns_apply, servers, search)
+        self._send(200, {"ok": True, "task": tid, "msg": "DNS 更新已开始（先备份、写完自动测试，失败自动回滚）"})
+
+    def _api_system_dns_test(self):
+        token = self._require_auth()
+        if token is None:
+            return
+        self._send(200, {"ok": True, "results": dns_test()})
+
+    def _api_system_time(self):
+        """POST /api/system/time {tz} | {action:"ntp", enable:bool}"""
+        token = self._require_auth()
+        if token is None:
+            return
+        data = self._read_json()
+        if str(data.get("action", "")).lower() == "ntp":
+            ok, msg = set_ntp(bool(data.get("enable")))
+        else:
+            ok, msg = set_timezone(data.get("tz"))
+        self._send(200 if ok else 400, {"ok": ok, "msg": msg, "error": "" if ok else msg})
+
+    def _api_system_hostname(self):
+        token = self._require_auth()
+        if token is None:
+            return
+        data = self._read_json()
+        ok, msg = set_hostname(data.get("name"))
+        self._send(200 if ok else 400, {"ok": ok, "msg": msg, "error": "" if ok else msg})
+
     def _api_apps(self):
         """GET /api/apps → 应用模板 + 已部署应用 + 环境状态"""
         token = self._require_auth()

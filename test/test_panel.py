@@ -5804,5 +5804,197 @@ class TestApps(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(os.stat(env).st_mode), 0o600, ".env 必须是 600")
 
 
+class TestSystem(unittest.TestCase):
+    """v3.2.0 系统页：swap / DNS / 时间 / 主机名 —— 校验、幂等、回滚语义"""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile as _tf
+        cls.tmp = _tf.mkdtemp(prefix="fwsys-")
+        cls.old = (panel.SWAP_FILE, panel.FSTAB_FILE, panel.SYS_BACKUP_DIR)
+        panel.SWAP_FILE = os.path.join(cls.tmp, "swapfile")
+        panel.FSTAB_FILE = os.path.join(cls.tmp, "fstab")
+        panel.SYS_BACKUP_DIR = os.path.join(cls.tmp, "backups")
+        with open(panel.FSTAB_FILE, "w") as f:
+            f.write("# fstab\nUUID=abc / ext4 defaults 0 1\n")
+        cls.cfg = make_cfg()
+        cls.store = panel.RuleStore(); cls.store.rules = []
+        cls.nft = panel.NFTManager(cls.store, cls.cfg)
+        cls.server = panel.PanelServer(("127.0.0.1", 17991), panel.PanelHandler,
+                                       cls.cfg, cls.store, cls.nft, panel.Auth(cls.cfg))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.token = ""
+        code, d = cls._req("POST", "/api/login", {"username": TEST_USER, "password": TEST_PASS})
+        cls.token = d.get("token", "")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown(); cls.server.server_close()
+        panel.SWAP_FILE, panel.FSTAB_FILE, panel.SYS_BACKUP_DIR = cls.old
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def _req(cls, method, path, data=None):
+        r = urllib.request.Request("http://127.0.0.1:17991" + path, method=method)
+        if cls.token:
+            r.add_header("Authorization", "Bearer " + cls.token)
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode(); r.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(r, body) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read())
+            except Exception:
+                return e.code, {}
+
+    def test_system_overview_api(self):
+        """GET /api/system 返回本机信息/swap/DNS/时间/BBR/IPv6/面板端口"""
+        code, d = self._req("GET", "/api/system")
+        self.assertEqual(code, 200, d)
+        for k in ("info", "mem", "swap", "dns", "time", "hostname", "bbr", "ipv6", "panel_port"):
+            self.assertIn(k, d, k)
+        self.assertTrue(d["info"].get("kernel"))
+        self.assertIn("supported", d["swap"])
+        self.assertIn("mode", d["dns"])
+
+    def test_fstab_swap_line_idempotent(self):
+        """fstab 写入幂等：重复添加只留一行；清理后其他行不受影响"""
+        ok, bak = panel._fstab_add_swap()
+        self.assertTrue(ok)
+        ok2, _ = panel._fstab_add_swap()
+        self.assertTrue(ok2)
+        txt = open(panel.FSTAB_FILE).read()
+        self.assertEqual(sum(1 for ln in txt.splitlines() if panel.SWAP_FILE in ln and "swap" in ln), 1, txt)
+        self.assertIn("UUID=abc", txt)
+        self.assertTrue(bak, "写入前必须备份 fstab")
+        self.assertTrue(os.path.isfile(bak))
+        panel._fstab_remove_swap()
+        txt2 = open(panel.FSTAB_FILE).read()
+        self.assertNotIn(panel.SWAP_FILE, txt2)
+        self.assertIn("UUID=abc", txt2)
+
+    def test_swap_create_validation(self):
+        """swap 大小范围 / 磁盘不足 / btrfs 环境都要拦住并给出原因"""
+        ok, msg = panel.swap_create(100)          # 太小
+        self.assertFalse(ok); self.assertIn("范围", msg)
+        ok, msg = panel.swap_create("abc")
+        self.assertFalse(ok)
+        real_disk, real_fstype = panel.shutil.disk_usage, panel._root_fstype
+        try:
+            class _DU: free = 100 * 1048576
+            panel.shutil.disk_usage = lambda p: _DU()
+            ok, msg = panel.swap_create(2048)
+            self.assertFalse(ok); self.assertIn("磁盘余量不足", msg)
+            panel.shutil.disk_usage = real_disk
+            panel._root_fstype = lambda: "btrfs"
+            ok, msg = panel.swap_create(1024)
+            self.assertFalse(ok); self.assertIn("btrfs", msg)
+        finally:
+            panel.shutil.disk_usage, panel._root_fstype = real_disk, real_fstype
+
+    def test_dns_validation_and_restore(self):
+        """DNS：非法地址拒绝；无备份时还原给出明确提示"""
+        ok, msg = panel.dns_apply([])
+        self.assertFalse(ok)
+        ok, msg = panel.dns_apply(["not-an-ip"])
+        self.assertFalse(ok); self.assertIn("无效", msg)
+        ok, msg = panel.dns_restore()
+        self.assertFalse(ok)      # 干净环境下没有备份
+        self.assertTrue(msg)
+
+    def test_dns_status_shape(self):
+        st = panel.dns_status()
+        self.assertIn("mode", st)
+        self.assertIn("servers", st)
+        self.assertTrue(panel.dns_test(["localhost"])[0]["ok"])
+
+    def test_time_and_hostname_validation(self):
+        ok, msg = panel.set_timezone("Not/AZone")
+        self.assertFalse(ok)
+        ok, msg = panel.set_timezone("")
+        self.assertFalse(ok)
+        st = panel.time_status()
+        self.assertIn("timezone", st)
+        for bad in ("", "-lead", "has space", "a" * 70):
+            ok, msg = panel.set_hostname(bad)
+            self.assertFalse(ok, bad)
+
+    def test_system_endpoint_validation(self):
+        code, d = self._req("POST", "/api/system/swappiness", {"value": 500})
+        self.assertEqual(code, 400, d)
+        code, d = self._req("POST", "/api/system/hostname", {"name": "bad name"})
+        self.assertEqual(code, 400, d)
+        code, d = self._req("POST", "/api/system/time", {"tz": "X/Y"})
+        self.assertEqual(code, 400, d)
+        # swap 走长任务（DRY_RUN 下参数校验在任务体里，接口应返回 task）
+        code, d = self._req("POST", "/api/system/swap", {"size_mb": 1024})
+        self.assertEqual(code, 200, d)
+        self.assertTrue(d.get("task"))
+        code, d = self._req("POST", "/api/system/swap", {"action": "bad"})
+        self.assertEqual(code, 400, d)
+
+
+    def test_dns_backup_unique_and_restore_really_restores(self):
+        """同一秒内两次备份不能互相覆盖；还原要回到上个备份的内容（真 bug 回归）"""
+        import tempfile as _tf
+        d = _tf.mkdtemp(prefix="fwbak-")
+        old_dir = panel.SYS_BACKUP_DIR
+        panel.SYS_BACKUP_DIR = d
+        try:
+            src = os.path.join(d, "resolv.conf")
+            with open(src, "w") as f:
+                f.write("nameserver 1.1.1.1\n")
+            b1 = panel._sys_backup(src)
+            with open(src, "w") as f:
+                f.write("nameserver 9.9.9.9\n")
+            b2 = panel._sys_backup(src)
+            self.assertNotEqual(b1, b2, "同一秒备份也不能互相覆盖")
+            self.assertEqual(open(b1).read().strip(), "nameserver 1.1.1.1")
+            self.assertEqual(open(b2).read().strip(), "nameserver 9.9.9.9")
+        finally:
+            panel.SYS_BACKUP_DIR = old_dir
+            shutil.rmtree(d, ignore_errors=True)
+
+
+    def test_app_update_cannot_resurrect_deleted_record(self):
+        """并发竞态回归：update 期间记录被删除，落盘不能把它写回来（v3.1.1「删了又回来」根因同类）"""
+        store = panel.AppStore()
+        entry = store.add({"template": "typecho", "name": "resurrect", "port": 19011,
+                           "folder": "typecho-19011", "data_dir": "/tmp/x"})
+        aid = entry["id"]
+        orig_load = panel.AppStore._load
+        state = {"n": 0}
+
+        def load(self):
+            d = orig_load(self)
+            state["n"] += 1
+            if state["n"] == 2:                 # 模拟另一线程在「读」与「写回」之间删掉了记录
+                panel.AppStore().remove(aid)
+            return d
+
+        panel.AppStore._load = load
+        try:
+            panel.AppStore().update(aid, status="ready")
+        finally:
+            panel.AppStore._load = orig_load
+        self.assertIsNone(panel.AppStore().get(aid), "已删除的应用不能被后台任务写回")
+
+    def test_store_operations_are_serialized(self):
+        """所有 store 写操作都在同一把锁里（避免整表覆写复活记录）"""
+        import threading as _th
+        self.assertTrue(hasattr(panel, "STORE_LOCK"))
+        seen = []
+
+        def work():
+            with panel.STORE_LOCK:
+                seen.append(1)
+        ths = [_th.Thread(target=work) for _ in range(8)]
+        [x.start() for x in ths]; [x.join() for x in ths]
+        self.assertEqual(len(seen), 8)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
