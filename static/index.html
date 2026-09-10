@@ -422,6 +422,58 @@ tr:hover td { background: var(--panel-solid); }
 .tag.deny { background: rgba(239,68,68,.15); color: var(--danger); }
 .tag.ip { background: rgba(61,139,253,.15); color: var(--accent); }
 .tag.prot { color: var(--warn); }
+/* ---- 网站模块（v3.0.0）---- */
+.site-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 12px; }
+.site-card { background: var(--card); border: var(--bdw) solid var(--border); border-radius: var(--r-card);
+  padding: 14px 16px; display: flex; flex-direction: column; gap: 7px;
+  box-shadow: var(--shadow-card), inset 0 1px 0 var(--hi); }
+.site-card.off { opacity: .62; }
+.site-card .sc-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.site-card .sc-dom { font-size: 15px; font-weight: 600; min-width: 0; word-break: break-all; }
+.site-card .sc-tags { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.site-card .sc-meta { color: var(--muted); font-size: 12px; word-break: break-all;
+  font-family: "0xProto", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.site-card .sc-stat { color: var(--muted); font-size: 12px; }
+/* 按钮行定高 + inline-flex 居中：彩色 emoji 字体行高 metric 大会把按钮撑高（v2.1.32 教训） */
+.site-card .sc-btns { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; margin-top: auto; padding-top: 4px; }
+.site-card .sc-btns .btn { flex: none; display: inline-flex; align-items: center; justify-content: center;
+  height: 28px; padding: 0 10px; }
+.tag.site { background: rgba(61,139,253,.15); color: var(--accent); }
+.tag.port { background: rgba(245,158,11,.15); color: var(--warn); }
+.tag.proxyt { background: rgba(139,92,246,.18); color: #a78bfa; }
+.tag.ont { background: rgba(34,197,94,.15); color: var(--accent2); }
+.tag.offt { background: rgba(148,163,184,.15); color: var(--muted); }
+.tag.warnt { background: rgba(245,158,11,.15); color: var(--warn); }
+.wz-dots { display: flex; gap: 6px; margin-bottom: 14px; }
+.wz-dot { height: 4px; flex: 1; border-radius: 2px; background: var(--border); }
+.wz-dot.active { background: linear-gradient(135deg, var(--btn-grad-a), var(--btn-grad-b)); }
+.wz-tip { color: var(--muted); font-size: 12px; margin-top: 8px; line-height: 1.7; }
+.wz-radio { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px;
+  border: var(--bdw) solid var(--border); border-radius: var(--r-sm); background: var(--input-bg);
+  cursor: pointer; margin-bottom: 8px; }
+.wz-radio input { width: auto; flex: none; margin-top: 2px; }
+.wz-radio b { display: block; font-size: 13px; margin-bottom: 2px; }
+.wz-radio span { color: var(--muted); font-size: 12px; }
+.wz-sum { background: var(--input-bg); border: 1px solid var(--border); border-radius: var(--r-sm);
+  padding: 10px 12px; font-size: 12px; line-height: 1.9; }
+.wz-sum code { font-family: "0xProto", ui-monospace, monospace; color: var(--accent); }
+.sf-crumb { font-family: "0xProto", ui-monospace, monospace; font-size: 12px; word-break: break-all; min-width: 0; }
+.sf-crumb a { color: var(--accent); cursor: pointer; text-decoration: none; }
+.sf-crumb a:hover { text-decoration: underline; }
+.sf-drop.drag { outline: 2px dashed var(--accent); outline-offset: 4px; border-radius: var(--r-sm); }
+.sf-name { display: inline-flex; align-items: center; gap: 6px; }
+.sf-name.dir { color: var(--accent); cursor: pointer; }
+.sf-name.link { color: var(--muted); }
+.sbar-wrap { display: flex; align-items: flex-end; gap: 8px; height: 132px; padding: 8px 10px;
+  background: var(--input-bg); border: 1px solid var(--border); border-radius: var(--r-sm); }
+.sbar { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: flex-end;
+  gap: 4px; height: 100%; min-width: 0; }
+.sbar .bar { width: 100%; max-width: 46px; border-radius: 4px 4px 0 0; min-height: 2px;
+  background: linear-gradient(180deg, var(--btn-grad-a), var(--btn-grad-b)); }
+.sbar .bar.empty { background: var(--border); }
+.sbar .lb, .sbar .vl { font-size: 11px; color: var(--muted); white-space: nowrap; }
+.sbar .vl { color: var(--text); }
+@media (max-width: 720px) { .site-cards { grid-template-columns: 1fr; } .sbar-wrap { height: 108px; } }
 .switch { position: relative; width: 38px; height: 20px; display: inline-block; }
 .switch input { opacity: 0; width: 0; height: 0; }
 .slider { position: absolute; inset: 0; background: var(--border); border-radius: 20px; transition: .2s; cursor: pointer; }
@@ -630,6 +682,7 @@ tr:hover td { background: var(--panel-solid); }
     <div class="tabs" id="sec_tabs">
       <button class="tab active" data-tab="overview" onclick="switchTab('overview')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V2h6v2M9 10h6M9 14h6M9 18h4"/></svg> 流量统计</button>
       <button class="tab" data-tab="fw" onclick="switchTab('fw')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3l7 3v5c0 5-3 8-7 10-4-2-7-5-7-10V6z"/></svg> 防火墙</button>
+      <button class="tab" data-tab="site" onclick="switchTab('site')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 13h.01M11 13h.01M7 17h7"/></svg> 网站</button>
       <button class="tab" data-tab="ssh" onclick="switchTab('ssh')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></svg> SSH 安全</button>
       <button class="tab" data-tab="px" onclick="switchTab('px')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3c2.5 2.5 2.5 15 0 18M12 3c-2.5 2.5-2.5 15 0 18"/></svg> 反代证书</button>
       <button class="tab" data-tab="dk" onclick="switchTab('dk')"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="3"/><path d="M3 9h18M9 21V9"/></svg> Docker</button>
@@ -801,6 +854,25 @@ tr:hover td { background: var(--panel-solid); }
         <tbody id="cert_rows"><tr><td colspan="3" style="color:var(--muted)">暂无独立申请记录</td></tr></tbody>
       </table>
       </div>
+    </div>
+
+    <div class="panel" data-sec="site">
+      <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M7 13h.01M11 13h.01M7 17h7"/></svg> 网站</h2>
+      <div id="site_status" style="color:var(--muted);font-size:12px;margin-bottom:10px">检测中...</div>
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:12px">
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <button class="btn" onclick="openNewSite()">＋ 新建网站</button>
+          <span style="color:var(--muted);font-size:12px">站点根目录：<code id="site_root_label" style="font-family:'0xProto',ui-monospace,monospace">/var/www</code></span>
+          <button class="btn mini ghost" onclick="openSiteRoot()">修改</button>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+          <input id="site_search" placeholder="🔍 搜索网站（域名 / 目录 / 备注）" style="width:220px" oninput="siteFilterChanged()">
+          <button class="btn mini ghost" onclick="loadSites()">刷新</button>
+        </div>
+      </div>
+      <div class="site-cards" id="site_cards"><div style="color:var(--muted);font-size:13px">加载中...</div></div>
+      <div id="site_empty" style="display:none;color:var(--muted);font-size:13px">还没有网站，点「＋ 新建网站」创建一个</div>
+      <div style="color:var(--muted);font-size:12px;margin-top:12px">静态站：把网页文件放进站点目录即可访问；反代站：内容来自本机端口/容器，在此统一查看（编辑请到「反代证书」）。建站会自动放行 80/443，并在需要时申请证书</div>
     </div>
 
     <div class="panel" data-sec="dk">
@@ -1286,6 +1358,126 @@ tr:hover td { background: var(--panel-solid); }
 </div>
 
 <!-- 通用确认弹窗（面板风格） -->
+<!-- ===== 网站模块弹窗 ===== -->
+<div id="snew_modal" class="modal-mask hidden">
+  <div class="modal" style="max-width:580px;width:94vw">
+    <h3>新建网站</h3>
+    <div class="wz-dots" id="wz_dots"></div>
+    <div id="wz_body"></div>
+    <div class="btnrow" style="margin-top:16px">
+      <button class="btn ghost" onclick="closeSiteNew()">取消</button>
+      <button class="btn ghost" id="wz_prev" onclick="wzStep(-1)">上一步</button>
+      <button class="btn" id="wz_next" onclick="wzStep(1)">下一步</button>
+    </div>
+  </div>
+</div>
+
+<div id="sroot_modal" class="modal-mask hidden">
+  <div class="modal" style="max-width:520px;width:94vw">
+    <h3>站点根目录</h3>
+    <div class="form-row"><input id="sroot_input" placeholder="/var/www" style="font-family:'0xProto',ui-monospace,monospace"></div>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:10px">新建的静态站会放在 <code style="font-family:'0xProto',ui-monospace,monospace">&lt;根目录&gt;/&lt;域名&gt;</code>，端口站放在 <code style="font-family:'0xProto',ui-monospace,monospace">&lt;根目录&gt;/port-&lt;端口&gt;</code>。修改只影响之后新建的站点，已有网站不受影响</div>
+    <div class="btnrow">
+      <button class="btn ghost" onclick="closeSiteRoot()">取消</button>
+      <button class="btn" onclick="saveSiteRoot()">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="sset_modal" class="modal-mask hidden">
+  <div class="modal" style="max-width:540px;width:94vw">
+    <h3>网站设置</h3>
+    <div id="sset_body"></div>
+    <div class="btnrow" style="margin-top:14px">
+      <button class="btn ghost" onclick="closeSiteSet()">取消</button>
+      <button class="btn" onclick="saveSiteSet()">保存</button>
+    </div>
+  </div>
+</div>
+
+<div id="sfile_modal" class="modal-mask hidden">
+  <div class="modal" style="max-width:900px;width:94vw">
+    <h3 id="sf_title">文件管理</h3>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
+      <div class="sf-crumb" id="sf_crumb"></div>
+      <div style="display:flex;gap:6px;flex-wrap:wrap">
+        <button class="btn mini" onclick="sfUploadPick()">上传文件</button>
+        <button class="btn mini ghost" onclick="sfMkdir()">新建目录</button>
+        <button class="btn mini ghost" onclick="sfNewFile()">新建文件</button>
+        <button class="btn mini ghost" onclick="sfLoad(sfPath)">刷新</button>
+      </div>
+    </div>
+    <input type="file" id="sf_upload" multiple style="display:none" onchange="sfUploadDo(this.files)">
+    <div class="sf-drop" id="sf_drop">
+      <div class="table-wrap" style="max-height:50vh;overflow:auto">
+        <table>
+          <thead><tr><th>名称</th><th>大小</th><th>权限</th><th>修改时间</th><th style="width:260px">操作</th></tr></thead>
+          <tbody id="sf_rows"><tr><td colspan="5" style="color:var(--muted)">加载中...</td></tr></tbody>
+        </table>
+      </div>
+      <div id="sf_hint" style="color:var(--muted);font-size:12px;margin-top:6px">可直接把文件拖到这里上传（单文件 ≤ 32MB）</div>
+    </div>
+    <div class="btnrow" style="margin-top:12px"><button class="btn ghost" onclick="closeSiteFiles()">关闭</button></div>
+  </div>
+</div>
+
+<div id="sedit_modal" class="modal-mask hidden">
+  <div class="modal" style="max-width:900px;width:94vw">
+    <h3 id="se_title">编辑文件</h3>
+    <div id="se_path" style="color:var(--muted);font-size:12px;margin-bottom:6px;word-break:break-all"></div>
+    <textarea id="se_text" spellcheck="false" style="width:100%;height:50vh;font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.55;resize:vertical;box-sizing:border-box"></textarea>
+    <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:10px">
+      <span id="se_info" style="color:var(--muted);font-size:12px"></span>
+      <div style="display:flex;gap:8px">
+        <button class="btn ghost" onclick="closeSiteEdit()">取消</button>
+        <button class="btn" onclick="sfSaveEdit()">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="slog_modal" class="modal-mask hidden">
+  <div class="modal" style="max-width:920px;width:94vw">
+    <h3 id="sl_title">站点日志</h3>
+    <div style="display:flex;gap:6px;margin-bottom:12px">
+      <button class="btn mini" id="sl_btn_log" onclick="slShow('log')">访问日志</button>
+      <button class="btn mini ghost" id="sl_btn_stat" onclick="slShow('stat')">访问统计</button>
+    </div>
+    <div id="sl_log_pane">
+      <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:8px">
+        <select id="sl_kind" style="width:auto" onchange="loadSiteLogs()"><option value="access">access.log</option><option value="error">error.log</option></select>
+        <select id="sl_lines" style="width:auto" onchange="loadSiteLogs()"><option>100</option><option selected>200</option><option>500</option><option>1000</option></select>
+        <label style="display:flex;align-items:center;gap:4px;font-size:12px;color:var(--muted);cursor:pointer"><input type="checkbox" id="sl_auto" onchange="slAutoToggle()"> 自动刷新</label>
+        <button class="btn mini ghost" onclick="slCopy()">复制</button>
+        <span id="sl_file" style="color:var(--muted);font-size:12px;word-break:break-all"></span>
+      </div>
+      <pre id="sl_text" style="background:var(--input-bg);border:1px solid var(--border);border-radius:var(--r-sm);padding:10px;max-height:52vh;overflow:auto;margin:0;font-family:'0xProto',ui-monospace,monospace;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all"></pre>
+    </div>
+    <div id="sl_stat_pane" style="display:none">
+      <div class="cards" style="margin-bottom:14px">
+        <div class="card"><div class="k">今日 PV</div><div class="v" id="st_pv">-</div></div>
+        <div class="card"><div class="k">今日 UV</div><div class="v" id="st_uv">-</div></div>
+        <div class="card"><div class="k">昨日 PV</div><div class="v" id="st_pv_y">-</div></div>
+        <div class="card"><div class="k">昨日 UV</div><div class="v" id="st_uv_y">-</div></div>
+      </div>
+      <div style="font-size:13px;font-weight:600;margin-bottom:6px">近 7 天访问量</div>
+      <div id="st_bars" class="sbar-wrap"></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-top:14px">
+        <div>
+          <div style="font-size:13px;font-weight:600;margin-bottom:6px">访问最多的地址</div>
+          <div class="table-wrap"><table><tbody id="st_urls"><tr><td style="color:var(--muted)">-</td></tr></tbody></table></div>
+        </div>
+        <div>
+          <div style="font-size:13px;font-weight:600;margin-bottom:6px">状态码分布</div>
+          <div class="table-wrap"><table><tbody id="st_codes"><tr><td style="color:var(--muted)">-</td></tr></tbody></table></div>
+        </div>
+      </div>
+      <div id="st_hint" style="color:var(--muted);font-size:12px;margin-top:10px"></div>
+    </div>
+    <div class="btnrow" style="margin-top:12px"><button class="btn ghost" onclick="closeSiteLogs()">关闭</button></div>
+  </div>
+</div>
+
 <div id="cfm_modal" class="modal-mask hidden">
   <div class="modal" style="width:380px">
     <h3 id="cfm_title">确认操作</h3>
@@ -1710,7 +1902,8 @@ function enterFed(n) {
   $("btn_fed").style.display = "none";
   $("tab_fed").style.display = "none";
   const saved = localStorage.getItem("fw_sec");
-  switchTab(saved && ["overview", "fw", "ssh", "px", "dk"].indexOf(saved) >= 0 ? saved : "overview");
+  sitesLoaded = false;                        // 网站列表切到节点数据
+  switchTab(saved && ["overview", "fw", "site", "ssh", "px", "dk"].indexOf(saved) >= 0 ? saved : "overview");
   refreshAll();
   toast("已进入远程管理：" + n.name, "okk");
 }
@@ -1720,6 +1913,7 @@ function exitFed() {
   $("fed_banner").classList.add("hidden");
   setFedTabsTop();
   $("btn_fed").style.display = ""; $("tab_fed").style.display = "";
+  sitesLoaded = false;                        // 回本机：网站列表重新按本机加载
   switchTab("fed");   // 钩子自动:未渲染则渲染,已渲染则静默刷新节点状态
   refreshAll();
   toast("已返回本机", "okk");
@@ -2049,6 +2243,661 @@ setTheme(localStorage.getItem("fw_theme") || "dark");
 applyZoomForce();
 
 /* ---------- 分组导航 tabs ---------- */
+/* ---------- 网站（站点管理，v3.0.0） ---------- */
+let sitesData = [];          // 网站列表（静态站/端口站 + 反代站合并视图）
+let siteRoot = "/var/www";
+let sitesLoaded = false;
+let wzState = null;          // 新建向导状态
+let sfSite = null;           // 文件管理当前站点
+let sfPath = "";             // 文件管理当前目录（站点内相对路径）
+let sePath = "";             // 在线编辑中的文件相对路径
+let slSite = null;           // 日志弹窗当前站点
+let slTimer = null;          // 日志自动刷新定时器
+
+function qjs(v) { return JSON.stringify(v == null ? "" : v); }
+
+/* 行内按钮统一构造：避免手写 onclick 属性时引号层级出错 */
+function btnHtml(label, code, cls) {
+  return '<button class="btn mini ' + (cls || "ghost") + '" onclick="' + code + '">' + label + "</button>";
+}
+
+async function loadSites() {
+  const box = $("site_cards");
+  try {
+    const d = await api("GET", "/api/sites");
+    sitesData = d.sites || [];
+    siteRoot = d.site_root || "/var/www";
+    sitesLoaded = true;
+    $("site_root_label").textContent = siteRoot;
+    const ng = d.nginx || {};
+    $("site_status").textContent = ng.installed
+      ? (ng.active ? "Nginx 运行中" : "Nginx 已安装但未运行（systemctl start nginx）")
+      : "未检测到 Nginx：先在「反代证书」里一键安装";
+    renderSites();
+  } catch (e) {
+    box.innerHTML = '<div style="color:var(--danger);font-size:13px">加载失败：' + esc(e.message) + "</div>";
+  }
+}
+
+function siteFilterChanged() { renderSites(); }
+
+function renderSites() {
+  const kw = ($("site_search").value || "").trim().toLowerCase();
+  const list = sitesData.filter(s => !kw || [s.domain, s.root, s.upstream, s.note, s.label]
+    .join(" ").toLowerCase().indexOf(kw) >= 0);
+  const box = $("site_cards");
+  $("site_empty").style.display = sitesData.length ? "none" : "";
+  if (!list.length) {
+    box.innerHTML = sitesData.length ? '<div style="color:var(--muted);font-size:13px">没有匹配的网站</div>' : "";
+    return;
+  }
+  box.innerHTML = list.map(siteCardHtml).join("");
+  list.forEach(s => { if (s.source !== "proxy") siteStatMini(s.id); });
+}
+
+function siteCardHtml(s) {
+  const isProxy = s.source === "proxy";
+  const typeCls = s.type === "static" ? "site" : (s.type === "port" ? "port" : "proxyt");
+  const c = s.cert || {};
+  const tags = ['<span class="tag ' + typeCls + '">' + esc(s.label || "网站") + "</span>",
+                s.enabled ? '<span class="tag ont">启用中</span>' : '<span class="tag offt">已停用</span>'];
+  if (c.on) {
+    const d = (c.days === null || c.days === undefined) ? null : c.days;
+    tags.push('<span class="tag ' + (d !== null && d <= 14 ? "warnt" : "ont") + '">🔒 '
+      + (d === null ? "证书有效" : "证书剩 " + d + " 天") + "</span>");
+  } else if (!isProxy && s.type === "static") {
+    tags.push('<span class="tag offt">未启用 HTTPS</span>');
+  }
+  const meta = isProxy ? esc(s.upstream || "") : esc(s.root || "");
+  const btns = [btnHtml("🌐 打开", "window.open(" + qjs(s.url) + ",'_blank')", "")];
+  if (isProxy) {
+    btns.push(btnHtml("⚙ 到反代模块", "switchTab('px')"));
+  } else {
+    btns.push(btnHtml("📁 文件", "openSiteFiles(" + qjs(s.id) + ")"));
+    btns.push(btnHtml("📜 日志", "openSiteLogs(" + qjs(s.id) + ")"));
+    if (s.domain) btns.push(btnHtml("🔒 证书", "issueSiteCert(" + qjs(s.id) + ")"));
+    btns.push(btnHtml("⚙ 设置", "openSiteSet(" + qjs(s.id) + ")"));
+    btns.push(btnHtml("✕ 删除", "deleteSite(" + qjs(s.id) + "," + qjs(s.domain || ("端口 " + s.port)) + ")", "danger"));
+  }
+  const sw = '<label class="switch" title="' + (isProxy ? "请在反代模块启停" : "启停网站") + '">'
+    + '<input type="checkbox" ' + (s.enabled ? "checked" : "") + (isProxy ? " disabled" : "")
+    + ' onchange="toggleSite(' + qjs(s.id) + ')"><span class="slider"></span></label>';
+  return '<div class="site-card' + (s.enabled ? "" : " off") + '">'
+    + '<div class="sc-head"><span class="sc-dom">' + esc(s.domain || ("端口 " + s.port)) + "</span>"
+    + '<span style="margin-left:auto">' + sw + "</span></div>"
+    + '<div class="sc-tags">' + tags.join("") + "</div>"
+    + '<div class="sc-meta">' + meta + (isProxy ? "" : (s.type === "port" ? ("　监听 " + s.port) : "")) + "</div>"
+    + '<div class="sc-stat" id="scstat_' + esc(s.id) + '">' + (isProxy ? "由端口 " + (s.domain || "") : "今日 PV —") + "</div>"
+    + (s.enabled && isProxy ? "" : "")
+    + '<div class="sc-btns">' + btns.join("") + "</div></div>";
+}
+
+async function siteStatMini(id) {
+  const el = $("scstat_" + id);
+  if (!el) return;
+  try {
+    const d = await api("GET", "/api/sites/" + id + "/stats?days=1");
+    if ($("scstat_" + id)) $("scstat_" + id).textContent = "今日 PV " + d.today.pv + " · UV " + d.today.uv;
+  } catch (e) { if ($("scstat_" + id)) $("scstat_" + id).textContent = "今日 PV —"; }
+}
+
+/* ---------- 新建向导 ---------- */
+function openNewSite() {
+  wzState = { step: 0, type: "static", domain: "", port: 8080, root: "",
+              cert_mode: "none", cert_ref: "", force_https: true, block_ip: true, note: "" };
+  $("snew_modal").classList.remove("hidden");
+  wzRender();
+}
+function closeSiteNew() { $("snew_modal").classList.add("hidden"); wzState = null; }
+
+function wzCollect() {
+  const st = wzState;
+  if (!st) return true;
+  if (st.step === 1) {
+    if (st.type === "static") {
+      const d = ($("wz_domain").value || "").trim().toLowerCase();
+      if (!d) { toast("请填写域名", "err"); return false; }
+      if (!/^[a-zA-Z0-9.*_-]+$/.test(d)) { toast("域名格式无效（字母/数字/点/短横线）", "err"); return false; }
+      st.domain = d;
+    } else {
+      const p = parseInt($("wz_port").value || "0", 10);
+      if (!(p >= 1024 && p <= 65535)) { toast("端口范围 1024-65535", "err"); return false; }
+      st.port = p;
+    }
+  } else if (st.step === 2) {
+    st.root = ($("wz_root").value || "").trim();
+  } else if (st.step === 3) {
+    st.cert_mode = $("wz_cert").value;
+    st.cert_ref = $("wz_certref") && $("wz_certref").style.display !== "none" ? ($("wz_certref").value || "") : "";
+    st.force_https = $("wz_force").checked;
+    st.block_ip = $("wz_blockip").checked;
+  } else if (st.step === 4) {
+    st.note = ($("wz_note").value || "").trim();
+  }
+  return true;
+}
+
+function wzStep(d) {
+  if (!wzState) return;
+  if (d > 0 && !wzCollect()) return;
+  if (d > 0 && wzState.step === 4) { wzCreate(); return; }
+  wzState.step = Math.max(0, Math.min(4, wzState.step + d));
+  wzRender();
+}
+
+function wzRender() {
+  const st = wzState;
+  if (!st) return;
+  $("wz_dots").innerHTML = [0, 1, 2, 3, 4].map(i =>
+    '<div class="wz-dot' + (i <= st.step ? " active" : "") + '"></div>').join("");
+  $("wz_prev").style.display = st.step === 0 ? "none" : "";
+  $("wz_next").textContent = st.step === 4 ? "创建网站" : "下一步";
+  const b = $("wz_body");
+  if (st.step === 0) {
+    b.innerHTML = '<div class="form-row" style="display:block">'
+      + '<label class="wz-radio"><input type="radio" name="wz_type" value="static"' + (st.type === "static" ? " checked" : "")
+      + '><span><b>静态站（有域名）</b><span>上传 HTML/CSS/JS 就能访问；可自动签发证书并强制 HTTPS</span></span></label>'
+      + '<label class="wz-radio"><input type="radio" name="wz_type" value="port"' + (st.type === "port" ? " checked" : "")
+      + '><span><b>端口站（无域名）</b><span>用 服务器IP:端口 访问，适合测试或内网；不需要域名与证书</span></span></label>'
+      + "</div>";
+    b.querySelectorAll('input[name="wz_type"]').forEach(el => {
+      el.addEventListener("change", () => { if (wzState) { wzState.type = el.value; wzRender(); } });
+    });
+  } else if (st.step === 1) {
+    b.innerHTML = st.type === "static"
+      ? '<div class="form-row"><input id="wz_domain" placeholder="域名（如 www.example.com）" value="' + esc(st.domain) + '"></div>'
+        + '<div class="wz-tip">解析前请先在域名服务商把 A 记录指到本机 IP，否则证书签发会失败（也可以下一步先选「暂不签证书」）</div>'
+      : '<div class="form-row"><input id="wz_port" placeholder="监听端口（1024-65535）" inputmode="numeric" value="' + esc(st.port) + '"></div>'
+        + '<div class="wz-tip">不能占用面板自身端口、SSH 保护端口，也不能和其它站点重复。创建后自动放行该端口</div>';
+  } else if (st.step === 2) {
+    const def = (st.type === "static") ? (siteRoot + "/" + (st.domain || "<域名>")) : (siteRoot + "/port-" + st.port);
+    b.innerHTML = '<div class="form-row"><input id="wz_root" placeholder="留空 = ' + esc(def) + '" value="' + esc(st.root) + '"'
+      + ' style="font-family:\'0xProto\',ui-monospace,monospace"></div>'
+      + '<div class="wz-tip">默认放在站点根目录下（当前 <code style="font-family:\'0xProto\',monospace">' + esc(siteRoot) + "</code>）。目录不存在会自动创建，并生成一个初始 index.html</div>";
+  } else if (st.step === 3) {
+    const certs = st.certs || [];
+    b.innerHTML = (st.type === "static" ? (
+      '<div class="form-row"><select id="wz_cert" onchange="wzCertChange()">'
+      + '<option value="none"' + (st.cert_mode === "none" ? " selected" : "") + '>暂不签证书（先跑 HTTP）</option>'
+      + '<option value="auto"' + (st.cert_mode === "auto" ? " selected" : "") + '>自动签发 Let\'s Encrypt（HTTP-01，需域名已解析到本机）</option>'
+      + '<option value="ref"' + (st.cert_mode === "ref" ? " selected" : "") + '>引用已有证书（含泛域名）</option>'
+      + "</select>"
+      + '<select id="wz_certref" style="display:' + (st.cert_mode === "ref" ? "" : "none") + ';margin-top:8px">'
+      + (certs.length ? certs.map(c => '<option value="' + esc(c.ref) + '"' + (st.cert_ref === c.ref ? " selected" : "") + ">"
+          + esc(c.ref) + (c.days === null || c.days === undefined ? "" : "（剩 " + c.days + " 天）") + "</option>").join("")
+        : '<option value="">（还没有已申请的证书）</option>')
+      + "</select></div>"
+      + '<label style="display:flex;align-items:center;gap:6px;font-size:13px;margin:10px 0;cursor:pointer"><input type="checkbox" id="wz_force"' + (st.force_https ? " checked" : "") + "> 强制 HTTPS（HTTP 自动跳转，仅证书就绪后生效）</label>"
+      + '<label style="display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer"><input type="checkbox" id="wz_blockip"' + (st.block_ip ? " checked" : "") + "> 禁止 IP 直连（只允许用域名访问）</label>"
+    ) : '<div class="wz-tip">端口站不需要证书，也不需要 IP 守卫：直接按 服务器IP:端口 访问</div>');
+    if (!$("wz_blockip")) {
+      const d = document.createElement("input"); d.type = "checkbox"; d.id = "wz_blockip"; d.checked = false; d.style.display = "none";
+      b.appendChild(d);
+    }
+    if (!$("wz_force")) {
+      const d = document.createElement("input"); d.type = "checkbox"; d.id = "wz_force"; d.checked = false; d.style.display = "none";
+      b.appendChild(d);
+    }
+  } else if (st.step === 4) {
+    const lines = [];
+    lines.push("类型：<code>" + (st.type === "static" ? "静态站" : "端口站") + "</code>");
+    lines.push("访问地址：<code>" + esc(st.type === "static" ? ("http" + (st.cert_mode === "auto" ? "s" : "") + "://" + st.domain)
+      : ("http://服务器IP:" + st.port)) + "</code>");
+    lines.push("目录：<code>" + esc(st.root || (st.type === "static" ? (siteRoot + "/" + st.domain) : (siteRoot + "/port-" + st.port))) + "</code>");
+    if (st.type === "static") {
+      lines.push("证书：" + (st.cert_mode === "auto" ? "自动签发 Let's Encrypt（后台执行，签完自动启用 HTTPS）"
+        : (st.cert_mode === "ref" && st.cert_ref ? ("引用 " + st.cert_ref) : "暂不签")));
+      lines.push("强制 HTTPS：" + (st.force_https ? "是" : "否") + "　IP 直连：" + (st.block_ip ? "禁止" : "允许"));
+    }
+    lines.push("将自动放行端口：<code>" + (st.type === "static" ? "80" + (st.cert_mode === "auto" || st.cert_ref ? "、443" : "") : String(st.port)) + "</code>");
+    b.innerHTML = '<div class="wz-sum">' + lines.join("<br>") + "</div>"
+      + '<div class="form-row" style="margin-top:10px"><input id="wz_note" placeholder="备注（可选）" value="' + esc(st.note) + '"></div>';
+  }
+}
+
+function wzCertChange() {
+  if (!wzState) return;
+  const v = $("wz_cert").value;
+  wzState.cert_mode = v;
+  const ref = $("wz_certref");
+  if (ref) ref.style.display = (v === "ref") ? "" : "none";
+}
+
+async function wzCreate() {
+  if (!wzState) return;
+  const st = wzState;
+  const body = { type: st.type, force_https: st.force_https, block_ip: st.block_ip, note: st.note };
+  if (st.type === "static") {
+    body.domain = st.domain;
+    body.cert_mode = st.cert_mode === "ref" ? "none" : st.cert_mode;
+    if (st.cert_mode === "ref" && st.cert_ref) { body.cert_mode = "auto"; body.cert_ref = st.cert_ref; }
+  } else {
+    body.port = st.port; body.cert_mode = "none";
+  }
+  if (st.root) body.root = st.root;
+  const btn = $("wz_next");
+  btn.disabled = true; btn.textContent = "创建中...";
+  try {
+    const d = await api("POST", "/api/sites", body);
+    closeSiteNew();
+    toast(d.msg || "网站已创建", "okk");
+    await loadSites();
+    if (d.cert_task) pollSiteCert(d.cert_task);
+  } catch (e) {
+    toast(e.message, "err");
+  } finally {
+    btn.disabled = false; btn.textContent = "下一步";
+  }
+}
+
+async function pollSiteCert(tid) {
+  for (let i = 0; i < 90; i++) {
+    await new Promise(r => setTimeout(r, 2000));
+    let t;
+    try { t = await api("GET", "/api/tasks/" + tid); } catch (e) { if (e.message !== "未登录") continue; return; }
+    if (t.status === "ok") { toast("证书已签发，HTTPS 已启用", "okk"); loadSites(); return; }
+    if (t.status === "error") { toast("证书签发失败：" + (t.msg || ""), "err"); return; }
+  }
+}
+
+/* ---------- 站点设置 / 根目录 / 启停 / 删除 / 证书 ---------- */
+function openSiteSet(id) {
+  const s = sitesData.find(x => x.id === id);
+  if (!s) return;
+  const isPort = s.type === "port";
+  $("sset_body").innerHTML =
+    (isPort ? '<div class="form-row"><input id="ss_port" value="' + esc(s.port) + '" inputmode="numeric" placeholder="监听端口"></div>'
+            : '<div class="form-row"><input id="ss_domain" value="' + esc(s.domain) + '" placeholder="域名"></div>')
+    + '<div class="form-row"><input id="ss_root" value="' + esc(s.root) + '" placeholder="站点目录（绝对路径）" style="font-family:\'0xProto\',ui-monospace,monospace"></div>'
+    + (isPort ? "" :
+      '<div class="form-row"><select id="ss_cert"><option value="none"' + (s.cert_mode !== "auto" ? " selected" : "") + ">暂不签证书</option>"
+      + '<option value="auto"' + (s.cert_mode === "auto" ? " selected" : "") + ">自动签发 / 使用 Let's Encrypt</option></select></div>"
+      + '<label style="display:flex;align-items:center;gap:6px;font-size:13px;margin:8px 0;cursor:pointer"><input type="checkbox" id="ss_force"' + (s.force_https ? " checked" : "") + "> 强制 HTTPS</label>"
+      + '<label style="display:flex;align-items:center;gap:6px;font-size:13px;margin-bottom:8px;cursor:pointer"><input type="checkbox" id="ss_blockip"' + (s.block_ip ? " checked" : "") + "> 禁止 IP 直连</label>")
+    + '<div class="form-row"><input id="ss_note" value="' + esc(s.note || "") + '" placeholder="备注（可选）"></div>'
+    + '<div class="wz-tip">改目录只切换 nginx 指向并建好新目录骨架，<b>不会搬运或删除旧目录里的文件</b></div>';
+  $("sset_modal").dataset.sid = id;
+  $("sset_modal").classList.remove("hidden");
+}
+function closeSiteSet() { $("sset_modal").classList.add("hidden"); }
+
+async function saveSiteSet() {
+  const id = $("sset_modal").dataset.sid;
+  const s = sitesData.find(x => x.id === id);
+  if (!s) return;
+  const body = { root: ($("ss_root").value || "").trim(), note: ($("ss_note").value || "").trim() };
+  if (s.type === "port") body.port = parseInt($("ss_port").value || "0", 10);
+  else {
+    body.domain = ($("ss_domain").value || "").trim().toLowerCase();
+    body.cert_mode = $("ss_cert").value;
+    body.force_https = $("ss_force").checked;
+    body.block_ip = $("ss_blockip").checked;
+  }
+  try {
+    const d = await api("POST", "/api/sites/" + id, body);
+    closeSiteSet();
+    toast(d.msg || "已保存", "okk");
+    loadSites();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function openSiteRoot() {
+  $("sroot_input").value = siteRoot;
+  $("sroot_modal").classList.remove("hidden");
+}
+function closeSiteRoot() { $("sroot_modal").classList.add("hidden"); }
+async function saveSiteRoot() {
+  const root = ($("sroot_input").value || "").trim();
+  if (!root) { toast("请填写绝对路径", "err"); return; }
+  try {
+    const d = await api("POST", "/api/sites/root", { root });
+    closeSiteRoot();
+    toast(d.msg || "已保存", "okk");
+    loadSites();
+  } catch (e) { toast(e.message, "err"); }
+}
+
+async function toggleSite(id) {
+  try {
+    const d = await api("POST", "/api/sites/" + id + "/toggle", {});
+    toast(d.msg || "已切换", "okk");
+    loadSites();
+  } catch (e) { toast(e.message, "err"); loadSites(); }
+}
+
+function deleteSite(id, label) {
+  const cb = document.createElement("label");
+  cb.style.cssText = "display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer;margin-top:4px";
+  cb.innerHTML = '<input type="checkbox" id="del_purge"> 同时删除站点目录与里面的文件（不可恢复）';
+  confirmPanel("确定删除网站「" + label + "」？默认只删除站点配置，文件保留在服务器上。",
+    async () => {
+      const purge = $("del_purge") && $("del_purge").checked ? "?purge=1" : "";
+      try {
+        const d = await api("DELETE", "/api/sites/" + id + purge);
+        toast(d.msg || "已删除", "okk");
+        loadSites();
+      } catch (e) { toast(e.message, "err"); }
+    }, "删除网站", cb);
+}
+
+function issueSiteCert(id) {
+  const s = sitesData.find(x => x.id === id);
+  if (!s) return;
+  confirmPanel("为 " + s.domain + " 申请 / 续签证书？（HTTP-01 验证，需要域名已解析到本机、80 端口可达）",
+    async () => {
+      try {
+        const d = await api("POST", "/api/sites/" + id + "/cert", {});
+        toast(d.msg || "已开始申请", "");
+        if (d.task) pollSiteCert(d.task);
+      } catch (e) { toast(e.message, "err"); }
+    }, "申请证书");
+}
+
+/* ---------- 文件管理 ---------- */
+async function openSiteFiles(id) {
+  const s = sitesData.find(x => x.id === id);
+  if (!s) return;
+  sfSite = s;
+  $("sf_title").textContent = "文件管理 · " + (s.domain || ("端口 " + s.port));
+  $("sfile_modal").classList.remove("hidden");
+  sfLoad("");
+}
+function closeSiteFiles() { $("sfile_modal").classList.add("hidden"); sfSite = null; sfPath = ""; }
+
+async function sfLoad(path) {
+  if (!sfSite) return;
+  sfPath = path || "";
+  $("sf_rows").innerHTML = '<tr><td colspan="5" style="color:var(--muted)">加载中...</td></tr>';
+  try {
+    const d = await api("GET", "/api/sites/" + sfSite.id + "/files?path=" + encodeURIComponent(sfPath));
+    sfRenderCrumb(d.path || "");
+    sfRenderRows(d);
+  } catch (e) {
+    $("sf_rows").innerHTML = '<tr><td colspan="5" style="color:var(--danger)">' + esc(e.message) + "</td></tr>";
+  }
+}
+
+function sfRenderCrumb(path) {
+  const parts = (path || "").split("/").filter(Boolean);
+  let acc = "";
+  const html = ['<a onclick="sfLoad(\'\')">' + esc(sfSite.domain || ("端口 " + sfSite.port)) + "</a>"];
+  parts.forEach(p => {
+    acc = acc ? (acc + "/" + p) : p;
+    html.push('<span style="color:var(--muted)">/</span>');
+    html.push('<a onclick="sfLoad(' + qjs(acc) + ')">' + esc(p) + "</a>");
+  });
+  $("sf_crumb").innerHTML = html.join(" ");
+}
+
+function sfRenderRows(d) {
+  const items = d.items || [];
+  if (!items.length) {
+    $("sf_rows").innerHTML = '<tr><td colspan="5" style="color:var(--muted)">空目录：可以上传文件或新建</td></tr>';
+    return;
+  }
+  $("sf_rows").innerHTML = items.map(it => {
+    const rel = (sfPath ? (sfPath + "/") : "") + it.name;
+    const nameCell = it.dir
+      ? '<span class="sf-name dir" onclick="sfLoad(' + qjs(rel) + ')">📁 ' + esc(it.name) + "</span>"
+      : (it.link
+        ? '<span class="sf-name link">🔗 ' + esc(it.name) + "（符号链接）</span>"
+        : '<span class="sf-name">📄 ' + esc(it.name) + "</span>");
+    const ops = [];
+    if (it.dir) ops.push(btnHtml("进入", "sfLoad(" + qjs(rel) + ")"));
+    if (it.editable) ops.push(btnHtml("编辑", "sfEdit(" + qjs(rel) + ")"));
+    if (!it.dir && !it.link) {
+      ops.push(btnHtml("下载", "sfDownload(" + qjs(it.name) + ")"));
+      if (/\.zip$/i.test(it.name)) ops.push(btnHtml("解压", "sfUnzip(" + qjs(rel) + ")"));
+    }
+    if (!it.link) {
+      ops.push(btnHtml("改名", "sfRename(" + qjs(rel) + "," + qjs(it.name) + ")"));
+      ops.push(btnHtml("权限", "sfChmod(" + qjs(rel) + "," + qjs(it.mode) + ")"));
+      ops.push(btnHtml("删除", "sfDelete(" + qjs(rel) + "," + qjs(it.name) + "," + (it.dir ? "true" : "false") + ")", "danger"));
+    }
+    const mt = it.mtime ? new Date(it.mtime * 1000).toLocaleString("zh-CN", { hour12: false }) : "-";
+    return "<tr><td>" + nameCell + "</td><td>" + (it.dir ? "—" : fmtBytes(it.size)) + "</td><td>"
+      + esc(it.mode) + "</td><td>" + esc(mt) + '</td><td><div style="display:flex;gap:6px;flex-wrap:wrap">' + ops.join("") + "</div></td></tr>";
+  }).join("");
+}
+
+function sfUploadPick() { $("sf_upload").click(); }
+
+function sfUploadDo(files) {
+  if (!sfSite || !files || !files.length) return;
+  const arr = Array.from(files);
+  let pending = arr.length, ok = 0, bad = 0;
+  const fin = () => {
+    if (--pending > 0) return;
+    toast("上传完成：" + ok + " 个成功" + (bad ? "，" + bad + " 个失败" : ""), bad ? "err" : "okk");
+    sfLoad(sfPath);
+  };
+  arr.forEach(f => {
+    if (f.size > 32 * 1024 * 1024) { bad++; toast(f.name + " 超过 32MB，已跳过", "err"); fin(); return; }
+    const fr = new FileReader();
+    fr.onload = async () => {
+      const b64 = String(fr.result).split(",")[1] || "";
+      try {
+        await api("POST", "/api/sites/" + sfSite.id + "/files",
+          { op: "upload", path: sfPath, name: f.name, content_b64: b64, overwrite: true });
+        ok++;
+      } catch (e) { bad++; toast(f.name + " 上传失败：" + e.message, "err"); }
+      fin();
+    };
+    fr.onerror = () => { bad++; toast(f.name + " 读取失败", "err"); fin(); };
+    fr.readAsDataURL(f);
+  });
+}
+
+function sfMkdir() {
+  const inp = document.createElement("input");
+  inp.placeholder = "目录名（可多级，如 assets/css）";
+  confirmPanel("在当前目录下新建目录", async () => {
+    const name = (inp.value || "").trim();
+    if (!name) { toast("请填写目录名", "err"); return; }
+    try {
+      const d = await api("POST", "/api/sites/" + sfSite.id + "/files", { op: "mkdir", name: name });
+      toast(d.msg || "已创建", "okk"); sfLoad(sfPath);
+    } catch (e) { toast(e.message, "err"); }
+  }, "新建目录", inp);
+}
+
+function sfNewFile() {
+  const inp = document.createElement("input");
+  inp.placeholder = "文件名（如 about.html）";
+  confirmPanel("在当前目录下新建文本文件", async () => {
+    const name = (inp.value || "").trim();
+    if (!name) { toast("请填写文件名", "err"); return; }
+    try {
+      const d = await api("POST", "/api/sites/" + sfSite.id + "/files",
+        { op: "write", path: (sfPath ? sfPath + "/" : "") + name, content: "" });
+      toast(d.msg || "已创建", "okk"); sfLoad(sfPath);
+    } catch (e) { toast(e.message, "err"); }
+  }, "新建文件", inp);
+}
+
+async function sfEdit(rel) {
+  try {
+    const d = await api("GET", "/api/sites/" + sfSite.id + "/files?op=read&path=" + encodeURIComponent(rel));
+    sePath = rel;
+    $("se_path").textContent = (sfSite.domain || ("端口 " + sfSite.port)) + " / " + rel;
+    $("se_text").value = d.content || "";
+    $("se_info").textContent = "编码 UTF-8　大小 " + fmtBytes((d.content || "").length) + "　保存后立即生效";
+    $("sedit_modal").classList.remove("hidden");
+  } catch (e) { toast(e.message, "err"); }
+}
+function closeSiteEdit() { $("sedit_modal").classList.add("hidden"); }
+async function sfSaveEdit() {
+  try {
+    const d = await api("POST", "/api/sites/" + sfSite.id + "/files",
+      { op: "write", path: sePath, content: $("se_text").value });
+    toast(d.msg || "已保存", "okk");
+    closeSiteEdit();
+    sfLoad(sfPath);
+  } catch (e) { toast(e.message, "err"); }
+}
+
+function sfRename(rel, old) {
+  const inp = document.createElement("input");
+  inp.value = old;
+  confirmPanel("重命名为：", async () => {
+    const name = (inp.value || "").trim();
+    if (!name || name === old) return;
+    try {
+      const d = await api("POST", "/api/sites/" + sfSite.id + "/files", { op: "rename", path: rel, name: name });
+      toast(d.msg || "已重命名", "okk"); sfLoad(sfPath);
+    } catch (e) { toast(e.message, "err"); }
+  }, "重命名", inp);
+}
+
+function sfChmod(rel, mode) {
+  const inp = document.createElement("input");
+  inp.value = mode || "644";
+  inp.placeholder = "如 644 / 755";
+  confirmPanel("修改权限（仅站点目录内）", async () => {
+    try {
+      const d = await api("POST", "/api/sites/" + sfSite.id + "/files", { op: "chmod", path: rel, mode: (inp.value || "").trim() });
+      toast(d.msg || "已修改", "okk"); sfLoad(sfPath);
+    } catch (e) { toast(e.message, "err"); }
+  }, "修改权限", inp);
+}
+
+function sfDelete(rel, name, isDir) {
+  const slot = document.createElement("div");
+  if (isDir) {
+    const lb = document.createElement("label");
+    lb.style.cssText = "display:flex;align-items:center;gap:6px;font-size:13px;cursor:pointer";
+    lb.innerHTML = '<input type="checkbox" id="sf_rec"> 目录非空时递归删除（含里面所有文件）';
+    slot.appendChild(lb);
+  }
+  confirmPanel("确定删除「" + name + "」？不可恢复。", async () => {
+    const rec = $("sf_rec") && $("sf_rec").checked;
+    try {
+      const d = await api("POST", "/api/sites/" + sfSite.id + "/files", { op: "delete", path: rel, recursive: !!rec });
+      toast(d.msg || "已删除", "okk"); sfLoad(sfPath);
+    } catch (e) { toast(e.message, "err"); }
+  }, "删除文件", slot);
+}
+
+function sfUnzip(rel) {
+  confirmPanel("解压 " + rel + " 到当前目录？", async () => {
+    try {
+      const d = await api("POST", "/api/sites/" + sfSite.id + "/files", { op: "unzip", path: rel });
+      toast(d.msg || "已解压", "okk"); sfLoad(sfPath);
+    } catch (e) { toast(e.message, "err"); }
+  }, "解压");
+}
+
+async function sfDownload(name) {
+  const rel = sfPath ? (sfPath + "/" + name) : name;
+  try {
+    const r = await fetch(API + "/api/sites/" + sfSite.id + "/download?path=" + encodeURIComponent(rel),
+      { headers: token ? { Authorization: "Bearer " + token } : {} });
+    if (!r.ok) {
+      let m = "下载失败";
+      try { m = (await r.json()).error || m; } catch (e) {}
+      throw new Error(m);
+    }
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+  } catch (e) { toast(e.message, "err"); }
+}
+
+/* ---------- 日志与统计 ---------- */
+async function openSiteLogs(id) {
+  const s = sitesData.find(x => x.id === id);
+  if (!s) return;
+  slSite = s;
+  $("sl_title").textContent = "站点日志与统计 · " + (s.domain || ("端口 " + s.port));
+  $("slog_modal").classList.remove("hidden");
+  slShow("log");
+}
+function closeSiteLogs() {
+  if (slTimer) { clearInterval(slTimer); slTimer = null; }
+  $("sl_auto").checked = false;
+  $("slog_modal").classList.add("hidden");
+  slSite = null;
+}
+function slShow(which) {
+  const isLog = which === "log";
+  $("sl_log_pane").style.display = isLog ? "" : "none";
+  $("sl_stat_pane").style.display = isLog ? "none" : "";
+  $("sl_btn_log").className = "btn mini" + (isLog ? "" : " ghost");
+  $("sl_btn_stat").className = "btn mini" + (isLog ? " ghost" : "");
+  if (isLog) loadSiteLogs(); else loadSiteStats();
+}
+async function loadSiteLogs() {
+  if (!slSite) return;
+  const kind = $("sl_kind").value, lines = $("sl_lines").value;
+  try {
+    const d = await api("GET", "/api/sites/" + slSite.id + "/logs?kind=" + kind + "&lines=" + lines);
+    const rows = d.lines || [];
+    $("sl_text").textContent = rows.length ? rows.join("\n") : "（还没有日志：站点被访问后这里会出现访问记录）";
+    $("sl_file").textContent = (d.file || "") + (rows.length ? ("　共 " + rows.length + " 行") : "");
+  } catch (e) { $("sl_text").textContent = "读取失败：" + e.message; }
+}
+function slAutoToggle() {
+  if (slTimer) { clearInterval(slTimer); slTimer = null; }
+  if ($("sl_auto").checked) slTimer = setInterval(loadSiteLogs, 5000);
+}
+function slCopy() {
+  const txt = $("sl_text").textContent || "";
+  navigator.clipboard.writeText(txt).then(() => toast("已复制日志", "okk")).catch(() => toast("复制失败，请手动选择", "err"));
+}
+
+async function loadSiteStats() {
+  if (!slSite) return;
+  try {
+    const d = await api("GET", "/api/sites/" + slSite.id + "/stats?days=7");
+    $("st_pv").textContent = d.today.pv;
+    $("st_uv").textContent = d.today.uv;
+    $("st_pv_y").textContent = d.yesterday.pv;
+    $("st_uv_y").textContent = d.yesterday.uv;
+    const days = d.days || [];
+    const max = Math.max.apply(null, days.map(x => x.pv).concat([1]));
+    $("st_bars").innerHTML = days.slice().reverse().map(x => {
+      const h = Math.round((x.pv / max) * 100);
+      const lb = x.date.slice(0, 6);
+      return '<div class="sbar"><div class="vl">' + x.pv + "</div>"
+        + '<div class="bar' + (x.pv ? "" : " empty") + '" style="height:' + (x.pv ? Math.max(h, 3) : 2) + '%"></div>'
+        + '<div class="lb">' + esc(lb) + "</div></div>";
+    }).join("");
+    $("st_urls").innerHTML = (d.top_urls || []).length
+      ? d.top_urls.map(u => "<tr><td>" + esc(u[0]) + '</td><td style="text-align:right;color:var(--muted)">' + u[1] + "</td></tr>").join("")
+      : '<tr><td style="color:var(--muted)">-</td></tr>';
+    $("st_codes").innerHTML = (d.codes || []).length
+      ? d.codes.map(c => "<tr><td>" + esc(c[0]) + '</td><td style="text-align:right;color:var(--muted)">' + c[1] + "</td></tr>").join("")
+      : '<tr><td style="color:var(--muted)">-</td></tr>';
+    $("st_hint").textContent = d.exists
+      ? ("日志文件：" + (d.log_file || "") + (d.truncated ? "（数据量较大，仅统计最近部分记录）" : "（近 7 天）"))
+      : "还没有访问日志：站点被访问后这里会自动出现数据";
+  } catch (e) {
+    $("st_hint").textContent = "统计读取失败：" + e.message;
+  }
+}
+
+/* 拖拽上传 */
+(function initSiteDrop() {
+  const bind = () => {
+    const dz = $("sf_drop");
+    if (!dz) return;
+    ["dragenter", "dragover"].forEach(ev => dz.addEventListener(ev, e => {
+      e.preventDefault(); dz.classList.add("drag");
+    }));
+    ["dragleave", "drop"].forEach(ev => dz.addEventListener(ev, e => {
+      e.preventDefault(); dz.classList.remove("drag");
+    }));
+    dz.addEventListener("drop", e => {
+      if (e.dataTransfer && e.dataTransfer.files) sfUploadDo(e.dataTransfer.files);
+    });
+  };
+  if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", bind);
+  else bind();
+})();
+
 function switchTab(sec) {
   if (fedNode && sec === "fed") { toast("远程模式下请先返回本机", "err"); return; }
   localStorage.setItem("fw_sec", sec);
@@ -2058,6 +2907,9 @@ function switchTab(sec) {
   document.querySelectorAll("#sec_tabs .tab").forEach(b => {
     b.classList.toggle("active", b.dataset.tab === sec);
   });
+  if (sec === "site" && token) {
+    if (!sitesLoaded) { sitesLoaded = false; loadSites(); }
+  }
   if (sec === "fed" && token) {
     if (!fedLoaded) renderFed();
     else refreshFedStatus();   // 已渲染过:静默重新探测各节点状态,不重建卡片
@@ -2065,7 +2917,7 @@ function switchTab(sec) {
 }
 (function initSec() {
   const saved = localStorage.getItem("fw_sec");
-  switchTab(saved && ["overview", "fw", "ssh", "px", "dk", "fed"].indexOf(saved) >= 0 ? saved : "overview");
+  switchTab(saved && ["overview", "fw", "site", "ssh", "px", "dk", "fed"].indexOf(saved) >= 0 ? saved : "overview");
 })();
 
 /* ---------- 网卡流量统计 ---------- */
