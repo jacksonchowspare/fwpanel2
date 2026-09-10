@@ -9,7 +9,15 @@
 // 退出码 0 = 全部通过
 //
 // 覆盖：登录后当前板块自动加载 / 卡片按钮（文件·日志·设置·打开）/ 文件管理进入目录 / 站点启停开关 / 控制台无报错
-const { chromium } = require("playwright");
+let chromium;
+try { chromium = require("playwright").chromium; }
+catch (e) {
+  console.error("缺少 playwright。任选其一：\n" +
+    "  a) 在任意目录装一次：mkdir -p ~/uicheck && cd ~/uicheck && npm i playwright && npx playwright install --with-deps chromium\n" +
+    "     然后跑：NODE_PATH=~/uicheck/node_modules node test/ui_check_playwright.js <url> <user> <pass>\n" +
+    "  b) 本机已装过（~/.cache/ms-playwright 有 chromium）时，直接用上面的 NODE_PATH 方式即可");
+  process.exit(3);
+}
 
 const URL = process.argv[2] || "https://sg1panel.isusz.com/";
 const USER = process.argv[3], PASS = process.argv[4];
@@ -106,15 +114,24 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
       const row = c.querySelector(".sc-btns"); if (!row) return null;
       const r = row.getBoundingClientRect();
       const bs = [...row.querySelectorAll("button")];
-      const ys = [...new Set(bs.map(b => Math.round(b.getBoundingClientRect().top)))];
+      // 同一行判定：top 差 ≤3px 视为同一行（表情符号会让按钮内容盒高 1px 差异，别把噪声当换行）
+      const tops = bs.map(b => b.getBoundingClientRect().top).sort((a, c) => a - c);
+      let rows = tops.length ? 1 : 0;
+      for (let i = 1; i < tops.length; i++) if (tops[i] - tops[i - 1] > 3) rows++;
       const last = bs[bs.length - 1].getBoundingClientRect();
-      return { n: bs.length, rows: ys.length, spill: Math.round(last.right - r.right) };
+      return { dom: (c.querySelector(".sc-dom") || {}).textContent || "?", n: bs.length, rows: rows,
+               spill: Math.round(last.right - r.right), rowW: Math.round(r.width), scrollW: row.scrollWidth,
+               wrap: getComputedStyle(row).flexWrap,
+               detail: bs.map(b => b.textContent.trim() + ":" + Math.round(b.getBoundingClientRect().width) + "px@y" + Math.round(b.getBoundingClientRect().top)).join(" ") };
     }).filter(Boolean);
     return { cards: btns,
              cardRows: Math.max(...btns.map(x => x.rows)),
              cardSpill: Math.max(...btns.map(x => x.spill)) };
   });
-  rec("站点卡片 6 个按钮同一行", lay.cardRows === 1, "最多行数=" + lay.cardRows + " 卡片数=" + lay.cards.length);
+  const bad = lay.cards.filter(x => x.rows > 1);
+  rec("站点卡片 6 个按钮同一行", lay.cardRows === 1,
+      "最多行数=" + lay.cardRows + " 卡片数=" + lay.cards.length +
+      (bad.length ? " | 异常卡片: " + bad.map(x => x.dom + " rows=" + x.rows + " wrap=" + x.wrap + " rowW=" + x.rowW + " scrollW=" + x.scrollW + " [" + x.detail + "]").join(" ;; ") : ""));
   rec("卡片按钮行不溢出", lay.cardSpill <= 1, "最大右侧超出=" + lay.cardSpill + "px");
 
   await page.click("button:has-text('新建网站')");
@@ -136,7 +153,10 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   await page.waitForTimeout(2500);
   const fm = await page.evaluate(() => [...document.querySelectorAll("#sf_rows tr")].map(tr => {
     const bs = [...tr.querySelectorAll("button")]; if (!bs.length) return null;
-    return { rows: [...new Set(bs.map(b => Math.round(b.getBoundingClientRect().top)))].length, n: bs.length };
+    const tops = bs.map(b => b.getBoundingClientRect().top).sort((a, c) => a - c);
+    let rows = tops.length ? 1 : 0;
+    for (let i = 1; i < tops.length; i++) if (tops[i] - tops[i - 1] > 3) rows++;
+    return { rows, n: bs.length };
   }).filter(Boolean));
   rec("文件管理操作按钮同一行（最坏 5-7 个按钮）", fm.length > 0 && fm.every(r => r.rows === 1),
       fm.map(r => r.n + "个按钮→" + r.rows + "行").join(" "));

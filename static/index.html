@@ -439,9 +439,9 @@ tr:hover td { background: var(--panel-solid); }
 /* 按钮行定高 + inline-flex 居中：彩色 emoji 字体行高 metric 大会把按钮撑高（v2.1.32 教训） */
 /* v3.0.3：原来 flex-wrap:wrap + padding 0 10px，6 个按钮要 ~373px 而卡片只有 363px 可用，
    「✕ 删除」被挤到第二行（用户点名）。改为不换行 + 收窄内边距，6 个按钮同行。 */
-.site-card .sc-btns { display: flex; gap: 4px; flex-wrap: nowrap; justify-content: flex-end; margin-top: auto; padding-top: 4px; }
+.site-card .sc-btns { display: flex; align-items: center; gap: 4px; flex-wrap: nowrap; justify-content: flex-end; margin-top: auto; padding-top: 4px; }
 .site-card .sc-btns .btn { flex: 0 1 auto; min-width: 0; overflow: hidden; display: inline-flex; align-items: center;
-  justify-content: center; white-space: nowrap; height: 28px; padding: 0 7px; }
+  justify-content: center; white-space: nowrap; height: 28px; line-height: 1; padding: 0 7px; }
 .tag.site { background: rgba(61,139,253,.15); color: var(--accent); }
 .tag.port { background: rgba(245,158,11,.15); color: var(--warn); }
 .tag.proxyt { background: rgba(139,92,246,.18); color: #a78bfa; }
