@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.1.32"
+CURRENT_VERSION = "2.1.33"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -2232,11 +2232,18 @@ def apply_proxies(store):
             elif os.path.exists(conf):
                 os.remove(conf)
         # 清理失效配置（代理已删除或已禁用）
+        # ⚠ v2.1.33 修复：必须按「12 位十六进制 id」形状校验（代理 id = secrets.token_hex(6)）。
+        # 旧实现只判断前缀 fwpanel-，于是兜底守卫配置 fwpanel-default.conf（id 段是 "default"）
+        # 每次刚写完就被当过期配置删掉 —— default_server 444 / 443 ssl_reject_handshake
+        # 实际从未生效（1.x 起即存在，2026-09-10 实测确认）
         for fn in os.listdir(conf_dir):
-            if fn.startswith("fwpanel-") and fn.endswith(".conf"):
-                pid = fn[len("fwpanel-"):-len(".conf")]
-                if not any(p["id"] == pid and p.get("enabled", True) for p in store.proxies):
-                    os.remove(os.path.join(conf_dir, fn))
+            if not (fn.startswith("fwpanel-") and fn.endswith(".conf")):
+                continue
+            pid = fn[len("fwpanel-"):-len(".conf")]
+            if not re.fullmatch(r"[0-9a-f]{12}", pid):
+                continue
+            if not any(p["id"] == pid and p.get("enabled", True) for p in store.proxies):
+                os.remove(os.path.join(conf_dir, fn))
     except OSError as e:
         return False, f"写入配置失败: {e}"
     # 校验
@@ -6301,6 +6308,19 @@ def main():
     resume_ssh_switch_watch(store, config)
     # v1.25.7：补齐存量反代入口端口放行（修复 https 反代漏放 443，重启即自愈）
     ensure_proxy_entry_ports(store)
+    # v2.1.33：确保 nginx 兜底守卫配置存在并生效（default_server 444 / 443 ssl_reject_handshake）。
+    # 旧版清理逻辑按前缀判定过期配置，会把该文件误删 →「禁止 IP 直连」的兜底从未生效；
+    # 修复后启动补写一次并 reload，升级后无需手动操作即恢复守卫（失败只记日志，不影响启动）
+    try:
+        if nginx_available():
+            ensure_nginx_default()
+            ok_guard, msg_guard = reload_nginx()
+            if ok_guard:
+                log("[v2.1.33] nginx 兜底守卫配置已确保并生效（禁止 IP 直连）")
+            else:
+                log(f"[v2.1.33] nginx 兜底守卫 reload 失败: {msg_guard}")
+    except Exception as e:
+        log(f"[v2.1.33] 兜底守卫检查异常: {e}")
     nft = NFTManager(store, config)
     auth = Auth(config)
     server = PanelServer((bind, port), PanelHandler, config, store, nft, auth)

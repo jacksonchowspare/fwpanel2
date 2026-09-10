@@ -4909,5 +4909,44 @@ class TestTermZsh(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class TestNginxGuardCleanup(unittest.TestCase):
+    """v2.1.33：过期配置清理不能误删兜底守卫 fwpanel-default.conf"""
+
+    def test_default_guard_survives_cleanup(self):
+        import types as _types
+        d = tempfile.mkdtemp()
+        real_dir, real_dry, real_ver, real_run = (panel.nginx_conf_dir, panel.DRY_RUN,
+                                                  panel.nginx_supports_reject_handshake,
+                                                  panel.subprocess.run)
+        panel.nginx_conf_dir = lambda: d
+        panel.DRY_RUN = False
+        panel.nginx_supports_reject_handshake = lambda: True
+        panel.subprocess.run = lambda *a, **k: _types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        try:
+            store = panel.ProxyStore()
+            store.proxies = [{"id": "aaaaaaaaaaaa", "domain": "p.example.com",
+                              "target_host": "127.0.0.1", "target_port": 8080,
+                              "scheme": "http", "enabled": True}]
+            # 造一个"已删除代理"的残留配置，验证清理逻辑本身仍然有效
+            stale = os.path.join(d, "fwpanel-deadbeef0000.conf")
+            with open(stale, "w") as f:
+                f.write("# stale\n")
+            ok, msg = panel.apply_proxies(store)
+            self.assertTrue(ok, msg)
+            files = set(os.listdir(d))
+            self.assertIn("fwpanel-default.conf", files,
+                          "兜底守卫配置不能被当过期配置删掉（否则 default_server 444 失效）")
+            self.assertIn("fwpanel-aaaaaaaaaaaa.conf", files)
+            self.assertNotIn("fwpanel-deadbeef0000.conf", files, "真正的过期配置仍要被清理")
+            guard = open(os.path.join(d, "fwpanel-default.conf")).read()
+            self.assertIn("listen 80 default_server;", guard)
+            self.assertIn("return 444;", guard)
+        finally:
+            panel.nginx_conf_dir, panel.DRY_RUN = real_dir, real_dry
+            panel.nginx_supports_reject_handshake = real_ver
+            panel.subprocess.run = real_run
+            shutil.rmtree(d, ignore_errors=True)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
