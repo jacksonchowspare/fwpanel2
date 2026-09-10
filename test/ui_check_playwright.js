@@ -99,10 +99,18 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
 
   // —— 场景 3：启停开关 ——
   console.log("== 场景 3：站点启停开关 ==");
+  // 先关掉可能残留的弹窗（上一场景的弹窗会挡住点击 → 假红）
+  await page.evaluate(() => { document.querySelectorAll(".modal-mask").forEach(m => m.classList.add("hidden")); });
+  await page.waitForTimeout(300);
   const before3 = await page.evaluate(() => document.querySelector("#site_cards .site-card")?.className || "");
   await page.evaluate(() => { const s = document.querySelector("#site_cards .site-card input[type=checkbox]"); if (s) s.click(); });
-  await page.waitForTimeout(3000);
-  const after3 = await page.evaluate(() => document.querySelector("#site_cards .site-card")?.className || "");
+  // 启停是异步动作：轮询等类名变化，最多 12s（固定 3s 在慢机器上会假红）
+  let after3 = before3;
+  for (let i = 0; i < 24; i++) {
+    await page.waitForTimeout(500);
+    after3 = await page.evaluate(() => document.querySelector("#site_cards .site-card")?.className || "");
+    if (after3 !== before3) break;
+  }
   rec("启停开关点击后卡片状态变化（.off 切换）", before3 !== after3, JSON.stringify(before3) + " → " + JSON.stringify(after3));
   // 恢复
   await page.evaluate(() => { const s = document.querySelector("#site_cards .site-card input[type=checkbox]"); if (s) s.click(); });
@@ -276,6 +284,49 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   rec("防火墙页有搬家提示", /已移至/.test(fwTx));
   const sshTx = await page.$eval('[data-sec="ssh"]', e => e.innerText);
   rec("SSH 页有面板端口搬家提示", /面板端口已移至/.test(sshTx));
+
+  // ---- 各 tab 区块布局形态（防"把 panel 误写成 grid2 变成左右两列"）----
+  const shapes = await page.evaluate(() => {
+    // 隐藏的区块量不到宽度：先临时全部展开（保留原内联 display），量完再还原
+    const els = [...document.querySelectorAll("[data-sec]")];
+    const saved = els.map(el => el.getAttribute("style") || "");
+    els.forEach(el => el.style.removeProperty("display"));
+    const out = {};
+    for (const el of els) {
+      const cs = getComputedStyle(el);
+      const sec = el.getAttribute("data-sec");
+      out[sec] = out[sec] || [];
+      out[sec].push({ cls: el.className, display: cs.display, w: Math.round(el.getBoundingClientRect().width) });
+    }
+    els.forEach((el, i) => { saved[i] ? el.setAttribute("style", saved[i]) : el.removeAttribute("style"); });
+    return out;
+  });
+  const fedShapes = shapes["fed"] || [];
+  rec("服务器页区块不是两列网格（未被误改成 grid2）",
+      fedShapes.every(s => s.display !== "grid" && !/\bgrid2\b/.test(s.cls)),
+      JSON.stringify(fedShapes));
+  // 真正会出问题的是"区块内容被塞进两列"：量标题与卡片容器是否占满区块宽度
+  const fedInner = await page.evaluate(() => {
+    const sec = document.querySelector('[data-sec="fed"]');
+    const saved = sec.getAttribute("style") || "";
+    sec.style.removeProperty("display");
+    const sw = Math.round(sec.getBoundingClientRect().width);
+    const h2 = sec.querySelector("h2");
+    const cards = sec.querySelector("#fed_cards");
+    const r = {
+      sec: sw,
+      h2: h2 ? Math.round(h2.getBoundingClientRect().width) : 0,
+      cards: cards ? Math.round(cards.getBoundingClientRect().width) : 0
+    };
+    saved ? sec.setAttribute("style", saved) : sec.removeAttribute("style");
+    return r;
+  });
+  rec("服务器页标题与内容占满区块宽度（内容没被切成左右两列）",
+      fedInner.h2 >= fedInner.sec * 0.85 && fedInner.cards >= fedInner.sec * 0.85,
+      JSON.stringify(fedInner));
+  const sysShapes = shapes["sys"] || [];
+  rec("系统页仍是两列网格（我的新页面没被改坏）",
+      sysShapes.some(s => s.display === "grid"), JSON.stringify(sysShapes));
 
   const v6tx2 = (await page.$eval("#sys_ipv6", e => e.innerText)).trim();
   rec("IPv6 显示真实状态（不是 - / 未知）", !/IPv6\s*-\s*$/.test(v6tx2) && !/未知/.test(v6tx2), v6tx2.replace(/\s+/g," ").slice(0,50));
