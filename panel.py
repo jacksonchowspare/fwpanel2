@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.0.0"
+CURRENT_VERSION = "3.0.1"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -635,10 +635,16 @@ def restart_service():
 
 
 def port_in_use_py(port):
-    """Python 侧端口占用检测（bind 测试）"""
+    """Python 侧端口占用检测（bind 测试）
+
+    ⚠ v3.0.1：必须设 SO_REUSEADDR。端口上存在 TIME_WAIT 残留连接（默认存活 60 秒）时，
+    不设该选项 bind 会报 EADDRINUSE → 误判「端口已被占用」——实测现象：把面板端口从 A 改成 B 后
+    想改回 A 会被拒（明明没人监听），另一个只是"最近有过连接"的端口也会被误判。
+    SO_REUSEADDR 只忽略 TIME_WAIT，不会放过真正在 LISTEN 的端口。"""
     import socket
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.bind(("0.0.0.0", port))
         return False
     except OSError:
@@ -2462,6 +2468,15 @@ def site_cert_info(site):
         except Exception:
             days = None
     return {"on": bool(on), "ref": ref if on else "", "days": days}
+
+
+def site_cert_ready(s):
+    """站点证书是否已就绪（无需签发）：cert_mode=auto 且引用/自身的证书文件已存在。
+    v3.0.1：引用已有证书（cert_ref）时不再重复签发——旧实现只要 cert_mode=auto 就发起签发，
+    白白消耗 Let's Encrypt 配额（实测：引用泛域名证书的站点又被单独签了一张）。"""
+    if not s or s.get("cert_mode") != "auto":
+        return False
+    return bool(site_cert_info(s).get("on"))
 
 
 def site_view(s):
@@ -4631,7 +4646,12 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            # v3.0.1：客户端提前断开（浏览器切页/探活超时）不是错误，静默即可——
+            # 旧实现会往 journalctl 里刷一整段 ConnectionResetError 堆栈
+            pass
 
     def _read_json(self):
         try:
@@ -5887,6 +5907,13 @@ class PanelHandler(BaseHTTPRequestHandler):
         if token is None:
             return
         data = self._read_json()
+        # v3.0.1：没装 nginx 时直接给出可操作引导（旧实现等到写配置才失败，报「未找到 nginx 配置目录」，
+        # 用户不知道该去哪里装）
+        if not nginx_available():
+            self._send(400, {"error": "尚未安装 Nginx：网站需要 Nginx 才能对外提供服务。"
+                                      "请先到「反代证书」页点「一键安装 Nginx + certbot」，装好后再回来建站",
+                             "need_nginx": True})
+            return
         pstore, sstore = ProxyStore(), SiteStore()
         site, err = site_validate(data, pstore, sstore, self.server.config)
         if err:
@@ -5921,8 +5948,13 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._send(500, {"error": f"nginx 配置失败，站点未创建：{nginx_msg}"})
             return
         task = ""
+        reused = ""
         if s["cert_mode"] == "auto":
-            task = start_task("site_cert", site_issue_cert, s["id"])
+            if site_cert_ready(s):
+                ci = site_cert_info(s)
+                reused = f"已引用证书 {ci['ref']}（剩 {ci['days']} 天），未重复签发"
+            else:
+                task = start_task("site_cert", site_issue_cert, s["id"])
         label = s.get("domain") or f"端口 {s.get('port')}"
         self._send(200, {
             "ok": True,
@@ -5930,7 +5962,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             "nginx": nginx_msg,
             "firewall": ("已放行 " + ", ".join(str(x) for x in fw)) if fw else "无需新增放行",
             "cert_task": task,
-            "msg": f"网站 {label} 已创建" + ("，证书正在签发" if task else ""),
+            "msg": f"网站 {label} 已创建"
+                   + ("，证书正在签发" if task else ("，" + reused if reused else "")),
         })
 
     def _api_site_update(self, sid):
@@ -5944,6 +5977,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._send(404, {"error": "站点不存在"})
             return
         data = self._read_json()
+        if not nginx_available():
+            self._send(400, {"error": "尚未安装 Nginx：请先在「反代证书」页一键安装 Nginx + certbot",
+                             "need_nginx": True})
+            return
         merged = dict(old)
         merged.update({k: v for k, v in data.items() if k not in ("id", "created")})
         pstore = ProxyStore()
@@ -6075,6 +6112,13 @@ class PanelHandler(BaseHTTPRequestHandler):
             return
         if not s.get("domain"):
             self._send(400, {"error": "端口站（无域名）不需要证书"})
+            return
+        body = self._read_json()
+        if site_cert_ready(s) and not body.get("force"):
+            ci = site_cert_info(s)
+            self._send(200, {"ok": True, "reused": True,
+                             "msg": f"证书已就绪（引用 {ci['ref']}，剩 {ci['days']} 天），无需重新签发；"
+                                    f"如需续期请到「反代证书」的证书模块操作（或强制重新签发）"})
             return
         okdns, why = site_dns_precheck(s["domain"], s.get("cert_ref"))
         if not okdns:
@@ -7576,6 +7620,17 @@ def main():
     resume_ssh_switch_watch(store, config)
     # v1.25.7：补齐存量反代入口端口放行（修复 https 反代漏放 443，重启即自愈）
     ensure_proxy_entry_ports(store)
+    # v3.0.1：启动时确保 nginx 兜底守卫配置存在并生效（default_server 444 / 443 ssl_reject_handshake）。
+    # 从 v2.1.32 升级上来的机器，该文件在旧版本里被清理逻辑误删过（见 v2.1.33 hotfix），
+    # 若不在启动补写，则要等到第一次建站/改反代才恢复，此期间 IP 直连落到第一个 server block。
+    try:
+        if nginx_available():
+            ensure_nginx_default()
+            ok_guard, msg_guard = reload_nginx()
+            if not ok_guard:
+                log(f"[v3.0.1] nginx 兜底守卫 reload 失败: {msg_guard}")
+    except Exception as e:
+        log(f"[v3.0.1] 兜底守卫检查异常: {e}")
     nft = NFTManager(store, config)
     auth = Auth(config)
     server = PanelServer((bind, port), PanelHandler, config, store, nft, auth)

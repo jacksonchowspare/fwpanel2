@@ -4923,9 +4923,13 @@ class TestSites(unittest.TestCase):
         # 生产环境 /tmp 属于禁放区（重启即清空）；测试的临时站点目录在 /tmp 下，此处临时放开
         self._forbid = panel.SITE_FORBIDDEN_ROOTS
         panel.SITE_FORBIDDEN_ROOTS = tuple(x for x in panel.SITE_FORBIDDEN_ROOTS if x != "/tmp")
+        # v3.0.1 起建站前会检查 nginx 是否安装；测试机没有 nginx，打桩为已安装
+        self._nginx_avail = panel.nginx_available
+        panel.nginx_available = lambda: True
 
     def tearDown(self):
         panel.SITE_FORBIDDEN_ROOTS = self._forbid
+        panel.nginx_available = self._nginx_avail
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _site(self, **kw):
@@ -5324,6 +5328,125 @@ class TestSites(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+
+class TestV301Fixes(unittest.TestCase):
+    """v3.0.1 五项修复的回归：端口误报占用 / nginx 引导 / cert_ref 去重复签发"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="fwsite301-")
+        cls.cfg = make_cfg()
+        cls.cfg.data["site_root"] = cls.tmp
+        cls.store = panel.RuleStore()
+        cls.store.rules = []
+        cls.nft = panel.NFTManager(cls.store, cls.cfg)
+        cls.server = panel.PanelServer(("127.0.0.1", 17986), panel.PanelHandler,
+                                       cls.cfg, cls.store, cls.nft, panel.Auth(cls.cfg))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.token = ""
+        code, d = cls._req("POST", "/api/login", {"username": TEST_USER, "password": TEST_PASS})
+        cls.token = d.get("token", "")
+        cls._forbid = panel.SITE_FORBIDDEN_ROOTS
+        panel.SITE_FORBIDDEN_ROOTS = tuple(x for x in panel.SITE_FORBIDDEN_ROOTS if x != "/tmp")
+
+    @classmethod
+    def tearDownClass(cls):
+        panel.SITE_FORBIDDEN_ROOTS = cls._forbid
+        cls.server.shutdown()
+        cls.server.server_close()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def _req(cls, method, path, data=None):
+        r = urllib.request.Request("http://127.0.0.1:17986" + path, method=method)
+        if cls.token:
+            r.add_header("Authorization", "Bearer " + cls.token)
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode()
+            r.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(r, body) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read())
+            except Exception:
+                return e.code, {}
+
+    def test_port_in_use_ignores_time_wait(self):
+        """① TIME_WAIT 残留不能让 port_in_use_py 误判占用（否则改完面板端口改不回来）"""
+        import socket as _s
+        srv = _s.socket()
+        srv.setsockopt(_s.SOL_SOCKET, _s.SO_REUSEADDR, 1)
+        srv.bind(("127.0.0.1", 0))
+        port = srv.getsockname()[1]
+        srv.listen(1)
+        self.assertTrue(panel.port_in_use_py(port), "真正在 LISTEN 的端口必须判为占用")
+        c = _s.create_connection(("127.0.0.1", port), timeout=3)
+        conn, _ = srv.accept()
+        conn.close(); c.close(); srv.close()          # 服务端先关 → 服务端 TIME_WAIT
+        tw = 0
+        try:
+            for line in open("/proc/net/tcp"):
+                parts = line.split()
+                if len(parts) > 3 and parts[3] == "06" and int(parts[1].split(":")[1], 16) == port:
+                    tw += 1
+        except Exception:
+            pass
+        self.assertGreater(tw, 0, "应已产生 TIME_WAIT（测试前提）")
+        self.assertFalse(panel.port_in_use_py(port),
+                         "TIME_WAIT 不能被判为占用（v3.0.1 修复点：加 SO_REUSEADDR）")
+
+    def test_site_requires_nginx(self):
+        """③ 未装 nginx 时建站给出可操作引导（need_nginx），不再等写配置才报技术错误"""
+        real = panel.nginx_available
+        panel.nginx_available = lambda: False
+        try:
+            code, d = self._req("POST", "/api/sites",
+                                {"type": "static", "domain": "ngx.local", "cert_mode": "none"})
+        finally:
+            panel.nginx_available = real
+        self.assertEqual(code, 400, d)
+        self.assertTrue(d.get("need_nginx"), d)
+        self.assertIn("一键安装", d.get("error", ""))
+
+    def test_cert_ref_skips_reissuance(self):
+        """⑤ 引用已有证书时不再重复签发（旧实现白耗 Let's Encrypt 配额）"""
+        real_ready, real_task, real_nginx, real_dns = (panel.site_cert_ready, panel.start_task,
+                                                       panel.nginx_available, panel.site_dns_precheck)
+        calls = []
+        panel.nginx_available = lambda: True
+        panel.site_dns_precheck = lambda d, ref="": (True, "")
+        panel.site_cert_ready = lambda s: True
+        panel.site_cert_info = lambda s: {"on": True, "ref": "*.imaster.dpdns.org", "days": 70}
+        panel.start_task = lambda action, fn, *a: calls.append(action) or "fake-task"
+        try:
+            code, d = self._req("POST", "/api/sites",
+                                {"type": "static", "domain": "ref.local", "cert_mode": "auto",
+                                 "cert_ref": "*.imaster.dpdns.org"})
+        finally:
+            panel.site_cert_ready, panel.start_task = real_ready, real_task
+            panel.nginx_available, panel.site_dns_precheck = real_nginx, real_dns
+        self.assertEqual(code, 200, d)
+        self.assertEqual(calls, [], "引用已有证书时不该发起签发任务")
+        self.assertFalse(d.get("cert_task"))
+        self.assertIn("引用证书", d.get("msg", ""))
+        sid = d["site"]["id"]
+        # 手动「证书」按钮：已就绪 → 不签发
+        real_ready2, real_task2 = panel.site_cert_ready, panel.start_task
+        calls2 = []
+        panel.site_cert_ready = lambda s: True
+        panel.site_cert_info = lambda s: {"on": True, "ref": "*.imaster.dpdns.org", "days": 70}
+        panel.start_task = lambda action, fn, *a: calls2.append(action) or "t2"
+        try:
+            code, d2 = self._req("POST", "/api/sites/%s/cert" % sid, {})
+        finally:
+            panel.site_cert_ready, panel.start_task = real_ready2, real_task2
+        self.assertEqual(code, 200, d2)
+        self.assertEqual(calls2, [], "已就绪证书不该重复签发")
+        self.assertTrue(d2.get("reused"))
 
 
 if __name__ == "__main__":

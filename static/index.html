@@ -2270,9 +2270,12 @@ async function loadSites() {
     sitesLoaded = true;
     $("site_root_label").textContent = siteRoot;
     const ng = d.nginx || {};
-    $("site_status").textContent = ng.installed
-      ? (ng.active ? "Nginx 运行中" : "Nginx 已安装但未运行（systemctl start nginx）")
-      : "未检测到 Nginx：先在「反代证书」里一键安装";
+    if (!ng.installed) {
+      $("site_status").innerHTML = '未检测到 Nginx：网站需要 Nginx 才能对外服务'
+        + '<button class="btn mini" style="margin-left:8px" onclick="installNginx()">一键安装 Nginx + certbot</button>';
+    } else {
+      $("site_status").textContent = ng.active ? "Nginx 运行中" : "Nginx 已安装但未运行（systemctl start nginx）";
+    }
     renderSites();
   } catch (e) {
     box.innerHTML = '<div style="color:var(--danger);font-size:13px">加载失败：' + esc(e.message) + "</div>";
@@ -3426,12 +3429,14 @@ async function loadProxy() {
 async function installNginx() {
   confirmPanel("确认一键安装 Nginx 和 certbot？\n\n将自动：检测系统包管理器（apt/pacman/dnf）→ 安装缺失组件 → 启动 nginx → 写入默认配置与已有代理配置。\n可能需要几分钟，期间请勿关闭页面。", () => {
     // ⚠ 不能用 event.target：回调在确认弹窗确定按钮点击后执行，target 是确定按钮（v1.24.6 修复）
-    const btn = $("btn_install_nginx"); const old = btn.textContent;
-    btn.disabled = true; btn.textContent = "安装中...（几分钟）";
+    // v3.0.1：按钮可能不存在（从「网站」页调用时），且装完要刷新网站列表
+    const btn = $("btn_install_nginx"); const old = btn ? btn.textContent : "";
+    if (btn) { btn.disabled = true; btn.textContent = "安装中...（几分钟）"; }
     apiTask("POST", "/api/proxy/install", {}).then(d => {
       toast(d.msg || "安装完成", "okk"); loadProxy();
-      btn.disabled = false; btn.textContent = old;
-    }).catch(e => { toast(e.message, "err"); btn.disabled = false; btn.textContent = old; });
+      if (sitesLoaded) loadSites();
+      if (btn) { btn.disabled = false; btn.textContent = old; }
+    }).catch(e => { toast(e.message, "err"); if (btn) { btn.disabled = false; btn.textContent = old; } });
   }, "⚙️ 安装确认");
 }
 async function addProxy() {
