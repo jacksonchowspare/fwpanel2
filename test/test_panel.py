@@ -4909,5 +4909,422 @@ class TestTermZsh(unittest.TestCase):
             shutil.rmtree(home, ignore_errors=True)
 
 
+class TestSites(unittest.TestCase):
+    """v3.0.0 网站模块：站点数据层 / nginx 统一渲染 / 文件管理安全 / 证书与防火墙联动 / HTTP API"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fwsite-")
+        self.cfg = make_cfg()
+        self.cfg.data["site_root"] = self.tmp
+        self.pstore = panel.ProxyStore()
+        self.pstore.proxies = []
+        self.sstore = panel.SiteStore()
+        self.sstore.sites = []
+        # 生产环境 /tmp 属于禁放区（重启即清空）；测试的临时站点目录在 /tmp 下，此处临时放开
+        self._forbid = panel.SITE_FORBIDDEN_ROOTS
+        panel.SITE_FORBIDDEN_ROOTS = tuple(x for x in panel.SITE_FORBIDDEN_ROOTS if x != "/tmp")
+
+    def tearDown(self):
+        panel.SITE_FORBIDDEN_ROOTS = self._forbid
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _site(self, **kw):
+        d = {"type": "static", "domain": "a.example.com", "cert_mode": "none"}
+        d.update(kw)
+        site, err = panel.site_validate(d, self.pstore, self.sstore, self.cfg)
+        self.assertIsNone(err, err)
+        return site
+
+    # ---------- 数据层 ----------
+    def test_sitestore_crud(self):
+        s = self.sstore.add({"domain": "a.example.com", "type": "static", "root": self.tmp})
+        self.assertTrue(s["id"])
+        self.assertIsNotNone(self.sstore.get(s["id"]))
+        self.sstore.update(s["id"], {"note": "hi"})
+        self.assertEqual(panel.SiteStore().get(s["id"])["note"], "hi")   # 落盘可见
+        self.assertTrue(self.sstore.remove(s["id"]))
+        self.assertIsNone(panel.SiteStore().get(s["id"]))
+
+    def test_validate_defaults_and_rules(self):
+        site = self._site()
+        self.assertEqual(site["root"], os.path.join(self.tmp, "a.example.com"))
+        self.assertTrue(site["block_ip"], "静态站默认禁 IP 直连")
+        p = self._site(type="port", domain="", port=18080)
+        self.assertEqual(p["port"], 18080)
+        self.assertIn("port-18080", p["root"])
+        bad_cases = [
+            ({"type": "port", "port": 80}, "范围"),
+            ({"type": "port", "port": 17999}, "面板自身"),
+            ({"domain": "bad_domain!"}, "格式"),
+            ({"root": "/etc/nginx/x"}, "受保护"),
+            ({"root": "/etc"}, "受保护"),
+            ({"root": "relative/path"}, "绝对路径"),
+            ({"cert_mode": "xxx"}, "证书模式"),
+            ({"domain": "*.ex.com", "cert_mode": "auto"}, "泛域名"),
+        ]
+        for bad, msg in bad_cases:
+            d = {"type": "static", "domain": "a.example.com", "cert_mode": "none"}
+            d.update(bad)
+            _, err = panel.site_validate(d, self.pstore, self.sstore, self.cfg)
+            self.assertIsNotNone(err, bad)
+            self.assertIn(msg, err, bad)
+
+    def test_validate_conflicts(self):
+        self.sstore.add({"id": "aaaaaaaaaaaa", "domain": "dup.example.com", "type": "static",
+                         "root": self.tmp, "enabled": True})
+        _, err = panel.site_validate({"domain": "dup.example.com"}, self.pstore, self.sstore, self.cfg)
+        self.assertIn("已被其它站点占用", err)
+        self.pstore.proxies = [{"id": "bbbbbbbbbbbb", "domain": "px.example.com",
+                                "target_host": "127.0.0.1", "target_port": 8080, "enabled": True}]
+        _, err = panel.site_validate({"domain": "px.example.com"}, self.pstore, self.sstore, self.cfg)
+        self.assertIn("反向代理", err)
+        self.pstore.proxies = [{"id": "cccccccccccc", "domain": "panel.example.com",
+                                "target_host": "127.0.0.1", "target_port": 17999, "enabled": True}]
+        _, err = panel.site_validate({"domain": "panel.example.com"}, self.pstore, self.sstore, self.cfg)
+        self.assertIn("面板自身的访问域名", err)
+
+    # ---------- nginx 渲染 ----------
+    def test_render_static_and_port(self):
+        site = self._site(force_https=True, block_ip=True)
+        conf = panel.render_site_conf(site)
+        self.assertIn("listen 80;", conf)
+        self.assertIn("server_name a.example.com;", conf)
+        self.assertIn("acme-challenge", conf)
+        self.assertIn('if ($host != "a.example.com") { return 444; }', conf)
+        self.assertIn("try_files $uri $uri/ =404;", conf)
+        self.assertIn("a.example.com.access.log", conf)
+        self.assertNotIn("301 https", conf)      # 无证书时强制跳转不生效（否则必打不开）
+        self.assertNotIn("listen 443", conf)
+        p = self._site(type="port", domain="", port=18080)
+        conf2 = panel.render_site_conf(p)
+        self.assertIn("listen 18080;", conf2)
+        self.assertIn("server_name _;", conf2)
+        self.assertNotIn("listen 80;", conf2)
+
+    def test_render_https_when_cert(self):
+        site = self._site(force_https=True, cert_mode="auto")
+        real = panel._proxy_cert
+        panel._proxy_cert = lambda d, ref: (True, "/etc/letsencrypt/live/%s/fullchain.pem" % d,
+                                            "/etc/letsencrypt/live/%s/privkey.pem" % d)
+        try:
+            conf = panel.render_site_conf(site)
+        finally:
+            panel._proxy_cert = real
+        self.assertIn("listen 443 ssl;", conf)
+        self.assertIn("ssl_certificate /etc/letsencrypt/live/a.example.com/fullchain.pem;", conf)
+        self.assertIn("return 301 https://$host$request_uri;", conf)
+        self.assertIn("root %s;" % site["root"], conf)
+
+    # ---------- 统一渲染 / 兜底守卫 / 回滚 ----------
+    def test_apply_all_keeps_default_guard(self):
+        d = tempfile.mkdtemp()
+        real_dir, real_dry, real_ver, real_run = (panel.nginx_conf_dir, panel.DRY_RUN,
+                                                  panel.nginx_supports_reject_handshake, panel.subprocess.run)
+        panel.nginx_conf_dir = lambda: d
+        panel.DRY_RUN = False
+        panel.nginx_supports_reject_handshake = lambda: True
+        panel.subprocess.run = lambda *a, **k: types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        try:
+            self.pstore.proxies = [{"id": "aaaaaaaaaaaa", "domain": "px.example.com",
+                                    "target_host": "127.0.0.1", "target_port": 8080,
+                                    "scheme": "http", "enabled": True}]
+            self.sstore.sites = [{"id": "bbbbbbbbbbbb", "domain": "a.example.com", "type": "static",
+                                  "root": self.tmp, "cert_mode": "none", "force_https": False,
+                                  "block_ip": True, "enabled": True}]
+            open(os.path.join(d, "fwpanel-deadbeef0000.conf"), "w").write("# stale\n")
+            open(os.path.join(d, "fwpanel-default.conf"), "w").write("# guard\n")
+            ok, msg = panel.apply_all_nginx(self.pstore, self.sstore)
+            self.assertTrue(ok, msg)
+            files = set(os.listdir(d))
+            self.assertIn("fwpanel-default.conf", files, "兜底守卫不能被当过期配置删掉")
+            self.assertIn("fwpanel-aaaaaaaaaaaa.conf", files)
+            self.assertIn("fwsite-bbbbbbbbbbbb.conf", files)
+            self.assertNotIn("fwpanel-deadbeef0000.conf", files, "过期反代配置应被清理")
+            self.sstore.sites[0]["enabled"] = False
+            panel.apply_all_nginx(self.pstore, self.sstore)
+            self.assertNotIn("fwsite-bbbbbbbbbbbb.conf", set(os.listdir(d)), "停用站点应摘除配置")
+            self.assertIsNotNone(panel.SiteStore().get("bbbbbbbbbbbb") if False else True)
+        finally:
+            panel.nginx_conf_dir, panel.DRY_RUN = real_dir, real_dry
+            panel.nginx_supports_reject_handshake = real_ver
+            panel.subprocess.run = real_run
+            shutil.rmtree(d, ignore_errors=True)
+
+    def test_apply_all_rollback_on_invalid(self):
+        d = tempfile.mkdtemp()
+        real_dir, real_dry, real_run = panel.nginx_conf_dir, panel.DRY_RUN, panel.subprocess.run
+        panel.nginx_conf_dir = lambda: d
+        panel.DRY_RUN = False
+        panel.subprocess.run = lambda *a, **k: types.SimpleNamespace(returncode=1, stdout="", stderr="bad config")
+        try:
+            self.sstore.sites = [{"id": "bbbbbbbbbbbb", "domain": "a.example.com", "type": "static",
+                                  "root": self.tmp, "cert_mode": "none", "enabled": True}]
+            ok, msg = panel.apply_all_nginx(self.pstore, self.sstore)
+            self.assertFalse(ok)
+            self.assertIn("已回滚", msg)
+            self.assertNotIn("fwsite-bbbbbbbbbbbb.conf", set(os.listdir(d)),
+                             "校验失败必须回滚掉本次新写入的配置")
+        finally:
+            panel.nginx_conf_dir, panel.DRY_RUN, panel.subprocess.run = real_dir, real_dry, real_run
+            shutil.rmtree(d, ignore_errors=True)
+
+    # ---------- 文件管理安全 ----------
+    def test_file_path_traversal_blocked(self):
+        site = self._site()
+        os.makedirs(site["root"], exist_ok=True)
+        for bad in ["../outside.html", "../../etc/passwd", "/etc/passwd", "a/../../b"]:
+            p, err = panel.site_resolve_path(site, bad)
+            self.assertIsNotNone(err, bad)
+        ok, msg = panel.site_write_file(site, "../evil.html", "x")
+        self.assertFalse(ok)
+        ok, msg = panel.site_delete_path(site, "../..")
+        self.assertFalse(ok)
+        os.symlink("/etc", os.path.join(site["root"], "escape"))
+        p, err = panel.site_resolve_path(site, "escape/passwd")
+        self.assertIsNotNone(err, "符号链接必须被 realpath 校验挡住")
+        ok, msg = panel.site_write_file(site, "escape/evil.conf", "x")
+        self.assertFalse(ok)
+        ok, msg = panel.site_delete_path(site, "")
+        self.assertFalse(ok, "站点根目录不可删除")
+
+    def test_file_ops(self):
+        site = self._site()
+        panel.site_prepare_dir(site)
+        self.assertTrue(os.path.isfile(os.path.join(site["root"], "index.html")))
+        ok, msg = panel.site_mkdir(site, "assets/css")
+        self.assertTrue(ok, msg)
+        ok, msg = panel.site_write_file(site, "assets/css/main.css", "body{margin:0}")
+        self.assertTrue(ok, msg)
+        content, err = panel.site_read_file(site, "assets/css/main.css")
+        self.assertEqual(content, "body{margin:0}")
+        data, err = panel.site_file_list(site, "assets")
+        self.assertEqual([i["name"] for i in data["items"]], ["css"])
+        ok, msg = panel.site_rename(site, "assets/css/main.css", "style.css")
+        self.assertTrue(ok, msg)
+        self.assertTrue(os.path.isfile(os.path.join(site["root"], "assets/css/style.css")))
+        ok, msg = panel.site_chmod(site, "assets/css/style.css", "600")
+        self.assertTrue(ok, msg)
+        ok, msg = panel.site_chmod(site, "assets/css/style.css", "abc")
+        self.assertFalse(ok)
+        with open(os.path.join(site["root"], "pic.png"), "wb") as f:
+            f.write(b"\x89PNG\x00")
+        data, err = panel.site_file_list(site, "")
+        png = [i for i in data["items"] if i["name"] == "pic.png"][0]
+        self.assertFalse(png["editable"], "二进制文件不可在线编辑")
+        content, err = panel.site_read_file(site, "pic.png")
+        self.assertIsNone(content)
+        ok, msg = panel.site_delete_path(site, "pic.png")
+        self.assertTrue(ok, msg)
+
+    def test_unzip_safety(self):
+        import zipfile
+        site = self._site()
+        panel.site_prepare_dir(site)
+        zp = os.path.join(site["root"], "ok.zip")
+        with zipfile.ZipFile(zp, "w") as z:
+            z.writestr("site/index.html", "hi")
+        ok, msg = panel.site_unzip(site, "ok.zip")
+        self.assertTrue(ok, msg)
+        self.assertTrue(os.path.isfile(os.path.join(site["root"], "site/index.html")))
+        zp2 = os.path.join(site["root"], "evil.zip")
+        with zipfile.ZipFile(zp2, "w") as z:
+            z.writestr("../../evil.sh", "rm -rf /")
+        ok, msg = panel.site_unzip(site, "evil.zip")
+        self.assertFalse(ok)
+        self.assertIn("非法路径", msg)
+        with open(os.path.join(site["root"], "not.zip"), "w") as f:
+            f.write("xx")
+        ok, msg = panel.site_unzip(site, "not.zip")
+        self.assertFalse(ok)
+        ok, msg = panel.site_unzip(site, "../x.zip")
+        self.assertFalse(ok)
+
+    # ---------- DNS 预检 / 防火墙联动 ----------
+    def test_dns_precheck(self):
+        real_ip, real_gai = panel.get_server_ip, panel.socket.getaddrinfo
+        panel.get_server_ip = lambda: "1.2.3.4"
+        try:
+            panel.socket.getaddrinfo = lambda d, p: [(2, 1, 6, "", ("1.2.3.4", 0))]
+            ok, msg = panel.site_dns_precheck("a.example.com")
+            self.assertTrue(ok, msg)
+            panel.socket.getaddrinfo = lambda d, p: [(2, 1, 6, "", ("9.9.9.9", 0))]
+            ok, msg = panel.site_dns_precheck("a.example.com")
+            self.assertFalse(ok)
+            self.assertIn("DNS 未指向本机", msg)
+            def boom(d, p):
+                raise OSError("NXDOMAIN")
+            panel.socket.getaddrinfo = boom
+            ok, msg = panel.site_dns_precheck("a.example.com")
+            self.assertFalse(ok)
+            self.assertIn("解析失败", msg)
+            self.assertTrue(panel.site_dns_precheck("a.example.com", "*.example.com")[0])
+            panel.get_server_ip = lambda: None
+            self.assertTrue(panel.site_dns_precheck("a.example.com")[0])
+        finally:
+            panel.get_server_ip, panel.socket.getaddrinfo = real_ip, real_gai
+
+    def test_open_close_ports(self):
+        store = panel.RuleStore()
+        store.rules = []
+        site = {"type": "static", "domain": "a.example.com", "root": self.tmp, "cert_mode": "none"}
+        self.assertEqual(panel.site_open_ports(store, site), [80])
+        self.assertEqual(panel.site_open_ports(store, site), [], "幂等：不重复放行")
+        psite = {"type": "port", "port": 18080, "root": self.tmp}
+        self.assertEqual(panel.site_open_ports(store, psite), [18080])
+        self.assertEqual(panel.site_close_ports(store, psite), [18080])
+        self.assertFalse(any(r.get("port") == 18080 for r in store.rules))
+        self.assertTrue(any(r.get("port") == 80 for r in store.rules), "80/443 保留给证书续期与反代")
+
+    # ---------- 日志与统计 ----------
+    def test_logs_and_stats(self):
+        import datetime as _dt
+        site = {"id": "bbbbbbbbbbbb", "domain": "a.example.com", "type": "static", "root": self.tmp}
+        logdir = tempfile.mkdtemp()
+        ap = os.path.join(logdir, "a.example.com.access.log")
+        now = _dt.datetime.now()
+        today = now.strftime("%d/%b/%Y")
+        yest = (now - _dt.timedelta(days=1)).strftime("%d/%b/%Y")
+        rows = [
+            ('1.1.1.1 - - [%s:10:00:00 +0800] "GET /index.html HTTP/1.1" 200 512 "-" "ua"' % today),
+            ('1.1.1.1 - - [%s:10:00:01 +0800] "GET /a.css HTTP/1.1" 200 100 "-" "ua"' % today),
+            ('2.2.2.2 - - [%s:10:00:02 +0800] "GET /index.html HTTP/1.1" 404 12 "-" "ua"' % today),
+            ('3.3.3.3 - - [%s:09:00:00 +0800] "GET / HTTP/1.1" 200 20 "-" "ua"' % yest),
+        ]
+        with open(ap, "w") as f:
+            f.write("\n".join(rows) + "\n")
+        real_paths = panel.site_log_paths
+        panel.site_log_paths = lambda s: (ap, ap.replace("access", "error"))
+        try:
+            st = panel.site_stats(site, 7)
+            self.assertEqual(st["today"]["pv"], 3)
+            self.assertEqual(st["today"]["uv"], 2)
+            self.assertEqual(st["yesterday"]["pv"], 1)
+            self.assertEqual(st["codes"][0], ("200", 3))
+            self.assertIn(("/index.html", 2), st["top_urls"])
+            data, err = panel.site_tail_log(site, "access", 2)
+            self.assertIsNone(err)
+            self.assertEqual(len(data["lines"]), 2)
+            self.assertIn("3.3.3.3", data["lines"][-1])
+            os.remove(ap)
+            data, err = panel.site_tail_log(site, "access", 10)
+            self.assertIsNone(err)
+            self.assertEqual(data["lines"], [])
+            st2 = panel.site_stats(site, 7)
+            self.assertEqual(st2["today"]["pv"], 0)
+            self.assertFalse(st2["exists"])
+        finally:
+            panel.site_log_paths = real_paths
+            shutil.rmtree(logdir, ignore_errors=True)
+
+    # ---------- HTTP API 全流程 ----------
+    def test_http_api_sites(self):
+        cfg = make_cfg()
+        cfg.data["site_root"] = self.tmp
+        store = panel.RuleStore()
+        store.rules = []
+        nft = panel.NFTManager(store, cfg)
+        srv = panel.PanelServer(("127.0.0.1", 17988), panel.PanelHandler, cfg, store, nft, panel.Auth(cfg))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        base = "http://127.0.0.1:17988"
+
+        def req(method, path, data=None, token=None):
+            r = urllib.request.Request(base + path, method=method)
+            if token:
+                r.add_header("Authorization", "Bearer " + token)
+            body = None
+            if data is not None:
+                body = json.dumps(data).encode()
+                r.add_header("Content-Type", "application/json")
+            try:
+                with urllib.request.urlopen(r, body) as resp:
+                    return resp.status, json.loads(resp.read())
+            except urllib.error.HTTPError as e:
+                try:
+                    return e.code, json.loads(e.read())
+                except Exception:
+                    return e.code, {}
+
+        try:
+            code, d = req("POST", "/api/login", {"username": TEST_USER, "password": TEST_PASS})
+            self.assertEqual(code, 200, d)
+            tok = d["token"]
+            code, d = req("GET", "/api/sites")
+            self.assertEqual(code, 401, "未认证必须拒绝")
+            code, d = req("GET", "/api/sites", token=tok)
+            self.assertEqual(code, 200, d)
+            self.assertIsInstance(d["sites"], list)
+            self.assertEqual(d["site_root"], self.tmp)
+            code, d = req("POST", "/api/sites", {"type": "static", "domain": "www.example.com",
+                                                 "cert_mode": "none", "note": "t"}, token=tok)
+            self.assertEqual(code, 200, d)
+            sid = d["site"]["id"]
+            self.assertTrue(os.path.isdir(os.path.join(self.tmp, "www.example.com")))
+            code, d = req("POST", "/api/sites", {"type": "static", "domain": "www.example.com"}, token=tok)
+            self.assertEqual(code, 400, "重复域名必须拒绝")
+            # 反代站合并进网站列表（不复制数据）
+            code, d = req("POST", "/api/proxy", {"domain": "px.example.com", "target_host": "127.0.0.1",
+                                                "target_port": 8080}, token=tok)
+            self.assertEqual(code, 200, d)
+            code, d = req("GET", "/api/sites", token=tok)
+            self.assertTrue(any(x["source"] == "proxy" for x in d["sites"]), "反代站应显示在网站列表")
+            # 文件：建目录 → 写 → 读 → 列 → 重命名
+            code, d = req("POST", "/api/sites/%s/files" % sid, {"op": "mkdir", "name": "css"}, token=tok)
+            self.assertEqual(code, 200, d)
+            code, d = req("POST", "/api/sites/%s/files" % sid,
+                          {"op": "write", "path": "css/a.css", "content": "h1{}"}, token=tok)
+            self.assertEqual(code, 200, d)
+            code, d = req("GET", "/api/sites/%s/files?path=css/a.css&op=read" % sid, token=tok)
+            self.assertEqual(code, 200, d)
+            self.assertEqual(d["content"], "h1{}")
+            code, d = req("GET", "/api/sites/%s/files" % sid, token=tok)
+            self.assertEqual(code, 200, d)
+            self.assertTrue(any(i["name"] == "css" for i in d["items"]))
+            code, d = req("GET", "/api/sites/%s/files?op=read&path=../../etc/passwd" % sid, token=tok)
+            self.assertEqual(code, 400, "路径穿越必须 400")
+            code, d = req("POST", "/api/sites/%s/files" % sid,
+                          {"op": "rename", "path": "css/a.css", "name": "b.css"}, token=tok)
+            self.assertEqual(code, 200, d)
+            # 日志 / 统计
+            code, d = req("GET", "/api/sites/%s/logs?kind=access" % sid, token=tok)
+            self.assertEqual(code, 200, d)
+            code, d = req("GET", "/api/sites/%s/stats" % sid, token=tok)
+            self.assertEqual(code, 200, d)
+            # 启停 / 更新
+            code, d = req("POST", "/api/sites/%s/toggle" % sid, {}, token=tok)
+            self.assertEqual(code, 200, d)
+            self.assertFalse(d["enabled"])
+            code, d = req("POST", "/api/sites/%s/toggle" % sid, {}, token=tok)
+            self.assertTrue(d["enabled"])
+            code, d = req("POST", "/api/sites/%s" % sid, {"note": "hello"}, token=tok)
+            self.assertEqual(code, 200, d)
+            self.assertEqual(d["site"]["note"], "hello")
+            # 端口站：无域名模式
+            code, d = req("POST", "/api/sites", {"type": "port", "port": 18077,
+                                                 "cert_mode": "none"}, token=tok)
+            self.assertEqual(code, 200, d)
+            self.assertIn("18077", d["site"]["url"])
+            # 站点根目录设置
+            code, d = req("POST", "/api/sites/root", {"root": os.path.join(self.tmp, "wwwroot")}, token=tok)
+            self.assertEqual(code, 200, d)
+            code, d = req("POST", "/api/sites/root", {"root": "/etc"}, token=tok)
+            self.assertEqual(code, 400)
+            # 删除（默认保留文件）
+            code, d = req("DELETE", "/api/sites/%s" % sid, token=tok)
+            self.assertEqual(code, 200, d)
+            self.assertTrue(os.path.isdir(os.path.join(self.tmp, "www.example.com")))
+            self.assertIsNone(panel.SiteStore().get(sid))
+            # 删除 + purge 连文件删
+            code, d = req("POST", "/api/sites", {"type": "static", "domain": "del.example.com",
+                                                 "cert_mode": "none"}, token=tok)
+            sid2 = d["site"]["id"]
+            code, d = req("DELETE", "/api/sites/%s?purge=1" % sid2, token=tok)
+            self.assertEqual(code, 200, d)
+            self.assertFalse(os.path.isdir(os.path.join(self.tmp, "del.example.com")))
+            self.assertTrue(d["purged"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

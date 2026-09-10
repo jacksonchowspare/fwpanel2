@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "2.1.32"
+CURRENT_VERSION = "3.0.0"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -582,6 +582,7 @@ FED_LONG_TASK_PREFIXES = (
     "/api/docker/data-root",
     "/api/proxy/install", "/api/proxy/",
     "/api/cert/", "/api/upgrade",
+    "/api/sites/",                       # v3.0.0：网站文件上传/解压可能较慢
 )
 
 
@@ -2212,42 +2213,893 @@ def render_proxy_conf(p):
     return "\n".join(lines) + "\n"
 
 
-def apply_proxies(store):
-    """生成所有启用代理的 nginx 配置 → nginx -t 校验 → reload"""
+# ------------------------------- 网站（站点管理，v3.0.0） -------------------------------
+# 设计要点（三条约束，改动前必读）：
+# 1) 反代站不复制数据：网站列表 = sites.json(静态站/端口站) ∪ proxies.json(反代站)，
+#    反代记录只有一份真相，站点模块只做视图合并，避免两边不同步
+# 2) nginx 配置只有一个渲染出口 apply_all_nginx()：旧的 apply_proxies 收敛为它的包装，
+#    否则两套渲染互相覆盖/误删（旧实现就踩过）
+# 3) 站点配置前缀 fwsite-，与反代 fwpanel- 分开：万一从 v3 退回 v2，v2 的清理循环
+#    只认 fwpanel-<12位hex>.conf，不会删掉站点配置（网站不会瞬间全 404）
+SITES_FILE = os.path.join(BASE_DIR, "sites.json")
+PROXY_CONF_PREFIX = "fwpanel-"
+SITE_CONF_PREFIX = "fwsite-"
+DEFAULT_SITE_ROOT = "/var/www"
+# ⚠ 清理失效配置必须按「12 位小写十六进制 id」校验形状：
+# id = secrets.token_hex(6)。旧实现只判断前缀 fwpanel-，于是兜底守卫配置
+# fwpanel-default.conf（id 段是 "default"）每次写完后立刻被当过期配置删掉 ——
+# default_server 444 / 443 ssl_reject_handshake 守卫实际从未生效（2026-09-10 实测确认）
+CONF_ID_RE = re.compile(r"^[0-9a-f]{12}$")
+SITE_TYPES = ("static", "port")
+# 站点目录禁放区（防误操作毁系统 / 面板自身数据）
+SITE_FORBIDDEN_ROOTS = ("/", "/etc", "/root", "/boot", "/proc", "/sys", "/dev", "/run",
+                        "/usr", "/bin", "/sbin", "/lib", "/var/log", "/var/lib", "/tmp")
+SITE_DEFAULT_INDEX = """<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title}</title>
+<style>
+ body {{ margin:0; min-height:100vh; display:flex; align-items:center; justify-content:center;
+         font-family:-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+         background:#12141a; color:#e8eaee; }}
+ .box {{ text-align:center; padding:48px 36px; border:1px solid #262a33; border-radius:12px; background:#171a21; }}
+ h1 {{ font-size:20px; font-weight:600; margin:0 0 12px; }}
+ p {{ margin:6px 0 0; color:#98a2b3; font-size:13px; }}
+</style>
+</head>
+<body>
+<div class="box">
+  <h1>{title}</h1>
+  <p>站点已创建，把网站文件放进本目录（入口 index.html）即可访问</p>
+  <p>生成自 FW-Panel2 网站模块</p>
+</div>
+</body>
+</html>
+"""
+
+
+def site_root_base(cfg=None):
+    """站点根目录：优先 config.json 的 site_root（「网站」设置可改），默认 /var/www"""
+    base = ""
+    if cfg is not None:
+        try:
+            base = str(cfg.get("site_root", "") or "")
+        except Exception:
+            base = ""
+    if not base:
+        try:
+            base = str(Config().get("site_root", "") or "")
+        except Exception:
+            base = ""
+    base = (base or DEFAULT_SITE_ROOT).strip().rstrip("/")
+    if not base.startswith("/"):
+        base = DEFAULT_SITE_ROOT
+    return base or DEFAULT_SITE_ROOT
+
+
+def site_root_ok(path):
+    """站点目录是否允许：绝对路径 + 不在禁放区 + 不落在面板数据/ACME/证书/nginx 目录内"""
+    if not path or not os.path.isabs(path):
+        return False
+    p = os.path.normpath(path)
+    if p in SITE_FORBIDDEN_ROOTS:
+        return False
+    for f in SITE_FORBIDDEN_ROOTS:
+        if f != "/" and p.startswith(f.rstrip("/") + "/"):
+            return False
+    for f in (BASE_DIR, ACME_WEBROOT, LE_LIVE, "/etc/nginx"):
+        f = str(f).rstrip("/")
+        if f and (p == f or p.startswith(f + "/")):
+            return False
+    return True
+
+
+def site_conf_name(sid):
+    return f"{SITE_CONF_PREFIX}{sid}.conf"
+
+
+def proxy_conf_name(pid):
+    return f"{PROXY_CONF_PREFIX}{pid}.conf"
+
+
+class SiteStore:
+    """站点清单（静态站 / 无域名端口站）持久化；反代站不入此表（视图合并 proxies.json）"""
+
+    def __init__(self):
+        self.sites = self._load()
+
+    def _load(self):
+        try:
+            with open(SITES_FILE) as f:
+                data = json.load(f)
+                return data if isinstance(data, list) else []
+        except Exception:
+            return []
+
+    def save(self):
+        os.makedirs(BASE_DIR, exist_ok=True)
+        tmp = SITES_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(self.sites, f, indent=2, ensure_ascii=False)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, SITES_FILE)
+
+    def get(self, sid):
+        for s in self.sites:
+            if s.get("id") == sid:
+                return s
+        return None
+
+    def add(self, s):
+        s = dict(s)
+        s["id"] = secrets.token_hex(6)
+        s.setdefault("enabled", True)
+        s["created"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.sites.append(s)
+        self.save()
+        return s
+
+    def update(self, sid, changes):
+        s = self.get(sid)
+        if not s:
+            return None
+        s.update(changes)
+        self.save()
+        return s
+
+    def remove(self, sid):
+        if not self.get(sid):
+            return False
+        self.sites = [x for x in self.sites if x.get("id") != sid]
+        self.save()
+        return True
+
+
+def site_validate(data, pstore, sstore, cfg, exclude_id=None):
+    """校验并归一化站点配置 → (site_dict, error)"""
+    t = str(data.get("type", "static")).strip().lower()
+    if t not in SITE_TYPES:
+        return None, "站点类型必须是 static（静态站）或 port（无域名端口站）"
+    cert_mode = str(data.get("cert_mode", "none")).strip().lower()
+    if cert_mode not in ("auto", "none"):
+        return None, "证书模式必须是 auto（自动签发）或 none（暂不签）"
+    domain = str(data.get("domain", "")).strip().lower()
+    port = 0
+    panel_port = int(cfg.get("port", 0) or 0)
+    ssh_port = int(cfg.get("ssh_port", 0) or 0)
+    if t == "static":
+        if not domain:
+            return None, "域名不能为空（没有域名请选「无域名端口站」）"
+        if not re.fullmatch(r"[a-zA-Z0-9.*_-]+", domain):
+            return None, "域名格式无效（支持 example.com 或 *.example.com）"
+        if domain.startswith("*.") and cert_mode == "auto":
+            return None, "泛域名无法用 HTTP-01 自动签发：请先在证书模块用 DNS 验证申请，再在本站点引用"
+        for p in pstore.proxies:
+            if (p.get("domain") or "").lower() != domain:
+                continue
+            if p.get("target_port") == panel_port:
+                return None, "该域名是面板自身的访问域名，网站模块不可占用（防面板失联）"
+            return None, f"域名 {domain} 已在「反向代理」中使用（网站列表里已显示为反代站），请到反代模块管理"
+        for s in sstore.sites:
+            if s.get("domain") == domain and s.get("id") != exclude_id:
+                return None, f"域名 {domain} 已被其它站点占用"
+    else:
+        try:
+            port = int(data.get("port", 0))
+        except (TypeError, ValueError):
+            return None, "监听端口必须是数字"
+        if not (1024 <= port <= 65535):
+            return None, "监听端口范围 1024-65535（1024 以下为系统保留）"
+        if port == panel_port:
+            return None, "该端口是面板自身端口，不能占用"
+        if port == ssh_port:
+            return None, "该端口是 SSH 保护端口，不能占用"
+        for s in sstore.sites:
+            if (s.get("type") == "port" and int(s.get("port", 0) or 0) == port
+                    and s.get("id") != exclude_id):
+                return None, f"端口 {port} 已被其它站点占用"
+    root = str(data.get("root", "")).strip()
+    if not root:
+        root = os.path.join(site_root_base(cfg),
+                            domain if t == "static" else f"port-{port}")
+    root = os.path.normpath(root)
+    if not os.path.isabs(root):
+        return None, "站点目录必须是绝对路径"
+    if not site_root_ok(root):
+        return None, f"站点目录不合法或属于受保护路径：{root}"
+    site = {
+        "domain": domain,
+        "type": t,
+        "root": root,
+        "cert_mode": cert_mode,
+        "cert_ref": str(data.get("cert_ref", "") or "").strip().lower(),
+        "force_https": bool(data.get("force_https")),
+        "block_ip": bool(data.get("block_ip", True)),
+        "note": str(data.get("note", "") or "").strip()[:120],
+        "enabled": bool(data.get("enabled", True)),
+    }
+    if t == "port":
+        site["port"] = port
+    return site, None
+
+
+def site_prepare_dir(site):
+    """创建站点目录 + 默认首页；root 运行时把属主交给 www-data（网站可写、面板可管）"""
+    root = site["root"]
+    created = not os.path.isdir(root)
+    os.makedirs(root, exist_ok=True)
+    idx = os.path.join(root, "index.html")
+    if not os.path.exists(idx):
+        title = site.get("domain") or ("端口 " + str(site.get("port", "")))
+        with open(idx, "w") as f:
+            f.write(SITE_DEFAULT_INDEX.format(title=title))
+    if os.geteuid() == 0:
+        try:
+            import pwd
+            u = pwd.getpwnam("www-data")
+            for pth, mode in ((root, 0o755), (idx, 0o644)):
+                os.chown(pth, u.pw_uid, u.pw_gid)
+                os.chmod(pth, mode)
+        except Exception:
+            pass
+    return created
+
+
+def site_cert_info(site):
+    """站点证书状态：{on, ref, days}（days=None = 无证书或读不出到期时间）"""
+    domain = site.get("domain") or ""
+    if not domain or site.get("cert_mode") != "auto":
+        return {"on": False, "ref": "", "days": None}
+    ref = (site.get("cert_ref") or domain).strip()
+    on, fc, key = _proxy_cert(domain, site.get("cert_ref"))
+    days = None
+    ts = cert_status(ref)
+    if ts:
+        try:
+            days = int((int(ts) - time.time()) // 86400)
+        except Exception:
+            days = None
+    return {"on": bool(on), "ref": ref if on else "", "days": days}
+
+
+def site_view(s):
+    """站点 → 前端视图（补访问地址与证书状态）"""
+    v = dict(s)
+    ci = site_cert_info(s)
+    domain = s.get("domain") or ""
+    if domain:
+        url = f"https://{domain}" if ci["on"] else f"http://{domain}"
+    else:
+        ip = get_server_ip() or "服务器IP"
+        url = f"http://{ip}:{s.get('port')}"
+    v.update({"source": "site", "url": url, "cert": ci, "label": "静态站" if s.get("type") == "static" else "端口站"})
+    return v
+
+
+def proxy_site_view(p):
+    """反代记录 → 网站视图（只读展示 + 跳转反代模块管理，不复制数据）"""
+    domain = p.get("domain") or ""
+    on, fc, key = _proxy_cert(domain, p.get("cert_ref"))
+    days = None
+    ts = cert_status((p.get("cert_ref") or domain).strip())
+    if ts:
+        try:
+            days = int((int(ts) - time.time()) // 86400)
+        except Exception:
+            days = None
+    upstream = f"{p.get('scheme', 'http')}://{p.get('target_host')}:{p.get('target_port')}"
+    return {
+        "id": "p_" + str(p.get("id")),
+        "proxy_id": p.get("id"),
+        "source": "proxy",
+        "label": "反代站",
+        "type": "proxy",
+        "domain": domain,
+        "root": "",
+        "upstream": upstream,
+        "cert": {"on": bool(on), "ref": (p.get("cert_ref") or domain) if on else "", "days": days},
+        "url": f"https://{domain}" if on else f"http://{domain}",
+        "enabled": bool(p.get("enabled", True)),
+        "note": "",
+        "created": "",
+    }
+
+
+SITE_EDIT_MAX_BYTES = 2 * 1024 * 1024        # 在线编辑上限 2MB
+SITE_UPLOAD_MAX_BYTES = 32 * 1024 * 1024     # 单文件上传上限 32MB
+SITE_UNZIP_MAX_BYTES = 512 * 1024 * 1024     # 解压后总量上限 512MB（防 zip 炸弹）
+SITE_LOG_TAIL_BYTES = 256 * 1024             # 日志只读尾部（避免大文件全量进内存）
+# 允许在线编辑的文本类扩展名（白名单：其余一律只给下载，不给编辑）
+SITE_TEXT_EXT = {
+    ".html", ".htm", ".xhtml", ".css", ".js", ".mjs", ".json", ".txt", ".md", ".markdown",
+    ".xml", ".yml", ".yaml", ".toml", ".ini", ".conf", ".cfg", ".env", ".php", ".py", ".sh",
+    ".sql", ".csv", ".tsv", ".log", ".svg", ".vue", ".ts", ".jsx", ".tsx", ".htaccess",
+}
+SITE_TEXT_NAMES = {"CNAME", "README", "LICENSE", "robots.txt", "sitemap.xml", ".htaccess"}
+
+_ACCESS_RE = re.compile(
+    r'^(?P<ip>\S+) \S+ \S+ \[(?P<t>[^\]]+)\] "(?P<req>[^"]*)" (?P<status>\d{3}) (?P<size>\S+)')
+
+
+def site_log_name(site):
+    """站点日志文件名（与 render_site_conf 生成的一致：域名安全化，端口站用 site-<id>）"""
+    domain = (site.get("domain") or "").strip()
+    return re.sub(r"[^A-Za-z0-9._-]", "_", domain) if domain else f"site-{site.get('id', 'x')}"
+
+
+def site_log_paths(site):
+    """站点日志路径（access, error）"""
+    name = site_log_name(site)
+    return (f"/var/log/nginx/{name}.access.log", f"/var/log/nginx/{name}.error.log")
+
+
+def site_available_certs():
+    """可引用的已签发证书（LE_LIVE 下的目录）→ [{ref, days}]"""
+    out = []
+    try:
+        for name in sorted(os.listdir(LE_LIVE)):
+            if os.path.isfile(os.path.join(LE_LIVE, name, "fullchain.pem")):
+                days = None
+                ts = cert_status(name)
+                if ts:
+                    try:
+                        days = int((int(ts) - time.time()) // 86400)
+                    except Exception:
+                        days = None
+                out.append({"ref": name, "days": days})
+    except Exception:
+        pass
+    return out
+
+
+def site_dns_precheck(domain, cert_ref=""):
+    """签发前预检域名是否已解析到本机 —— 避免白等一次注定失败的签发。
+    返回 (ok, msg)。引用已有证书/取不到公网 IP/查询异常时一律放行（交给 ACME 结果说话）"""
+    if cert_ref or not domain:
+        return True, ""
+    try:
+        server_ip = get_server_ip()
+    except Exception:
+        server_ip = None
+    if not server_ip:
+        return True, ""
+    try:
+        ips = {info[4][0] for info in socket.getaddrinfo(domain, None)}
+    except Exception as e:
+        return False, (f"域名 {domain} 解析失败（{e}）：请先把 A 记录指向 {server_ip} 再试，"
+                       f"或在向导里选「暂不签证书」先用 HTTP 跑起来")
+    if server_ip not in ips:
+        got = ", ".join(sorted(ips)[:3]) or "无"
+        return False, (f"域名 {domain} 当前解析到 {got}，本机公网 IP 是 {server_ip}："
+                       f"DNS 未指向本机，签发必然失败。请先改 DNS，或选「暂不签证书」")
+    return True, ""
+
+
+def site_issue_cert(sid):
+    """后台任务体：给站点申请证书（HTTP-01）→ 成功后重新渲染 nginx。返回 (ok, msg)"""
+    sstore = SiteStore()
+    s = sstore.get(sid)
+    if not s:
+        return False, "站点已不存在"
+    domain = (s.get("domain") or "").strip()
+    if not domain:
+        return False, "端口站（无域名）不需要证书"
+    try:
+        email = str(Config().get("acme_email", "") or "")
+    except Exception:
+        email = ""
+    ok, msg = issue_cert(domain, email)
+    if not ok:
+        return False, msg
+    ok2, msg2 = apply_all_nginx(ProxyStore(), SiteStore(), None)
+    if not ok2:
+        return False, f"证书已签发，但 nginx 重载失败：{msg2}"
+    return True, f"证书已签发并启用 HTTPS（{msg2}）"
+
+
+def site_open_ports(store, site):
+    """建站放行入口端口（严格模式必需）→ 返回新放行的端口列表。
+    静态站：80 必放（ACME HTTP-01 要用），有证书时加 443；端口站：放行自定义端口"""
+    ports = []
+    if site.get("type") == "static":
+        ports = [80]
+        if site_cert_info(site)["on"] or site.get("force_https"):
+            ports.append(443)
+    else:
+        p = int(site.get("port", 0) or 0)
+        if p:
+            ports = [p]
+    changed = []
+    for p in ports:
+        if any(r.get("type") == "port_allow" and r.get("port") == p for r in store.rules):
+            continue
+        comment = {80: "网站:HTTP", 443: "网站:HTTPS"}.get(p, "网站:自定义端口")
+        store.add({"type": "port_allow", "proto": "tcp", "port": p, "comment": comment})
+        changed.append(p)
+    if changed:
+        store.save()
+    return changed
+
+
+def site_close_ports(store, site):
+    """删除站点时回收它专属的放行规则（80/443 保留——证书续期与反代可能还要用）"""
+    if site.get("type") != "port":
+        return []
+    p = int(site.get("port", 0) or 0)
+    if not p:
+        return []
+    keep = [r for r in store.rules
+            if not (r.get("type") == "port_allow" and r.get("port") == p
+                    and r.get("comment") == "网站:自定义端口")]
+    removed = len(store.rules) - len(keep)
+    if removed:
+        store.rules = keep
+        store.save()
+    return [p] if removed else []
+
+
+def site_resolve_path(site, rel):
+    """站点内路径解析（路径穿越防护）：realpath 归一后必须落在站点根目录内。
+    rel 为空 = 站点根。返回 (abs_path, err)"""
+    root = os.path.realpath(site["root"])
+    rel = (rel or "").strip().replace("\\", "/")
+    if rel.startswith("/"):
+        return None, "请使用站点内的相对路径"
+    rel = rel.lstrip("/")
+    if "\x00" in rel:
+        return None, "非法路径"
+    p = os.path.realpath(os.path.join(root, rel))
+    if p != root and not p.startswith(root + os.sep):
+        return None, "路径越界：只允许操作站点目录内的文件"
+    return p, None
+
+
+def site_editable(name, size=0):
+    """是否允许在线编辑（文本白名单 + 体积上限）"""
+    if size and size > SITE_EDIT_MAX_BYTES:
+        return False
+    if name in SITE_TEXT_NAMES:
+        return True
+    return os.path.splitext(name)[1].lower() in SITE_TEXT_EXT
+
+
+def site_file_list(site, rel=""):
+    """列目录 → {path, abs, items[]}；符号链接只展示不跟随（点进去会被 realpath 校验挡住）"""
+    d, err = site_resolve_path(site, rel)
+    if err:
+        return None, err
+    if not os.path.isdir(d):
+        return None, "目录不存在"
+    items = []
+    for name in os.listdir(d):
+        fp = os.path.join(d, name)
+        try:
+            st = os.lstat(fp)
+            is_link = os.path.islink(fp)
+            is_dir = os.path.isdir(fp) and not is_link
+            items.append({
+                "name": name,
+                "dir": is_dir,
+                "link": is_link,
+                "size": 0 if is_dir else st.st_size,
+                "mtime": int(st.st_mtime),
+                "mode": oct(st.st_mode & 0o777)[2:],
+                "editable": (not is_dir) and (not is_link) and site_editable(name, st.st_size),
+            })
+        except OSError:
+            continue
+    items.sort(key=lambda x: (not x["dir"], x["name"].lower()))
+    return {"path": (rel or "").strip().strip("/"), "abs": d, "items": items}, None
+
+
+def site_chown_www(p, mode=None):
+    """把站点内的文件/目录属主交给 www-data（root 运行时），确保 nginx 可读"""
+    if os.geteuid() != 0:
+        return
+    try:
+        import pwd
+        u = pwd.getpwnam("www-data")
+        os.chown(p, u.pw_uid, u.pw_gid)
+        if mode:
+            os.chmod(p, mode)
+    except Exception:
+        pass
+
+
+def site_write_file(site, rel, content, overwrite=True):
+    """写入/新建站点内文件（限文本白名单 + 2MB）"""
+    if not isinstance(content, str):
+        return False, "内容格式错误"
+    if len(content.encode("utf-8", "replace")) > SITE_EDIT_MAX_BYTES:
+        return False, f"内容超过 {SITE_EDIT_MAX_BYTES // 1024 // 1024}MB 上限"
+    name = os.path.basename((rel or "").replace("\\", "/").rstrip("/"))
+    if not name:
+        return False, "请指定文件名"
+    if not site_editable(name):
+        return False, "该类型文件不支持在线编辑（可在文件列表里下载后修改再上传）"
+    p, err = site_resolve_path(site, rel)
+    if err:
+        return False, err
+    if os.path.isdir(p):
+        return False, "目标是目录"
+    if os.path.islink(p):
+        return False, "拒绝写入符号链接（防逃逸）"
+    if not overwrite and os.path.exists(p):
+        return False, "文件已存在"
+    parent = os.path.dirname(p)
+    if not os.path.isdir(parent):
+        return False, "上级目录不存在"
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(content)
+        site_chown_www(p, 0o644)
+    except OSError as e:
+        return False, f"写入失败: {e}"
+    return True, f"已保存 {name}"
+
+
+def site_mkdir(site, rel):
+    p, err = site_resolve_path(site, rel)
+    if err:
+        return False, err
+    if os.path.exists(p):
+        return False, "同名文件/目录已存在"
+    try:
+        os.makedirs(p)
+        site_chown_www(p, 0o755)
+    except OSError as e:
+        return False, f"创建目录失败: {e}"
+    return True, "目录已创建"
+
+
+def site_delete_path(site, rel, recursive=False):
+    """删除站点内文件/目录；站点根目录禁止删除"""
+    p, err = site_resolve_path(site, rel)
+    if err:
+        return False, err
+    root = os.path.realpath(site["root"])
+    if p == root:
+        return False, "站点根目录不能删除"
+    if not os.path.exists(p) and not os.path.islink(p):
+        return False, "文件不存在"
+    try:
+        if os.path.islink(p) or os.path.isfile(p):
+            os.remove(p)
+        elif recursive:
+            shutil.rmtree(p)
+        else:
+            os.rmdir(p)
+    except OSError as e:
+        return False, f"删除失败: {e}（目录非空需勾选递归删除）"
+    return True, f"已删除 {os.path.basename(p)}"
+
+
+def site_rename(site, rel, new_name):
+    """重命名站点内文件/目录"""
+    src, err = site_resolve_path(site, rel)
+    if err:
+        return False, err
+    new_name = (new_name or "").strip().replace("\\", "/")
+    if not new_name or "/" in new_name or new_name in (".", ".."):
+        return False, "新名称不合法（只能是文件名）"
+    if os.path.realpath(site["root"]) == src:
+        return False, "站点根目录不能重命名"
+    dst = os.path.join(os.path.dirname(src), new_name)
+    if not os.path.realpath(dst).startswith(os.path.realpath(site["root"]) + os.sep):
+        return False, "路径越界"
+    if os.path.exists(dst):
+        return False, "目标名称已存在"
+    try:
+        os.rename(src, dst)
+    except OSError as e:
+        return False, f"重命名失败: {e}"
+    return True, f"已重命名为 {new_name}"
+
+
+def site_chmod(site, rel, mode):
+    """改权限（仅站点目录内；mode 形如 644 / 755）"""
+    p, err = site_resolve_path(site, rel)
+    if err:
+        return False, err
+    m = str(mode or "").strip()
+    if not re.fullmatch(r"[0-7]{3,4}", m):
+        return False, "权限格式无效（如 644 / 755）"
+    try:
+        os.chmod(p, int(m, 8))
+    except OSError as e:
+        return False, f"修改权限失败: {e}"
+    return True, f"权限已改为 {m}"
+
+
+def site_unzip(site, rel):
+    """解压站点内 zip（防护：条目路径必须在站点目录内、拒绝符号链接、限制解压后总量）"""
+    import zipfile
+    p, err = site_resolve_path(site, rel)
+    if err:
+        return False, err
+    if not os.path.isfile(p) or not p.lower().endswith(".zip"):
+        return False, "请选择一个 .zip 文件"
+    root = os.path.realpath(site["root"])
+    dest = os.path.dirname(p)
+    try:
+        with zipfile.ZipFile(p) as zf:
+            total = 0
+            entries = []
+            for info in zf.infolist():
+                name = info.filename
+                if name.startswith("/") or ".." in name.replace("\\", "/").split("/"):
+                    return False, f"压缩包内含非法路径条目：{name}"
+                total += info.file_size
+                if total > SITE_UNZIP_MAX_BYTES:
+                    return False, f"解压后总量超过 {SITE_UNZIP_MAX_BYTES // 1024 // 1024}MB 上限"
+                target = os.path.realpath(os.path.join(dest, name))
+                if target != dest and not target.startswith(dest + os.sep):
+                    return False, f"条目超出站点目录：{name}"
+                entries.append((info, target))
+            for info, target in entries:
+                if info.is_dir():
+                    os.makedirs(target, exist_ok=True)
+                    continue
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                with zf.open(info) as src, open(target, "wb") as out:
+                    shutil.copyfileobj(src, out)
+                site_chown_www(target, 0o644)
+    except zipfile.BadZipFile:
+        return False, "不是有效的 zip 文件"
+    except OSError as e:
+        return False, f"解压失败: {e}"
+    return True, "解压完成"
+
+
+def site_read_file(site, rel):
+    """读取站点内文本文件（在线编辑用）"""
+    p, err = site_resolve_path(site, rel)
+    if err:
+        return None, err
+    if os.path.isdir(p):
+        return None, "目标是目录，不是文件"
+    if not os.path.isfile(p) or os.path.islink(p):
+        return None, "文件不存在"
+    try:
+        size = os.path.getsize(p)
+    except OSError as e:
+        return None, f"读取失败: {e}"
+    if not site_editable(os.path.basename(p), size):
+        return None, "该类型/大小不支持在线编辑"
+    try:
+        with open(p, "r", encoding="utf-8", errors="replace") as f:
+            return f.read(), None
+    except OSError as e:
+        return None, f"读取失败: {e}"
+
+
+def site_tail_log(site, kind="access", lines=200):
+    """读取站点日志尾部（只读尾部 256KB，避免大文件全量进内存）"""
+    ap, ep = site_log_paths(site)
+    path = ap if kind == "access" else ep
+    lines = max(1, min(int(lines or 200), 5000))
+    for cand in (path, path + ".1"):
+        if not os.path.isfile(cand):
+            continue
+        try:
+            size = os.path.getsize(cand)
+            with open(cand, "rb") as f:
+                if size > SITE_LOG_TAIL_BYTES:
+                    f.seek(size - SITE_LOG_TAIL_BYTES)
+                    f.readline()          # 丢掉可能被截断的半行
+                data = f.read().decode("utf-8", "replace")
+        except OSError as e:
+            return None, f"读取日志失败: {e}"
+        rows = [ln for ln in data.splitlines() if ln.strip()]
+        return {"kind": kind, "file": cand, "lines": rows[-lines:], "rotated": cand.endswith(".1")}, None
+    return {"kind": kind, "file": path, "lines": [], "rotated": False}, None
+
+
+def site_stats(site, days=7):
+    """解析站点 access.log → 今日/昨日/近 N 天 PV、UV（IP 去重）、Top URL、状态码分布"""
+    import collections
+    ap, _ = site_log_paths(site)
+    days = max(1, min(int(days or 7), 30))
+    today = datetime.date.today()
+    day_keys = [(today - datetime.timedelta(days=i)).strftime("%d/%b/%Y") for i in range(days)]
+    pv = {k: 0 for k in day_keys}
+    ipset = {k: set() for k in day_keys}
+    urls = collections.Counter()
+    codes = collections.Counter()
+    total_lines = 0
+    max_lines = 200000                     # 单次解析上限，防超大日志拖死面板
+    files = [ap]
+    for i in range(1, 4):                  # 兼容 logrotate
+        cand = f"{ap}.{i}"
+        if os.path.isfile(cand):
+            files.append(cand)
+    for path in reversed(files):           # 老的轮转文件先看
+        if not os.path.isfile(path):
+            continue
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    total_lines += 1
+                    if total_lines > max_lines:
+                        break
+                    m = _ACCESS_RE.match(line)
+                    if not m:
+                        continue
+                    ts = m.group("t").split(":")[0]      # dd/Mon/yyyy
+                    if ts not in pv:
+                        continue
+                    ip = m.group("ip")
+                    pv[ts] += 1
+                    ipset[ts].add(ip)
+                    req = m.group("req").split(" ")
+                    if len(req) >= 2:
+                        urls[req[1][:120]] += 1
+                    codes[m.group("status")] += 1
+        except OSError:
+            continue
+        if total_lines > max_lines:
+            break
+    d_today = today.strftime("%d/%b/%Y")
+    d_yest = (today - datetime.timedelta(days=1)).strftime("%d/%b/%Y")
+    return {
+        "today": {"pv": pv.get(d_today, 0), "uv": len(ipset.get(d_today, ()))},
+        "yesterday": {"pv": pv.get(d_yest, 0), "uv": len(ipset.get(d_yest, ()))},
+        "days": [{"date": k, "pv": pv[k], "uv": len(ipset[k])} for k in day_keys],
+        "sum_pv": sum(pv.values()),
+        "top_urls": urls.most_common(8),
+        "codes": codes.most_common(8),
+        "log_file": ap,
+        "exists": os.path.isfile(ap),
+        "truncated": total_lines > max_lines,
+    }
+
+
+def render_site_conf(s):
+    """站点 nginx server block：静态站含 ACME 挑战路径 / 强制跳转 / Host 守卫 / 分站日志；
+    端口站只监听指定端口（无域名场景）。"""
+    domain = (s.get("domain") or "").strip()
+    root = s.get("root") or DEFAULT_SITE_ROOT
+    ssl_on, ssl_fc, ssl_key = (False, None, None)
+    if domain and s.get("cert_mode") == "auto":
+        ssl_on, ssl_fc, ssl_key = _proxy_cert(domain, s.get("cert_ref"))
+    force = bool(s.get("force_https")) and ssl_on
+    guard = host_guard(domain) if (domain and s.get("block_ip")) else ""
+    log_name = site_log_name(s)
+    acc = f"/var/log/nginx/{log_name}.access.log"
+    err = f"/var/log/nginx/{log_name}.error.log"
+
+    def body(ind="    "):
+        return [
+            ind + f"root {root};",
+            ind + "index index.html index.htm;",
+            ind + "location / { try_files $uri $uri/ =404; }",
+            ind + f"access_log {acc};",
+            ind + f"error_log {err};",
+        ]
+
+    head = "# FW-Panel2 网站: " + (domain or ("端口 " + str(s.get("port"))))
+    lines = [head]
+    if not domain:
+        lines.append("server {")
+        lines.append(f"    listen {int(s.get('port', 8080))};")
+        lines.append("    server_name _;")
+        lines += body()
+        lines.append("}")
+    else:
+        lines.append("server {")
+        lines.append("    listen 80;")
+        lines.append(f"    server_name {domain};")
+        lines.append(f"    location /.well-known/acme-challenge/ {{ root {ACME_WEBROOT}; }}")
+        if guard:
+            lines.extend(x for x in guard.splitlines() if x)
+        if force:
+            lines.append("    location / { return 301 https://$host$request_uri; }")
+        else:
+            lines += body()
+        lines.append("}")
+        if ssl_on:
+            lines.append("server {")
+            lines.append("    listen 443 ssl;")
+            lines.append(f"    server_name {domain};")
+            lines.append(f"    ssl_certificate {ssl_fc};")
+            lines.append(f"    ssl_certificate_key {ssl_key};")
+            if guard:
+                lines.extend(x for x in guard.splitlines() if x)
+            lines += body()
+            lines.append("}")
+    return "\n".join(lines) + "\n"
+
+
+def apply_all_nginx(pstore, sstore, cfg=None):
+    """nginx 配置唯一渲染出口：反代(fwpanel-<id>.conf) + 站点(fwsite-<id>.conf)
+    → nginx -t 校验 → reload；校验失败自动回滚本次改动（旧配置继续提供服务）"""
     if DRY_RUN:
-        log("[dry-run] 生成 nginx 反代配置（跳过写入/reload）")
+        log("[dry-run] 生成 nginx 配置（反代+站点，跳过写入/reload）")
         return True, "dry-run"
     conf_dir = nginx_conf_dir()
     if not conf_dir:
         return False, "未找到 nginx 配置目录（未安装 nginx？）"
     # 确保默认兜底配置正确（default_server 接管未匹配请求，禁止 IP 直连）
     ensure_nginx_default()
+    before = {}
+
+    def _read(path):
+        with open(path) as f:
+            return f.read()
+
+    def _write(path, content):
+        if path not in before:
+            before[path] = _read(path) if os.path.exists(path) else None
+        with open(path, "w") as f:
+            f.write(content)
+
+    def _remove(path):
+        if os.path.exists(path):
+            before.setdefault(path, _read(path))
+            os.remove(path)
+
+    def _rollback():
+        for path, old in before.items():
+            try:
+                if old is None:
+                    if os.path.exists(path):
+                        os.remove(path)
+                else:
+                    with open(path, "w") as f:
+                        f.write(old)
+            except OSError:
+                pass
+
     try:
-        # 写入/删除各代理配置
-        for p in store.proxies:
-            conf = os.path.join(conf_dir, f"fwpanel-{p['id']}.conf")
+        for p in pstore.proxies:
+            conf = os.path.join(conf_dir, proxy_conf_name(p["id"]))
             if p.get("enabled", True):
-                with open(conf, "w") as f:
-                    f.write(render_proxy_conf(p))
-            elif os.path.exists(conf):
-                os.remove(conf)
-        # 清理失效配置（代理已删除或已禁用）
+                _write(conf, render_proxy_conf(p))
+            else:
+                _remove(conf)
+        for s in sstore.sites:
+            conf = os.path.join(conf_dir, site_conf_name(s["id"]))
+            if s.get("enabled", True):
+                _write(conf, render_site_conf(s))
+            else:
+                _remove(conf)
+        # 清理失效配置：只认「前缀 + 12 位 hex id」，兜底配置等非此形状文件一律不动
+        valid = {proxy_conf_name(p["id"]) for p in pstore.proxies if p.get("enabled", True)}
+        valid |= {site_conf_name(s["id"]) for s in sstore.sites if s.get("enabled", True)}
         for fn in os.listdir(conf_dir):
-            if fn.startswith("fwpanel-") and fn.endswith(".conf"):
-                pid = fn[len("fwpanel-"):-len(".conf")]
-                if not any(p["id"] == pid and p.get("enabled", True) for p in store.proxies):
-                    os.remove(os.path.join(conf_dir, fn))
+            if not fn.endswith(".conf"):
+                continue
+            for prefix in (PROXY_CONF_PREFIX, SITE_CONF_PREFIX):
+                mid = fn[len(prefix):-len(".conf")] if fn.startswith(prefix) else ""
+                if mid and CONF_ID_RE.match(mid):
+                    if fn not in valid:
+                        _remove(os.path.join(conf_dir, fn))
+                    break
     except OSError as e:
+        _rollback()
         return False, f"写入配置失败: {e}"
-    # 校验
     try:
         r = subprocess.run(["nginx", "-t"], capture_output=True, text=True, timeout=15)
     except FileNotFoundError:
+        _rollback()
         return False, "nginx 不可用（未安装）"
     if r.returncode != 0:
-        return False, f"nginx 配置校验失败: {(r.stderr or r.stdout).strip()[:300]}"
+        _rollback()
+        # 回滚后重载一次，确保运行中的配置回到改动前
+        try:
+            subprocess.run(["nginx", "-s", "reload"], capture_output=True, text=True, timeout=15)
+        except Exception:
+            pass
+        return False, f"nginx 配置校验失败（已回滚）: {(r.stderr or r.stdout).strip()[:300]}"
     subprocess.run(["nginx", "-s", "reload"], capture_output=True, text=True, timeout=15)
     return True, "nginx 已重载"
+
+
+def apply_proxies(store):
+    """兼容旧调用点：统一渲染（反代 + 站点一次生成，避免两套渲染互相覆盖/误删）"""
+    return apply_all_nginx(store, SiteStore(), None)
 
 
 def _ensure_http01_port(store):
@@ -3855,6 +4707,22 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_bruteforce()
         elif path == "/api/proxy":
             self._api_proxy()
+        elif path == "/api/sites":
+            self._api_sites()
+        elif path.startswith("/api/sites/"):
+            parts = path[len("/api/sites/"):].strip("/").split("/")
+            sid = parts[0]
+            action = parts[1] if len(parts) > 1 else ""
+            if action == "logs":
+                self._api_site_logs(sid)
+            elif action == "stats":
+                self._api_site_stats(sid)
+            elif action == "files":
+                self._api_site_files(sid)
+            elif action == "download":
+                self._api_site_download(sid)
+            else:
+                self._send(404, {"error": "Not Found"})
         elif path == "/api/docker":
             self._api_docker_status()
         elif path == "/api/docker/containers":
@@ -4497,6 +5365,22 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_cert_action(path.rsplit("/", 1)[1])
         elif path == "/api/proxy":
             self._api_proxy_add()
+        elif path == "/api/sites":
+            self._api_site_add()
+        elif path == "/api/sites/root":
+            self._api_site_root_set()
+        elif path.startswith("/api/sites/"):
+            parts = path[len("/api/sites/"):].strip("/").split("/")
+            sid = parts[0]
+            action = parts[1] if len(parts) > 1 else ""
+            if action == "toggle":
+                self._api_site_toggle(sid)
+            elif action == "cert":
+                self._api_site_cert(sid)
+            elif action == "files":
+                self._api_site_files(sid)
+            else:
+                self._api_site_update(sid)
         elif path == "/api/proxy/install":
             self._api_proxy_install()
         elif path.startswith("/api/proxy/"):
@@ -4551,6 +5435,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_bruteforce_unban(path.rsplit("/", 1)[1])
         elif path.startswith("/api/proxy/"):
             self._api_proxy_delete(path.rsplit("/", 1)[1])
+        elif path.startswith("/api/sites/"):
+            self._api_site_delete(path[len("/api/sites/"):].strip("/").split("/")[0])
         elif path == "/api/term/key":
             self._api_term_key_delete()
         elif path.startswith("/api/fed/nodes/"):
@@ -4969,6 +5855,395 @@ class PanelHandler(BaseHTTPRequestHandler):
         threading.Timer(1.5, restart_service).start()
         self._send(200, {"ok": True, "msg": f"面板端口已修改为 {port}，服务重启中，"
                                             f"请用 http://<服务器IP>:{port} 访问{proxy_hint}"})
+
+    # ---------------- 网站（站点管理，v3.0.0） ----------------
+
+    def _site_find(self, sid):
+        s = SiteStore().get(sid)
+        if not s:
+            self._send(404, {"error": "站点不存在"})
+        return s
+
+    def _api_sites(self):
+        """GET /api/sites → 网站列表（本站点 + 反代站合并视图）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        pstore, sstore = ProxyStore(), SiteStore()
+        items = [site_view(s) for s in sstore.sites] + [proxy_site_view(p) for p in pstore.proxies]
+        items.sort(key=lambda x: (x.get("domain") or "").lower())
+        self._send(200, {
+            "sites": items,
+            "site_root": site_root_base(self.server.config),
+            "certs": site_available_certs(),
+            "nginx": {"installed": nginx_available(), "active": nginx_active()},
+            "server_ip": get_server_ip(),
+            "panel_port": int(self.server.config.get("port", 0) or 0),
+        })
+
+    def _api_site_add(self):
+        """POST /api/sites 创建网站：{domain|port, type, root?, cert_mode, cert_ref?, force_https, block_ip, note}"""
+        token = self._require_auth()
+        if token is None:
+            return
+        data = self._read_json()
+        pstore, sstore = ProxyStore(), SiteStore()
+        site, err = site_validate(data, pstore, sstore, self.server.config)
+        if err:
+            self._send(400, {"error": err})
+            return
+        if site["cert_mode"] == "auto":
+            okdns, why = site_dns_precheck(site["domain"], site.get("cert_ref"))
+            if not okdns:
+                self._send(400, {"error": why})
+                return
+        try:
+            site_prepare_dir(site)
+        except OSError as e:
+            self._send(500, {"error": f"创建站点目录失败: {e}"})
+            return
+        s = sstore.add(site)
+        fw = []
+        try:
+            fw = site_open_ports(self.server.store, s)
+            self.server.nft.apply()
+        except Exception as e:
+            log(f"[site] 放行入口端口失败: {e}")
+        okn, nginx_msg = apply_all_nginx(pstore, sstore, self.server.config)
+        if not okn:
+            # nginx 失败 → 回滚站点记录与放行端口（目录保留，避免文件白建）
+            sstore.remove(s["id"])
+            if site_close_ports(self.server.store, s):
+                try:
+                    self.server.nft.apply()
+                except Exception:
+                    pass
+            self._send(500, {"error": f"nginx 配置失败，站点未创建：{nginx_msg}"})
+            return
+        task = ""
+        if s["cert_mode"] == "auto":
+            task = start_task("site_cert", site_issue_cert, s["id"])
+        label = s.get("domain") or f"端口 {s.get('port')}"
+        self._send(200, {
+            "ok": True,
+            "site": site_view(s),
+            "nginx": nginx_msg,
+            "firewall": ("已放行 " + ", ".join(str(x) for x in fw)) if fw else "无需新增放行",
+            "cert_task": task,
+            "msg": f"网站 {label} 已创建" + ("，证书正在签发" if task else ""),
+        })
+
+    def _api_site_update(self, sid):
+        """POST /api/sites/<id> 更新网站配置"""
+        token = self._require_auth()
+        if token is None:
+            return
+        sstore = SiteStore()
+        old = sstore.get(sid)
+        if not old:
+            self._send(404, {"error": "站点不存在"})
+            return
+        data = self._read_json()
+        merged = dict(old)
+        merged.update({k: v for k, v in data.items() if k not in ("id", "created")})
+        pstore = ProxyStore()
+        site, err = site_validate(merged, pstore, sstore, self.server.config, exclude_id=sid)
+        if err:
+            self._send(400, {"error": err})
+            return
+        if site["cert_mode"] == "auto":
+            okdns, why = site_dns_precheck(site["domain"], site.get("cert_ref"))
+            if not okdns:
+                self._send(400, {"error": why})
+                return
+        # 目录变更：只把 nginx 指向新目录并建好骨架，不动旧目录里的文件（避免误删用户数据）
+        if site["root"] != old.get("root") and not os.path.isdir(site["root"]):
+            try:
+                site_prepare_dir(site)
+            except OSError as e:
+                self._send(500, {"error": f"创建新目录失败: {e}"})
+                return
+        site["id"] = sid
+        site["created"] = old.get("created", "")
+        for i, x in enumerate(sstore.sites):
+            if x.get("id") == sid:
+                sstore.sites[i] = site
+                break
+        sstore.save()
+        try:
+            site_open_ports(self.server.store, site)
+            self.server.nft.apply()
+        except Exception:
+            pass
+        okn, nginx_msg = apply_all_nginx(pstore, sstore, self.server.config)
+        if not okn:
+            for i, x in enumerate(sstore.sites):
+                if x.get("id") == sid:
+                    sstore.sites[i] = old
+                    break
+            sstore.save()
+            apply_all_nginx(pstore, sstore, self.server.config)
+            self._send(500, {"error": f"nginx 配置失败，已还原：{nginx_msg}"})
+            return
+        self._send(200, {"ok": True, "site": site_view(sstore.get(sid)), "msg": "网站已更新"})
+
+    def _api_site_toggle(self, sid):
+        """POST /api/sites/<id>/toggle 启停网站（禁用=摘掉 nginx 配置，文件保留）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        sstore = SiteStore()
+        s = sstore.get(sid)
+        if not s:
+            self._send(404, {"error": "站点不存在"})
+            return
+        s["enabled"] = not bool(s.get("enabled", True))
+        sstore.save()
+        okn, nginx_msg = apply_all_nginx(ProxyStore(), sstore, self.server.config)
+        self._send(200 if okn else 500, {
+            "ok": bool(okn), "enabled": s["enabled"], "site": site_view(s),
+            "msg": ("网站已启用" if s["enabled"] else "网站已停用（配置文件已摘除，文件保留）") if okn else nginx_msg,
+        })
+
+    def _api_site_delete(self, sid):
+        """DELETE /api/sites/<id>?purge=1 删除网站（默认保留目录与文件，purge=1 连文件一起删）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        sstore = SiteStore()
+        s = sstore.get(sid)
+        if not s:
+            self._send(404, {"error": "站点不存在"})
+            return
+        query = parse_qs(urlparse(self.path).query)
+        purge = (query.get("purge") or ["0"])[0] in ("1", "true", "yes")
+        purged = False
+        if purge:
+            root = os.path.realpath(s.get("root") or "")
+            if not root or not site_root_ok(root):
+                self._send(400, {"error": f"目录不在允许范围，拒绝删除文件：{root}"})
+                return
+            try:
+                if os.path.isdir(root):
+                    shutil.rmtree(root)
+                    purged = True
+            except OSError as e:
+                self._send(500, {"error": f"删除站点目录失败: {e}"})
+                return
+        sstore.remove(sid)
+        try:
+            site_close_ports(self.server.store, s)
+            self.server.nft.apply()
+        except Exception:
+            pass
+        okn, nginx_msg = apply_all_nginx(ProxyStore(), sstore, self.server.config)
+        label = s.get("domain") or f"端口 {s.get('port')}"
+        self._send(200 if okn else 500, {
+            "ok": bool(okn), "purged": purged,
+            "msg": (f"网站 {label} 已删除" + ("（文件已一并删除）" if purged else "（文件保留）")) if okn else nginx_msg,
+        })
+
+    def _api_site_root_set(self):
+        """POST /api/sites/root {root} 修改站点根目录（只影响之后新建的站点）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        data = self._read_json()
+        root = os.path.normpath(str(data.get("root", "")).strip())
+        if not root or not os.path.isabs(root):
+            self._send(400, {"error": "必须是绝对路径"})
+            return
+        if not site_root_ok(root):
+            self._send(400, {"error": f"该路径不允许作为站点根目录（系统目录受保护）：{root}"})
+            return
+        try:
+            os.makedirs(root, exist_ok=True)
+        except OSError as e:
+            self._send(500, {"error": f"创建目录失败: {e}"})
+            return
+        self.server.config.set("site_root", root)
+        self._send(200, {"ok": True, "site_root": root, "msg": f"站点根目录已设为 {root}（只影响新建站点）"})
+
+    def _api_site_cert(self, sid):
+        """POST /api/sites/<id>/cert 申请证书（后台任务，避免长请求阻塞）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        s = SiteStore().get(sid)
+        if not s:
+            self._send(404, {"error": "站点不存在"})
+            return
+        if not s.get("domain"):
+            self._send(400, {"error": "端口站（无域名）不需要证书"})
+            return
+        okdns, why = site_dns_precheck(s["domain"], s.get("cert_ref"))
+        if not okdns:
+            self._send(400, {"error": why})
+            return
+        tid = start_task("site_cert", site_issue_cert, sid)
+        self._send(200, {"ok": True, "task": tid, "msg": f"正在为 {s['domain']} 申请证书…"})
+
+    def _api_site_logs(self, sid):
+        """GET /api/sites/<id>/logs?kind=access|error&lines=200"""
+        token = self._require_auth()
+        if token is None:
+            return
+        s = SiteStore().get(sid)
+        if not s:
+            self._send(404, {"error": "站点不存在"})
+            return
+        query = parse_qs(urlparse(self.path).query)
+        kind = (query.get("kind") or ["access"])[0]
+        lines = (query.get("lines") or ["200"])[0]
+        if kind not in ("access", "error"):
+            kind = "access"
+        try:
+            lines = int(lines)
+        except ValueError:
+            lines = 200
+        data, err = site_tail_log(s, kind, lines)
+        if err:
+            self._send(500, {"error": err})
+            return
+        self._send(200, data)
+
+    def _api_site_stats(self, sid):
+        """GET /api/sites/<id>/stats?days=7 访问统计（PV/UV/Top URL/状态码）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        s = SiteStore().get(sid)
+        if not s:
+            self._send(404, {"error": "站点不存在"})
+            return
+        query = parse_qs(urlparse(self.path).query)
+        try:
+            days = int((query.get("days") or ["7"])[0])
+        except ValueError:
+            days = 7
+        self._send(200, site_stats(s, days))
+
+    def _api_site_files(self, sid):
+        """GET /api/sites/<id>/files?path=xx  列目录
+        GET /api/sites/<id>/files?path=xx&op=read  读文本（在线编辑）
+        POST /api/sites/<id>/files {op,...}   mkdir|write|rename|delete|chmod|unzip|upload"""
+        token = self._require_auth()
+        if token is None:
+            return
+        s = SiteStore().get(sid)
+        if not s:
+            self._send(404, {"error": "站点不存在"})
+            return
+        if self.command == "GET":
+            query = parse_qs(urlparse(self.path).query)
+            rel = (query.get("path") or [""])[0]
+            op = (query.get("op") or [""])[0]
+            if op == "read":
+                content, err = site_read_file(s, rel)
+                if err:
+                    self._send(400, {"error": err})
+                    return
+                self._send(200, {"path": rel.strip("/"), "content": content})
+                return
+            data, err = site_file_list(s, rel)
+            if err:
+                self._send(400, {"error": err})
+                return
+            data["roots"] = [{"name": s.get("domain") or f"端口 {s.get('port')}", "path": ""}]
+            self._send(200, data)
+            return
+        data = self._read_json()
+        op = str(data.get("op", "")).strip()
+        rel = str(data.get("path", "") or "")
+        if op == "mkdir":
+            ok, msg = site_mkdir(s, str(data.get("name", "") or "").strip().strip("/"))
+        elif op == "write":
+            ok, msg = site_write_file(s, rel, data.get("content", ""), bool(data.get("overwrite", True)))
+        elif op == "upload":
+            ok, msg = self._site_upload(s, data)
+        elif op == "rename":
+            ok, msg = site_rename(s, rel, str(data.get("name", "")))
+        elif op == "delete":
+            ok, msg = site_delete_path(s, rel, bool(data.get("recursive")))
+        elif op == "chmod":
+            ok, msg = site_chmod(s, rel, data.get("mode", ""))
+        elif op == "unzip":
+            ok, msg = site_unzip(s, rel)
+        else:
+            self._send(400, {"error": "不支持的操作"})
+            return
+        self._send(200 if ok else 400, {"ok": bool(ok), "msg": msg})
+
+    def _site_upload(self, s, data):
+        """上传文件（前端 FileReader → base64）：{op:upload, path:目录, name:文件名, content_b64}"""
+        import base64 as _b64
+        name = str(data.get("name", "") or "").strip().replace("\\", "/")
+        if not name or "/" in name or name in (".", ".."):
+            return False, "文件名不合法"
+        raw = data.get("content_b64", "")
+        if not isinstance(raw, str) or not raw:
+            return False, "文件内容为空"
+        if len(raw) > SITE_UPLOAD_MAX_BYTES * 4 // 3 + 1024:
+            return False, f"文件超过 {SITE_UPLOAD_MAX_BYTES // 1024 // 1024}MB 上限"
+        try:
+            blob = _b64.b64decode(raw, validate=False)
+        except Exception as e:
+            return False, f"内容解码失败: {e}"
+        if len(blob) > SITE_UPLOAD_MAX_BYTES:
+            return False, f"文件超过 {SITE_UPLOAD_MAX_BYTES // 1024 // 1024}MB 上限"
+        rel = str(data.get("path", "") or "").strip().strip("/")
+        target, err = site_resolve_path(s, (rel + "/" + name) if rel else name)
+        if err:
+            return False, err
+        if os.path.isdir(target):
+            return False, "同名目录已存在"
+        if not os.path.isdir(os.path.dirname(target)):
+            return False, "上级目录不存在"
+        if os.path.islink(target):
+            return False, "拒绝写入符号链接（防逃逸）"
+        if os.path.exists(target) and not data.get("overwrite"):
+            return False, "同名文件已存在"
+        try:
+            with open(target, "wb") as f:
+                f.write(blob)
+            site_chown_www(target, 0o644)
+        except OSError as e:
+            return False, f"写入失败: {e}"
+        return True, f"已上传 {name}（{len(blob)} 字节）"
+
+    def _api_site_download(self, sid):
+        """GET /api/sites/<id>/download?path=xx 下载站点内文件"""
+        token = self._require_auth()
+        if token is None:
+            return
+        s = SiteStore().get(sid)
+        if not s:
+            self._send(404, {"error": "站点不存在"})
+            return
+        query = parse_qs(urlparse(self.path).query)
+        rel = (query.get("path") or [""])[0]
+        p, err = site_resolve_path(s, rel)
+        if err or not os.path.isfile(p) or os.path.islink(p):
+            self._send(404, {"error": err or "文件不存在"})
+            return
+        try:
+            size = os.path.getsize(p)
+            if size > 256 * 1024 * 1024:
+                self._send(400, {"error": "文件超过 256MB，请用 SFTP 下载"})
+                return
+            with open(p, "rb") as f:
+                blob = f.read()
+        except OSError as e:
+            self._send(500, {"error": f"读取失败: {e}"})
+            return
+        name = os.path.basename(p).replace('"', "")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/octet-stream")
+        self.send_header("Content-Disposition", f'attachment; filename="{name}"')
+        self.send_header("Content-Length", str(len(blob)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(blob)
 
     def _api_username(self):
         """修改面板登录用户名"""
