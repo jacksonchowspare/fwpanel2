@@ -1593,10 +1593,12 @@ async function login() {
           setTimeout(() => { vp.setAttribute("content", "width=device-width, initial-scale=1.0"); }, 300);
         }
       }
-      showMain(); ensureFedTab(); refreshAll(); toast("登录成功", "okk");
+      showMain(); ensureFedTab(); refreshAll(); switchTab(localStorage.getItem("fw_sec") || "overview");
+      toast("登录成功", "okk");
       return;
     }
-    showMain(); ensureFedTab(); refreshAll(); toast("登录成功", "okk");
+    showMain(); ensureFedTab(); refreshAll(); switchTab(localStorage.getItem("fw_sec") || "overview");
+    toast("登录成功", "okk");
   } catch (e) { toast(e.message, "err"); }
 }
 function resetIOSZoom() {
@@ -2257,8 +2259,17 @@ let slTimer = null;          // 日志自动刷新定时器
 function qjs(v) { return JSON.stringify(v == null ? "" : v); }
 
 /* 行内按钮统一构造：避免手写 onclick 属性时引号层级出错 */
+/* 行内事件属性的转义：把代码里的 " & < > 转成实体，浏览器解析属性值时会还原成原字符。
+   ⚠ 必修（v3.0.2）：onclick="' + code + '" 这种写法，只要 code 里含双引号（JSON.stringify/qjs 的产物），
+   HTML 解析器会在第一个内层双引号处把属性截断 —— 例如 onclick="window.open("https://x/")" 会被解析成
+   onclick="window.open(" + 一堆垃圾属性，点击时执行 window.open( → SyntaxError → 按钮"完全没反应"
+   （只有控制台能看到报错）。3.0.0/3.0.1 的网站卡片按钮全中此坑。 */
+function attrEsc(code) {
+  return String(code).replace(/&/g, "&amp;").replace(/"/g, "&quot;")
+                     .replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
 function btnHtml(label, code, cls) {
-  return '<button class="btn mini ' + (cls || "ghost") + '" onclick="' + code + '">' + label + "</button>";
+  return '<button class="btn mini ' + (cls || "ghost") + '" onclick="' + attrEsc(code) + '">' + label + "</button>";
 }
 
 async function loadSites() {
@@ -2278,6 +2289,8 @@ async function loadSites() {
     }
     renderSites();
   } catch (e) {
+    // v3.0.2：失败时状态行也要给出结论，别让「检测中…」永远僵在那里
+    $("site_status").textContent = "状态获取失败：" + e.message + "（点右上「刷新」重试）";
     box.innerHTML = '<div style="color:var(--danger);font-size:13px">加载失败：' + esc(e.message) + "</div>";
   }
 }
@@ -2324,7 +2337,7 @@ function siteCardHtml(s) {
   }
   const sw = '<label class="switch" title="' + (isProxy ? "请在反代模块启停" : "启停网站") + '">'
     + '<input type="checkbox" ' + (s.enabled ? "checked" : "") + (isProxy ? " disabled" : "")
-    + ' onchange="toggleSite(' + qjs(s.id) + ')"><span class="slider"></span></label>';
+    + ' onchange="' + attrEsc("toggleSite(" + qjs(s.id) + ")") + '"><span class="slider"></span></label>';
   return '<div class="site-card' + (s.enabled ? "" : " off") + '">'
     + '<div class="sc-head"><span class="sc-dom">' + esc(s.domain || ("端口 " + s.port)) + "</span>"
     + '<span style="margin-left:auto">' + sw + "</span></div>"
@@ -2627,7 +2640,7 @@ function sfRenderCrumb(path) {
   parts.forEach(p => {
     acc = acc ? (acc + "/" + p) : p;
     html.push('<span style="color:var(--muted)">/</span>');
-    html.push('<a onclick="sfLoad(' + qjs(acc) + ')">' + esc(p) + "</a>");
+    html.push('<a onclick="' + attrEsc("sfLoad(" + qjs(acc) + ")") + '">' + esc(p) + "</a>");
   });
   $("sf_crumb").innerHTML = html.join(" ");
 }
@@ -2641,7 +2654,7 @@ function sfRenderRows(d) {
   $("sf_rows").innerHTML = items.map(it => {
     const rel = (sfPath ? (sfPath + "/") : "") + it.name;
     const nameCell = it.dir
-      ? '<span class="sf-name dir" onclick="sfLoad(' + qjs(rel) + ')">📁 ' + esc(it.name) + "</span>"
+      ? '<span class="sf-name dir" onclick="' + attrEsc("sfLoad(" + qjs(rel) + ")") + '">📁 ' + esc(it.name) + "</span>"
       : (it.link
         ? '<span class="sf-name link">🔗 ' + esc(it.name) + "（符号链接）</span>"
         : '<span class="sf-name">📄 ' + esc(it.name) + "</span>");
