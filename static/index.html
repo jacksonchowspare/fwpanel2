@@ -383,7 +383,9 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
 .btn.danger { background: linear-gradient(135deg, var(--danger-grad-a), var(--danger-grad-b)); box-shadow: var(--btn-shdw), inset 0 1px 0 var(--btn-inset); }
 .btn.danger:hover { box-shadow: var(--btn-shdw-h), inset 0 1px 0 var(--btn-inset); }
 .btn.danger:active { box-shadow: var(--btn-shdw-a), inset 0 1px 0 var(--btn-inset); }
-.btn.mini { padding: 4px 10px; font-size: 12px; border-radius: var(--r-sm); }
+.btn.mini { padding: 4px 8px; font-size: 12px; border-radius: var(--r-sm); }
+/* 文件管理操作列：一行放得下（进入/编辑/下载/解压/改名/权限/删除），超宽交给外层横向滚动 */
+#sf_rows td:last-child { white-space: nowrap; width: 1px; }
 #btn_upgrade { min-width: 80px; } /* 升级中文字变长也不换行 */
 td .btn.mini + .btn.mini { margin-left: 6px; }
 .btn:disabled { opacity: .4; cursor: not-allowed; transform: none !important; box-shadow: none !important; filter: none !important; }
@@ -435,9 +437,11 @@ tr:hover td { background: var(--panel-solid); }
   font-family: "0xProto", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 .site-card .sc-stat { color: var(--muted); font-size: 12px; }
 /* 按钮行定高 + inline-flex 居中：彩色 emoji 字体行高 metric 大会把按钮撑高（v2.1.32 教训） */
-.site-card .sc-btns { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; margin-top: auto; padding-top: 4px; }
-.site-card .sc-btns .btn { flex: none; display: inline-flex; align-items: center; justify-content: center;
-  height: 28px; padding: 0 10px; }
+/* v3.0.3：原来 flex-wrap:wrap + padding 0 10px，6 个按钮要 ~373px 而卡片只有 363px 可用，
+   「✕ 删除」被挤到第二行（用户点名）。改为不换行 + 收窄内边距，6 个按钮同行。 */
+.site-card .sc-btns { display: flex; gap: 4px; flex-wrap: nowrap; justify-content: flex-end; margin-top: auto; padding-top: 4px; }
+.site-card .sc-btns .btn { flex: 0 1 auto; min-width: 0; overflow: hidden; display: inline-flex; align-items: center;
+  justify-content: center; white-space: nowrap; height: 28px; padding: 0 7px; }
 .tag.site { background: rgba(61,139,253,.15); color: var(--accent); }
 .tag.port { background: rgba(245,158,11,.15); color: var(--warn); }
 .tag.proxyt { background: rgba(139,92,246,.18); color: #a78bfa; }
@@ -451,9 +455,13 @@ tr:hover td { background: var(--panel-solid); }
 .wz-radio { display: flex; align-items: flex-start; gap: 8px; padding: 10px 12px;
   border: var(--bdw) solid var(--border); border-radius: var(--r-sm); background: var(--input-bg);
   cursor: pointer; margin-bottom: 8px; }
-.wz-radio input { width: auto; flex: none; margin-top: 2px; }
-.wz-radio b { display: block; font-size: 13px; margin-bottom: 2px; }
-.wz-radio span { color: var(--muted); font-size: 12px; }
+/* ⚠ 权重陷阱（v3.0.3）：.modal input{width:100%} 与 .wz-radio input{width:auto} 同为 (0,1,1)，
+   且前者在样式表更靠后 → 单选按钮被拉成整行宽，说明文字被挤到右侧窄栏里逐字换行。
+   修复：换属性选择器提高权重 (0,2,1)，说明文字改成块级两行布局。 */
+.wz-radio > input[type="radio"] { width: 16px; height: 16px; flex: 0 0 auto; margin: 2px 0 0; }
+.wz-radio > span { flex: 1 1 auto; min-width: 0; }
+.wz-radio b { display: block; font-size: 13px; margin-bottom: 3px; color: var(--text); }
+.wz-radio > span > span { display: block; color: var(--muted); font-size: 12px; line-height: 1.5; }
 .wz-sum { background: var(--input-bg); border: 1px solid var(--border); border-radius: var(--r-sm);
   padding: 10px 12px; font-size: 12px; line-height: 1.9; }
 .wz-sum code { font-family: "0xProto", ui-monospace, monospace; color: var(--accent); }
@@ -503,6 +511,8 @@ tr:hover td { background: var(--panel-solid); }
 .modal h3 { margin-bottom: 14px; }
 .modal .form-row { flex-direction: column; }
 .modal input { width: 100%; }
+/* 单选/复选按钮例外：不能跟着被拉满（v3.0.3，向导选项曾被挤成右侧窄栏） */
+.modal input[type="radio"], .modal input[type="checkbox"] { width: auto; flex: 0 0 auto; }
 .modal input[type="checkbox"] { width: auto; flex: none; }
 .modal .btnrow { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
   /* ---- Web 终端多窗口系统（v2.1.23）---- */
@@ -1411,7 +1421,7 @@ tr:hover td { background: var(--panel-solid); }
     <div class="sf-drop" id="sf_drop">
       <div class="table-wrap" style="max-height:50vh;overflow:auto">
         <table>
-          <thead><tr><th>名称</th><th>大小</th><th>权限</th><th>修改时间</th><th style="width:260px">操作</th></tr></thead>
+          <thead><tr><th>名称</th><th>大小</th><th>权限</th><th>修改时间</th><th style="width:1px;white-space:nowrap">操作</th></tr></thead>
           <tbody id="sf_rows"><tr><td colspan="5" style="color:var(--muted)">加载中...</td></tr></tbody>
         </table>
       </div>
@@ -2672,7 +2682,7 @@ function sfRenderRows(d) {
     }
     const mt = it.mtime ? new Date(it.mtime * 1000).toLocaleString("zh-CN", { hour12: false }) : "-";
     return "<tr><td>" + nameCell + "</td><td>" + (it.dir ? "—" : fmtBytes(it.size)) + "</td><td>"
-      + esc(it.mode) + "</td><td>" + esc(mt) + '</td><td><div style="display:flex;gap:6px;flex-wrap:wrap">' + ops.join("") + "</div></td></tr>";
+      + esc(it.mode) + "</td><td>" + esc(mt) + '</td><td><div style="display:flex;gap:6px;flex-wrap:nowrap">' + ops.join("") + "</div></td></tr>";
   }).join("");
 }
 

@@ -99,6 +99,48 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   await page.evaluate(() => { const s = document.querySelector("#site_cards .site-card input[type=checkbox]"); if (s) s.click(); });
   await page.waitForTimeout(3000);
 
+  // —— 场景 4：布局（v3.0.3 用户点名的三处）——
+  console.log("== 场景 4：布局不换行 ==");
+  const lay = await page.evaluate(() => {
+    const btns = [...document.querySelectorAll("#site_cards .site-card")].map(c => {
+      const row = c.querySelector(".sc-btns"); if (!row) return null;
+      const r = row.getBoundingClientRect();
+      const bs = [...row.querySelectorAll("button")];
+      const ys = [...new Set(bs.map(b => Math.round(b.getBoundingClientRect().top)))];
+      const last = bs[bs.length - 1].getBoundingClientRect();
+      return { n: bs.length, rows: ys.length, spill: Math.round(last.right - r.right) };
+    }).filter(Boolean);
+    return { cards: btns,
+             cardRows: Math.max(...btns.map(x => x.rows)),
+             cardSpill: Math.max(...btns.map(x => x.spill)) };
+  });
+  rec("站点卡片 6 个按钮同一行", lay.cardRows === 1, "最多行数=" + lay.cardRows + " 卡片数=" + lay.cards.length);
+  rec("卡片按钮行不溢出", lay.cardSpill <= 1, "最大右侧超出=" + lay.cardSpill + "px");
+
+  await page.click("button:has-text('新建网站')");
+  await page.waitForTimeout(1200);
+  const wz = await page.evaluate(() => {
+    const lab = document.querySelector("#snew_modal .wz-radio");
+    const inp = lab.querySelector('input[type="radio"]'), wrap = lab.querySelector("span"), desc = wrap.querySelector("span");
+    return { inpW: Math.round(inp.getBoundingClientRect().width), wrapW: Math.round(wrap.getBoundingClientRect().width),
+             descLines: Math.round(desc.getBoundingClientRect().height), x: Math.round(wrap.getBoundingClientRect().left),
+             inpRight: Math.round(inp.getBoundingClientRect().right) };
+  });
+  rec("向导单选按钮未被拉满（≤20px）", wz.inpW <= 20, "radio 宽=" + wz.inpW + "px");
+  rec("向导说明文字占满宽度且紧跟按钮（≤20px 间距）", wz.wrapW > 380 && (wz.x - wz.inpRight) <= 20,
+      "文字块=" + wz.wrapW + "px 与按钮间距=" + (wz.x - wz.inpRight) + "px");
+  await page.evaluate(() => document.getElementById("snew_modal").classList.add("hidden"));
+  await page.waitForTimeout(400);
+
+  await page.click("#site_cards .site-card button:has-text('文件')");
+  await page.waitForTimeout(2500);
+  const fm = await page.evaluate(() => [...document.querySelectorAll("#sf_rows tr")].map(tr => {
+    const bs = [...tr.querySelectorAll("button")]; if (!bs.length) return null;
+    return { rows: [...new Set(bs.map(b => Math.round(b.getBoundingClientRect().top)))].length, n: bs.length };
+  }).filter(Boolean));
+  rec("文件管理操作按钮同一行（最坏 5-7 个按钮）", fm.length > 0 && fm.every(r => r.rows === 1),
+      fm.map(r => r.n + "个按钮→" + r.rows + "行").join(" "));
+
   console.log("\n== 控制台错误 ==");
   const real = errors.filter(e => !/favicon|net::ERR_ABORTED/i.test(e));
   console.log(real.length ? real.slice(0, 10).join("\n") : "  无");
