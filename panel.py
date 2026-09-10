@@ -53,7 +53,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.0"
+CURRENT_VERSION = "3.2.1"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -7580,7 +7580,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             "time": time_status(),
             "hostname": os.uname().nodename,
             "bbr": {"enabled": bbr_status(), "supported": bbr_available(), "kernel": os.uname().release},
-            "ipv6": ipv6_status(),
+            "ipv6": {"status": ipv6_status()},   # 前端兼容字符串/对象两种形态
             "panel_port": int(self.server.config.get("port", 0) or 0),
             "backup_dir": SYS_BACKUP_DIR,
         })

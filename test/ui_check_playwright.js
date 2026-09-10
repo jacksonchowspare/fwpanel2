@@ -277,6 +277,15 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   const sshTx = await page.$eval('[data-sec="ssh"]', e => e.innerText);
   rec("SSH 页有面板端口搬家提示", /面板端口已移至/.test(sshTx));
 
+  const v6tx2 = (await page.$eval("#sys_ipv6", e => e.innerText)).trim();
+  rec("IPv6 显示真实状态（不是 - / 未知）", !/IPv6\s*-\s*$/.test(v6tx2) && !/未知/.test(v6tx2), v6tx2.replace(/\s+/g," ").slice(0,50));
+  await page.click('button:has-text("内核版本")');
+  await page.waitForTimeout(800);
+  const kmsg2 = await page.$eval("#cfm_msg", e => e.innerText).catch(() => "");
+  rec("内核弹窗显示真实内核版本号", /\d+\.\d+/.test(kmsg2), kmsg2.replace(/\n+/g," | ").slice(0,60));
+  rec("内核弹窗显示 BBR 支持结论", /支持/.test(kmsg2) && !/未知/.test(kmsg2), "");
+  await page.evaluate(() => { const m = document.getElementById("cfm_modal"); if (m) m.classList.add("hidden"); });
+
 
   results.filter(r => !r.ok).forEach(r => console.log("  ✗ " + r.name + " | " + r.detail));
   await browser.close();

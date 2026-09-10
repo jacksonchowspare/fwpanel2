@@ -3223,8 +3223,11 @@ function renderSysNet(d) {
     + (b.enabled ? '<span style="color:var(--accent2)">已开启</span>' : "未开启")
     + (b.supported ? "" : '　<span style="color:var(--danger)">内核不支持（需 4.9+）</span>')
     + "　内核 " + esc(b.kernel || "") + "</span></div>";
-  const modeTxt = v6.mode === "disable" ? "已禁用 IPv6"
-    : (v6.mode === "v4_first" ? "IPv4 优先（IPv6 仍开启）" : (v6.mode === "enable" ? "IPv6 已开启" : "-"));
+  // /api/system 的 ipv6 字段可能是字符串（旧接口语义）也可能是对象，两种都要认
+  const v6st = (typeof v6 === "string") ? v6 : (v6.status || v6.mode || "");
+  const modeTxt = v6st === "disabled" || v6st === "disable" ? "🚫 已禁用"
+    : (v6st === "v4_first" ? "🌐 IPv4 优先（IPv6 仍开启）"
+    : (v6st === "enabled" || v6st === "enable" ? "✅ 已开启（默认）" : "未知（点「刷新」重试）"));
   $("sys_ipv6").innerHTML = '<div style="display:flex;gap:8px"><span style="color:var(--muted);min-width:88px">IPv6</span><span>'
     + esc(modeTxt) + (v6.gai_conf || v6.sysctl ? "" : "") + "</span></div>";
   if ($("sys_panel_port")) {
@@ -4113,7 +4116,9 @@ async function loadBbr() {
   if (!el) return;
   try {
     const d = await api("GET", "/api/bbr");
+    bbrInfo = d;                                   // 兼容旧代码（showKernel 等）
     if (sysData.bbr) { sysData.bbr.enabled = !!d.enabled; sysData.bbr.supported = d.supported !== false; }
+    if (!sysData.bbr) sysData.bbr = d;
     el.innerHTML = '<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">BBR</span><span>'
       + (d.enabled ? '<span style="color:var(--accent2)">已开启</span>' : "未开启")
       + (d.supported === false ? '　<span style="color:var(--danger)">内核不支持（需 4.9+）</span>' : "")
@@ -4121,9 +4126,11 @@ async function loadBbr() {
   } catch (e) { el.textContent = "状态获取失败"; }
 }
 function showKernel() {
-  const k = (bbrInfo && bbrInfo.kernel) || "未知";
-  const sup = bbrInfo ? (bbrInfo.supported ? "✅ 支持" : "❌ 不支持") : "未知";
-  confirmPanel(`当前内核版本：${k}\n\nBBR 支持：${sup}`, null, "📦 内核版本");
+  // 数据来源要有兜底：loadBbr 现在把结果写进 sysData.bbr（v3.2.0 系统页），bbrInfo 可能为空
+  const src = (sysData && sysData.bbr) || bbrInfo || null;
+  const k = (src && src.kernel) || "未知（请到「系统」页刷新一次）";
+  const sup = src ? (src.supported ? "✅ 支持" : "❌ 不支持（需 Linux 4.9+）") : "未知";
+  confirmPanel("当前内核版本：" + k + "\n\nBBR 支持：" + sup, null, "📦 内核版本");
 }
 async function toggleBbr() {
   confirmPanel("确认开启 BBR？\n\n将写入 /etc/sysctl.d/99-fwpanel-bbr.conf 并立即生效。\n不影响现有连接，重启后自动保持。", () => {
