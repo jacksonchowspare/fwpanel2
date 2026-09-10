@@ -2014,12 +2014,14 @@ async function loadCerts() {
       const exp = c.cert_exists
         ? (c.cert_expiry ? `有效至 ${new Date(c.cert_expiry * 1000).toLocaleDateString()}` : "已签发")
         : "未签发";
-      const srcTag = c.source === "proxy" ? '<span style="color:var(--muted);font-size:11px;margin-left:6px">反代</span>' : "";
+      // v3.0.5：来源标签（站点自动申请/站点引用/本机已有的证书也要看得见来源）
+      const SRC_LABEL = { proxy: "反代", site: "站点申请", "site-ref": "站点引用", system: "本机已有" };
+      const srcTag = SRC_LABEL[c.source] ? '<span style="color:var(--muted);font-size:11px;margin-left:6px">' + SRC_LABEL[c.source] + "</span>" : "";
       tr.innerHTML = `<td>${c.domain}${c.method === "dns" ? '<span style="color:#f59e0b;font-size:11px;margin-left:6px">DNS</span>' : '<span style="color:var(--muted);font-size:11px;margin-left:6px">HTTP</span>'}${srcTag}</td><td style="color:var(--muted);font-size:12px">${exp}</td>
         <td>
           <button class="btn mini ghost" onclick="renewCertSolo('${c.domain}')">手动续期</button>
           <button class="btn mini ghost" onclick="showCertPathsSolo('${c.domain}')">显示路径</button>
-          <button class="btn mini danger" onclick="delCert('${c.domain}')">移除</button>
+          ${c.source === "independent" ? `<button class="btn mini danger" onclick="delCert('${c.domain}')">移除</button>` : ""}
         </td>`;
       tbody.appendChild(tr);
     }

@@ -5449,5 +5449,116 @@ class TestV301Fixes(unittest.TestCase):
         self.assertTrue(d2.get("reused"))
 
 
+class TestCertUnmanaged(unittest.TestCase):
+    """v3.0.5：站点模块自动申请的证书此前不写证书记录 → 「已申请证书」列表里看不到、无法管理。
+    修复后：① 站点签发即登记记录；② 列表并入磁盘上所有已签发证书（标注来源）；
+    ③ 磁盘证书同样可续期/查看路径。"""
+
+    @classmethod
+    def setUpClass(cls):
+        import tempfile as _tf
+        cls.tmp = _tf.mkdtemp(prefix="fwcert505-")
+        cls.le = os.path.join(cls.tmp, "le")
+        cls.certfile = os.path.join(cls.tmp, "certificates.json")
+        for d in ("site.example.com", "ref.example.com", "manual.example.com", "orphan.example.com"):
+            os.makedirs(os.path.join(cls.le, d))
+            with open(os.path.join(cls.le, d, "fullchain.pem"), "w") as f:
+                f.write("-----BEGIN CERTIFICATE-----\nfake\n-----END CERTIFICATE-----")
+            with open(os.path.join(cls.le, d, "privkey.pem"), "w") as f:
+                f.write("fake-key")
+        cls.old_le, cls.old_cf = panel.LE_LIVE, panel.CERT_FILE
+        panel.LE_LIVE, panel.CERT_FILE = cls.le, cls.certfile
+        cls.cfg = make_cfg()
+        cls.store = panel.RuleStore(); cls.store.rules = []
+        cls.nft = panel.NFTManager(cls.store, cls.cfg)
+        cls.server = panel.PanelServer(("127.0.0.1", 17988), panel.PanelHandler,
+                                       cls.cfg, cls.store, cls.nft, panel.Auth(cls.cfg))
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.token = ""
+        code, d = cls._req("POST", "/api/login", {"username": TEST_USER, "password": TEST_PASS})
+        cls.token = d.get("token", "")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown(); cls.server.server_close()
+        panel.LE_LIVE, panel.CERT_FILE = cls.old_le, cls.old_cf
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def _req(cls, method, path, data=None):
+        r = urllib.request.Request("http://127.0.0.1:17988" + path, method=method)
+        if cls.token:
+            r.add_header("Authorization", "Bearer " + cls.token)
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode(); r.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(r, body) as resp:
+                return resp.status, json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read())
+            except Exception:
+                return e.code, {}
+
+    def test_disk_certs_listed_with_source(self):
+        """列表并入磁盘证书：站点域名标「站点申请」、引用标「站点引用」、其余标「本机已有」"""
+        real = panel.site_cert_owners
+        panel.site_cert_owners = lambda: ({"site.example.com"}, {"ref.example.com"})
+        try:
+            code, d = self._req("GET", "/api/cert")
+        finally:
+            panel.site_cert_owners = real
+        self.assertEqual(code, 200, d)
+        by = {c["domain"]: c for c in d["certs"]}
+        for dom in ("site.example.com", "ref.example.com", "manual.example.com"):
+            self.assertIn(dom, by, "磁盘上已签发的证书必须出现在列表里: " + dom)
+            self.assertTrue(by[dom]["cert_exists"])
+        self.assertEqual(by["site.example.com"]["source"], "site")
+        self.assertEqual(by["ref.example.com"]["source"], "site-ref")
+        self.assertEqual(by["manual.example.com"]["source"], "system")
+
+    def test_site_issue_registers_record(self):
+        """站点签发成功后必须写证书记录（否则列表看不到）"""
+        fake_site = {"id": "sitesite1234", "domain": "site.example.com", "cert_mode": "auto", "type": "static"}
+        real_site_store, real_issue, real_apply = panel.SiteStore, panel.issue_cert, panel.apply_all_nginx
+        class _SS:
+            def __init__(self): pass
+            def get(self, sid): return fake_site if sid == "sitesite1234" else None
+        panel.SiteStore = _SS
+        panel.issue_cert = lambda dom, email: (True, "证书已签发")
+        panel.apply_all_nginx = lambda ps, ss, cfg: (True, "nginx 已重载")
+        try:
+            ok, msg = panel.site_issue_cert("sitesite1234")
+        finally:
+            panel.SiteStore, panel.issue_cert, panel.apply_all_nginx = real_site_store, real_issue, real_apply
+        self.assertTrue(ok, msg)
+        store = panel.load_cert_store()
+        self.assertIn("site.example.com", store, "站点证书必须登记进证书记录")
+        self.assertEqual(panel._cert_meta(store["site.example.com"])[3], "site")
+
+    def test_disk_cert_actions_allowed(self):
+        """无记录的磁盘证书：① 可续期（续期后收编进记录）② 无记录的 delete 给出明确语义 ③ 都没有则 400"""
+        # ① 磁盘证书续期（不再被「不在独立证书列表中」挡住）
+        real_renew = panel.renew_cert
+        panel.renew_cert = lambda dom: (True, "证书已续期")
+        try:
+            code, d = self._req("POST", "/api/cert/manual.example.com", {"action": "renew"})
+        finally:
+            panel.renew_cert = real_renew
+        self.assertEqual(code, 200, d)
+        self.assertTrue(d.get("task") or d.get("ok"), d)
+        self.assertIn("manual.example.com", panel.load_cert_store(), "续期成功后应收编进独立证书记录")
+
+        # ② 无记录 + 有证书文件 → 不移除记录，给出可操作说明（不是 400）
+        code, d = self._req("POST", "/api/cert/orphan.example.com", {"action": "delete"})
+        self.assertEqual(code, 200, d)
+        self.assertIn("无独立申请记录", d.get("msg", ""))
+
+        # ③ 磁盘和记录都没有 → 400
+        code, d = self._req("POST", "/api/cert/nope.invalid", {"action": "renew"})
+        self.assertEqual(code, 400, d)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

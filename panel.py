@@ -51,7 +51,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.0.4"
+CURRENT_VERSION = "3.0.5"
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -2078,6 +2078,45 @@ def cert_files_exist(domain):
     return os.path.isfile(os.path.join(LE_LIVE, domain, "fullchain.pem"))
 
 
+def discover_disk_certs():
+    """扫描 LE_LIVE 下所有已签发证书（返回域名集合）。
+
+    v3.0.5：站点模块自动申请的证书此前只落磁盘、不写 certificates.json 记录，
+    导致它们在「已申请证书」列表里看不到、无法续期/查看（用户实测反馈）。
+    现在列表 = 记录 ∪ 磁盘实际存在的证书，任何已签发证书都能被管理。"""
+    out = []
+    try:
+        for name in os.listdir(LE_LIVE):
+            if cert_files_exist(name):
+                out.append(name)
+    except OSError:
+        pass
+    return sorted(out)
+
+
+def site_cert_owners():
+    """返回 (站点自身域名集合, 站点引用的证书域名集合) —— 用于给磁盘证书标注来源"""
+    own, refs = set(), set()
+    try:
+        for s in SiteStore().sites:
+            dom = (s.get("domain") or "").strip().lower()
+            if dom:
+                own.add(dom)
+            ref = (s.get("cert_ref") or "").strip().lower()
+            if ref:
+                refs.add(ref)
+    except Exception:
+        pass
+    return own, refs
+
+
+def cert_record(domain, email="", method="http", provider="certbot", source="independent"):
+    """写入独立证书记录（证书模块列表的数据来源）"""
+    store = load_cert_store()
+    store[domain] = {"email": email, "method": method, "provider": provider, "source": source}
+    save_cert_store(store)
+
+
 def _fmt_next_check(next_raw):
     """把下次检测时间格式化为「xxxx年xx月xx日 星期几」"""
     try:
@@ -2611,6 +2650,11 @@ def site_issue_cert(sid):
     ok2, msg2 = apply_all_nginx(ProxyStore(), SiteStore(), None)
     if not ok2:
         return False, f"证书已签发，但 nginx 重载失败：{msg2}"
+    # v3.0.5：登记到独立证书记录，否则证书在「已申请证书」列表里看不到、无法管理
+    try:
+        cert_record(domain, email=email, method="http", provider="certbot", source="site")
+    except Exception as e:
+        log(f"[v3.0.5] 站点证书登记失败（不影响站点使用）: {e}")
     return True, f"证书已签发并启用 HTTPS（{msg2}）"
 
 
@@ -6840,7 +6884,20 @@ class PanelHandler(BaseHTTPRequestHandler):
         token = self._require_auth()
         if token is None:
             return
-        store = load_cert_store()
+        store = dict(load_cert_store())
+        # v3.0.5：把磁盘上已签发但无记录的证书并入列表（站点自动申请 / 手工 certbot）
+        own, refs = site_cert_owners()
+        for dom in discover_disk_certs():
+            if dom in store:
+                continue
+            if dom in own:
+                src, note = "site", "站点申请"
+            elif dom in refs:
+                src, note = "site-ref", "站点引用"
+            else:
+                src, note = "system", "本机已有"
+            store[dom] = {"email": "", "method": "http", "provider": "certbot",
+                          "source": src, "note": note}
         items = []
         for domain, entry in store.items():
             email, method, provider, source = _cert_meta(entry)
@@ -6948,10 +7005,15 @@ class PanelHandler(BaseHTTPRequestHandler):
         domain = suffix.strip().lower()
         data = self._read_json()
         action = str(data.get("action", ""))
-        store = load_cert_store()
+        store = dict(load_cert_store())
+        own, refs = site_cert_owners()
         if domain not in store:
-            self._send(400, {"error": "该域名不在独立证书列表中"})
-            return
+            # v3.0.5：磁盘上存在但无记录的证书（站点申请/手工签发）同样允许管理
+            if not cert_files_exist(domain):
+                self._send(400, {"error": "该域名没有有效证书（列表与磁盘均未找到）"})
+                return
+            src = "site" if domain in own else ("site-ref" if domain in refs else "system")
+            store[domain] = {"email": "", "method": "http", "provider": "certbot", "source": src}
         if action == "renew":
             email, method, provider, source = _cert_meta(store.get(domain))
 
@@ -6962,12 +7024,24 @@ class PanelHandler(BaseHTTPRequestHandler):
                     ok, msg = renew_cert(domain)
                 if not ok:
                     return False, msg
+                # v3.0.5：续期成功后确保有记录（磁盘证书续期后纳入管理）
+                try:
+                    cert_record(domain, email=email, method=method, provider=provider,
+                                source=source if source != "independent" else "independent")
+                except Exception:
+                    pass
                 return True, f"{domain} 证书已续期"
 
             self._run_long_task("cert/renew", _renew_work)
         elif action == "delete":
-            del store[domain]
-            save_cert_store(store)
+            if domain not in load_cert_store():
+                # 无独立申请记录（站点申请/手工签发）：不隐藏——否则会被磁盘发现逻辑立刻重新列出来
+                self._send(200, {"ok": True, "msg": f"{domain} 由站点模块/系统持有，无独立申请记录可移除（证书文件保留，"
+                                                      f"如需停用请在对应站点停用或删除站点）"})
+                return
+            real = load_cert_store()
+            del real[domain]
+            save_cert_store(real)
             self._send(200, {"ok": True, "msg": f"{domain} 已从列表移除（证书文件保留，供服务引用）"})
         else:
             self._send(400, {"error": "action 必须是 renew 或 delete"})

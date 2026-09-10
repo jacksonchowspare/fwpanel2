@@ -161,6 +161,22 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   rec("文件管理操作按钮同一行（最坏 5-7 个按钮）", fm.length > 0 && fm.every(r => r.rows === 1),
       fm.map(r => r.n + "个按钮→" + r.rows + "行").join(" "));
 
+  // —— 场景 5：证书列表（v3.0.5：站点自动申请的证书必须在列表里且可管理）——
+  console.log("== 场景 5：已申请证书列表 ==");
+  await page.evaluate(() => switchTab("px"));
+  await page.waitForTimeout(1500);
+  const certs = await page.evaluate(() => {
+    const rows = [...document.querySelectorAll("#cert_rows tr")];
+    const txt = (document.getElementById("cert_rows") || {}).textContent || "";
+    return { n: rows.filter(r => r.querySelector("button")).length, empty: /暂无独立申请记录/.test(txt),
+             domains: rows.map(r => (r.querySelector("td") || {}).textContent || "").filter(Boolean).slice(0, 6),
+             hasRenew: rows.some(r => /手动续期/.test(r.textContent)) };
+  });
+  rec("证书列表非空（站点自动申请的证书可见）", certs.n >= 1 && !certs.empty,
+      "行数=" + certs.n + (certs.empty ? " (显示暂无记录)" : "") + " " + JSON.stringify(certs.domains));
+  rec("证书行带管理按钮（手动续期）", certs.hasRenew, "");
+  await page.locator("#cert_rows").screenshot({ path: "/tmp/uicheck/shots2/certs.png" }).catch(() => {});
+
   console.log("\n== 控制台错误 ==");
   const real = errors.filter(e => !/favicon|net::ERR_ABORTED/i.test(e));
   console.log(real.length ? real.slice(0, 10).join("\n") : "  无");
