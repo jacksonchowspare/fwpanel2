@@ -380,6 +380,20 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   const pass = results.filter(r => r.ok).length;
   console.log("\n结果：" + pass + "/" + results.length + " 通过");
 
+  // ---- 静态资源请求挂住时，登录页仍必须出现（用户实测：只有背景+标签转圈）----
+  {
+    await page.route("**/static/vendor/xterm.js", () => {});
+    await page.goto(URL, { waitUntil: "commit" }).catch(() => {});
+    await page.waitForTimeout(4500);
+    const hung = await page.evaluate(() => ({
+      loginVisible: !document.getElementById("login").classList.contains("hidden"),
+      btn: !!document.querySelector("#login button"),
+      ready: document.readyState !== "loading"
+    }));
+    rec("挂住静态脚本时登录页仍然出现（不会只有背景+转圈）", hung.loginVisible && hung.btn && hung.ready, JSON.stringify(hung));
+    await page.unroute("**/static/vendor/xterm.js");
+  }
+
   results.filter(r => !r.ok).forEach(r => console.log("  ✗ " + r.name + " | " + r.detail));
   await browser.close();
   process.exit(pass === results.length ? 0 : 1);
