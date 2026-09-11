@@ -5996,5 +5996,44 @@ class TestSystem(unittest.TestCase):
         self.assertEqual(len(seen), 8)
 
 
+    def test_cache_headers_version_and_head(self):
+        """v3.2.5：面板 HTML/接口必须 no-store（升级后不能拿旧页面）；静态资源带 ETag 协商；HEAD 可用"""
+        import http.client
+        c = http.client.HTTPConnection("127.0.0.1", 17991, timeout=20)
+        # 首页：no-store + 版本占位符已替换
+        c.request("GET", "/")
+        r = c.getresponse(); body = r.read()
+        self.assertEqual(r.status, 200)
+        self.assertEqual(r.getheader("Cache-Control"), "no-store", "首页必须不缓存")
+        self.assertNotIn(b"__VERSION__", body, "版本占位符必须已被替换")
+        self.assertIn(panel.CURRENT_VERSION.encode(), body)
+        # 版本接口（前端握手用）
+        c.request("GET", "/api/version")
+        r = c.getresponse(); d = json.loads(r.read())
+        self.assertEqual(d["version"], panel.CURRENT_VERSION)
+        self.assertEqual(r.getheader("Cache-Control"), "no-store")
+        self.assertIn("started", d)
+        # 认证接口也 no-store
+        c.request("GET", "/api/status", headers={"Authorization": "Bearer " + self.token})
+        r = c.getresponse(); r.read()
+        self.assertEqual(r.getheader("Cache-Control"), "no-store")
+        # 静态资源：no-cache + ETag，条件请求 304
+        c.request("GET", "/static/vendor/xterm.js")
+        r = c.getresponse(); r.read()
+        etag = r.getheader("ETag")
+        self.assertTrue(etag, "静态资源必须带 ETag")
+        self.assertEqual(r.getheader("Cache-Control"), "no-cache")
+        c.request("GET", "/static/vendor/xterm.js", headers={"If-None-Match": etag})
+        r2 = c.getresponse(); r2.read()
+        self.assertEqual(r2.status, 304, "ETag 未变时应回 304")
+        # HEAD 支持（之前 501，curl -I 会误判面板挂了）
+        c.request("HEAD", "/")
+        rh = c.getresponse(); hbody = rh.read()
+        self.assertEqual(rh.status, 200)
+        self.assertEqual(hbody, b"", "HEAD 不应返回响应体")
+        self.assertTrue(rh.getheader("Content-Length"))
+        c.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1683,17 +1683,51 @@ function confirmPanel(msg, onOk, title, contentEl) {
 }
 function closeCfm() { $("cfm_modal").classList.add("hidden"); cfmCallback = null; }
 function cfmOk() { const cb = cfmCallback; closeCfm(); if (cb) cb(); }
-async function api(method, path, body) {
-  const opt = { method, headers: {} };
+async function api(method, path, body, timeoutMs) {
+  const opt = { method, headers: {}, cache: "no-store" };
   if (token) opt.headers["Authorization"] = "Bearer " + token;
   if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
-  const r = await fetch(API + path, opt);
+  // 请求必须有超时：面板重启/升级中、节点不可达时，没有超时的 fetch 会一直挂着，
+  // 页面表现为"永远加载不出来"（用户实测）
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), timeoutMs || 25000);
+  opt.signal = ctl.signal;
+  let r;
+  try {
+    r = await fetch(API + path, opt);
+  } catch (e) {
+    clearTimeout(t);
+    if (e.name === "AbortError") throw new Error("请求超时（面板可能正在重启或升级）");
+    throw new Error("无法连接面板（可能正在重启或升级）");
+  }
+  clearTimeout(t);
   let data = {};
   try { data = await r.json(); } catch (e) {}
   if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error(data.error || "未登录"); }
   if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
   return data;
 }
+
+/* ---------- 版本握手：升级后自动刷新，用户不用再清缓存 ---------- */
+const PAGE_VERSION = "__VERSION__";
+window._verTried = window._verTried || 0;   // 自动刷新只做一次（放 window 上便于回归脚本抑制跳转）
+async function checkVersionHandshake() {
+  if (!token) return;
+  try {
+    const d = await api("GET", "/api/version", null, 12000);
+    if (d.version && d.version !== PAGE_VERSION) {
+      toast("面板已升级到 v" + d.version + "，正在自动刷新…", "");
+      if (window._verTried >= 1) return;
+      window._verTried++;
+      setTimeout(() => {
+        // 带查询串刷新 = 绕过缓存，用户不需要手动清缓存
+        const u = location.pathname + "?_v=" + encodeURIComponent(d.version);
+        location.replace(u);
+      }, 1200);
+    }
+  } catch (e) { /* 面板正在重启：忽略，下次再试 */ }
+}
+setInterval(checkVersionHandshake, 5 * 60 * 1000);
 
 // 长任务异步执行（v2.1.18）：POST 返回 {task} → 轮询 GET /api/tasks/<id> 至完成。
 // nginx 网关 60s 超时会掐断长连接（装 Docker 曾报 HTTP 504），异步后接口秒回、轮询短请求，彻底免疫。
@@ -1747,6 +1781,43 @@ function closeAllFloating() {
   try { TERM_WINS.slice().forEach(w => termClose(w)); } catch (e) {}
   const d = $("term_dock"); if (d) d.innerHTML = "";
 }
+/* ---------- 网络异常横幅（面板重启/升级/节点不可达时给用户明确出路） ---------- */
+function netBanner(msg) {
+  let b = document.getElementById("net_banner");
+  if (!b) {
+    b = document.createElement("div");
+    b.id = "net_banner";
+    b.style.cssText = "position:fixed;top:0;left:0;right:0;z-index:9999;background:#c0392b;color:#fff;"
+      + "padding:8px 12px;font-size:13px;display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap";
+    document.body.appendChild(b);
+  }
+  b.innerHTML = "";
+  const s = document.createElement("span");
+  s.textContent = msg;
+  const btn = document.createElement("button");
+  btn.className = "btn mini";
+  btn.textContent = "重新加载";
+  btn.onclick = () => { location.replace(location.pathname + "?_r=" + Date.now()); };  // 带查询串=绕过缓存
+  b.appendChild(s);
+  b.appendChild(btn);
+}
+function clearNetBanner() { const b = document.getElementById("net_banner"); if (b) b.remove(); }
+/* 启动探活：面板正在重启/升级时自动重试，并给出明确提示（以前是一屏空白或"检测中"） */
+async function bootLoad() {
+  for (let i = 1; i <= 3; i++) {
+    try {
+      await api("GET", "/api/version", null, 10000);
+      clearNetBanner();
+      refreshAll();
+      checkVersionHandshake();
+      return;
+    } catch (e) {
+      netBanner("面板暂时无法响应（可能正在重启或升级）—— 第 " + i + "/3 次重试：" + e.message);
+      await new Promise(r => setTimeout(r, 2500));
+    }
+  }
+  netBanner("面板无响应，可能正在重启或升级。恢复后点右侧按钮即可（不需要清理浏览器缓存）");
+}
 function showLogin() { closeAllFloating(); fedUiReset(); $("login").classList.remove("hidden"); $("main").classList.add("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "inline-block"; }
 function showMain()  { $("login").classList.add("hidden"); $("main").classList.remove("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "none"; }
 async function login() {
@@ -1766,11 +1837,11 @@ async function login() {
           setTimeout(() => { vp.setAttribute("content", "width=device-width, initial-scale=1.0"); }, 300);
         }
       }
-      showMain(); ensureFedTab(); refreshAll(); switchTab(localStorage.getItem("fw_sec") || "overview");
+      showMain(); ensureFedTab(); bootLoad(); switchTab(localStorage.getItem("fw_sec") || "overview");
       toast("登录成功", "okk");
       return;
     }
-    showMain(); ensureFedTab(); refreshAll(); switchTab(localStorage.getItem("fw_sec") || "overview");
+    showMain(); ensureFedTab(); bootLoad(); switchTab(localStorage.getItem("fw_sec") || "overview");
     toast("登录成功", "okk");
   } catch (e) { toast(e.message, "err"); }
 }

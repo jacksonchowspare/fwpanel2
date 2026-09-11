@@ -334,6 +334,15 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
       sysShapes.some(s => s.display === "grid"), JSON.stringify(sysShapes));
 
   // ---- 退出登录后不能有残留浮层（否则登录页被遮住 = "打不开"）----
+  {
+    await page.evaluate(() => { window._verTried = 1; window.__savedApi = api; window.api = async () => ({ version: "99.99.99" }); });
+    await page.evaluate(() => checkVersionHandshake());
+    await page.waitForTimeout(800);
+    const th = await page.$eval("#toast", e => e.innerText).catch(() => "");
+    rec("检测到服务端版本变化会提示自动刷新（不用清缓存）", /已升级/.test(th) && /99\.99\.99/.test(th), th.slice(0, 50));
+    await page.evaluate(() => { window.api = window.__savedApi; window._verTried = 0; });
+  }
+
   // 直接调用 openTheme()：登录页的浮动主题按钮在登录后是隐藏的，点它会超时
   await page.evaluate(() => { document.querySelectorAll(".modal-mask").forEach(m => m.classList.add("hidden")); openTheme(); });
   await page.waitForTimeout(600);
@@ -357,6 +366,11 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   rec("退出后没有残留弹窗遮罩", afterLogout.open.length === 0, JSON.stringify(afterLogout.open));
   rec("退出后悬浮终端窗口已关闭", afterLogout.twins === 0, "twins=" + afterLogout.twins);
   rec("退出后登录页可见且登录按钮可点", !afterLogout.loginHidden && afterLogout.topIsButton, afterLogout.topId);
+  const ccHdr = await page.evaluate(async () => {
+    const r = await fetch(location.pathname, { cache: "no-store" });
+    return r.headers.get("cache-control") || "(无)";
+  });
+  rec("面板 HTML 响应头带 Cache-Control: no-store（升级后不会拿旧页面）", ccHdr === "no-store", ccHdr);
   const creds = await page.evaluate(() => ({ u: document.getElementById("lg_user").value, p: document.getElementById("lg_pass").value }));
   rec("退出后登录框的账号密码已清空", creds.u === "" && creds.p === "", JSON.stringify(creds));
 
@@ -365,6 +379,7 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   console.log(real.length ? real.slice(0, 10).join("\n") : "  无");
   const pass = results.filter(r => r.ok).length;
   console.log("\n结果：" + pass + "/" + results.length + " 通过");
+
   results.filter(r => !r.ok).forEach(r => console.log("  ✗ " + r.name + " | " + r.detail));
   await browser.close();
   process.exit(pass === results.length ? 0 : 1);

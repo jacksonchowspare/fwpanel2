@@ -53,7 +53,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.4"
+CURRENT_VERSION = "3.2.5"
+PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -6283,7 +6284,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         pass
 
     # ---------- 基础 ----------
-    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+    def _send(self, code, body, ctype="application/json; charset=utf-8", cache=None, extra=None):
         if isinstance(body, (dict, list)):
             body = json.dumps(body, ensure_ascii=False).encode()
         elif isinstance(body, str):
@@ -6292,7 +6293,15 @@ class PanelHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("X-Content-Type-Options", "nosniff")
+        # 面板 HTML 与接口一律不缓存：升级后浏览器必须拿到新页面，
+        # 否则会继续渲染旧版应用（用户实测：升级后页面异常，只能清缓存才恢复）
+        self.send_header("Cache-Control", cache or "no-store")
+        self.send_header("Pragma", "no-cache")
+        for k, v in (extra or {}).items():
+            self.send_header(k, v)
         self.end_headers()
+        if getattr(self, "_head_only", False):     # HEAD 请求只回头，不回体
+            return
         try:
             self.wfile.write(body)
         except (BrokenPipeError, ConnectionResetError):
@@ -6335,6 +6344,14 @@ class PanelHandler(BaseHTTPRequestHandler):
         return None
 
     # ---------- 路由 ----------
+    def do_HEAD(self):
+        """HEAD = GET 的头（不做请求体）。之前直接 501，curl -I 与部分客户端会误判"""
+        self._head_only = True
+        try:
+            self.do_GET()
+        finally:
+            self._head_only = False
+
     def do_GET(self):
         parsed = urlparse(self.path)
         path = parsed.path
@@ -6374,6 +6391,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_bruteforce()
         elif path == "/api/proxy":
             self._api_proxy()
+        elif path == "/api/version":
+            self._api_version()
         elif path == "/api/system":
             self._api_system()
         elif path == "/api/system/dns/test":
@@ -7154,6 +7173,8 @@ class PanelHandler(BaseHTTPRequestHandler):
         except FileNotFoundError:
             self._send(404, {"error": "Not Found"})
             return
+        etag = '"%x-%x"' % (int(os.path.getmtime(path)), len(data))
+        cache_hdr = "no-store" if name.endswith(".html") else "no-cache"
         if name.endswith(".html"):
             ctype = "text/html; charset=utf-8"
             # 注入当前版本号（登录页底部显示）
@@ -7170,7 +7191,19 @@ class PanelHandler(BaseHTTPRequestHandler):
             ctype = "font/woff2"
         else:
             ctype = "application/octet-stream"
-        self._send(200, data, ctype)
+        # 静态资源走协商缓存：升级后文件变了 ETag 就变，浏览器必然拿到新文件；
+        # 没变则 304，省流量（面板静态资源里 xterm.js 有 280KB）
+        if not name.endswith(".html"):
+            inm = self.headers.get("If-None-Match", "")
+            if inm and inm == etag:
+                self._send(304, b"", ctype, cache=cache_hdr, extra={"ETag": etag})
+                return
+            self._send(200, data, ctype, cache=cache_hdr,
+                       extra={"ETag": etag,
+                              "Last-Modified": time.strftime("%a, %d %b %Y %H:%M:%S GMT",
+                                                             time.gmtime(os.path.getmtime(path)))})
+            return
+        self._send(200, data, ctype, cache=cache_hdr, extra={"ETag": etag})
 
     # ---------- API ----------
     def _api_login(self):
@@ -7565,6 +7598,12 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     # ---------------- 应用（一键部署，v3.1.0） ----------------
     # ---------------- 系统设置（v3.2.0） ----------------
+    def _api_version(self):
+        """GET /api/version → 版本 + 进程启动时间（前端用来做"升级后自动刷新"握手）
+        必须 no-store：否则浏览器缓存后握手失效，用户又得清缓存"""
+        self._send(200, {"version": CURRENT_VERSION, "pid": os.getpid(),
+                         "started": int(PANEL_START_TS), "uptime_s": int(time.time() - PANEL_START_TS)})
+
     def _api_system(self):
         """GET /api/system → 本机设置总览"""
         token = self._require_auth()
