@@ -357,6 +357,8 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   rec("退出后没有残留弹窗遮罩", afterLogout.open.length === 0, JSON.stringify(afterLogout.open));
   rec("退出后悬浮终端窗口已关闭", afterLogout.twins === 0, "twins=" + afterLogout.twins);
   rec("退出后登录页可见且登录按钮可点", !afterLogout.loginHidden && afterLogout.topIsButton, afterLogout.topId);
+  const creds = await page.evaluate(() => ({ u: document.getElementById("lg_user").value, p: document.getElementById("lg_pass").value }));
+  rec("退出后登录框的账号密码已清空", creds.u === "" && creds.p === "", JSON.stringify(creds));
 
   console.log("\n== 控制台错误 ==");
   const real = errors.filter(e => !/favicon|net::ERR_ABORTED/i.test(e));

@@ -1739,6 +1739,11 @@ function ensureFedTab() {
 function closeAllFloating() {
   document.querySelectorAll(".modal-mask").forEach(m => m.classList.add("hidden"));
   cfmCallback = null;
+  // 清空登录/改密输入框：退出登录后密码留在输入框里是明显的隐私问题（用户实测反馈）
+  try {
+    document.querySelectorAll('input[type="password"]').forEach(i => { i.value = ""; });
+    const u = $("lg_user"); if (u) u.value = "";
+  } catch (e) {}
   try { TERM_WINS.slice().forEach(w => termClose(w)); } catch (e) {}
   const d = $("term_dock"); if (d) d.innerHTML = "";
 }
