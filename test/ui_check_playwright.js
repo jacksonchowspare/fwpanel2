@@ -374,12 +374,6 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
   const creds = await page.evaluate(() => ({ u: document.getElementById("lg_user").value, p: document.getElementById("lg_pass").value }));
   rec("退出后登录框的账号密码已清空", creds.u === "" && creds.p === "", JSON.stringify(creds));
 
-  console.log("\n== 控制台错误 ==");
-  const real = errors.filter(e => !/favicon|net::ERR_ABORTED/i.test(e));
-  console.log(real.length ? real.slice(0, 10).join("\n") : "  无");
-  const pass = results.filter(r => r.ok).length;
-  console.log("\n结果：" + pass + "/" + results.length + " 通过");
-
   // ---- 静态资源请求挂住时，登录页仍必须出现（用户实测：只有背景+标签转圈）----
   {
     await page.route("**/static/vendor/xterm.js", () => {});
@@ -393,6 +387,13 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
     rec("挂住静态脚本时登录页仍然出现（不会只有背景+转圈）", hung.loginVisible && hung.btn && hung.ready, JSON.stringify(hung));
     await page.unroute("**/static/vendor/xterm.js");
   }
+
+  console.log("\n== 控制台错误 ==");
+  const real = errors.filter(e => !/favicon|net::ERR_ABORTED/i.test(e));
+  console.log(real.length ? real.slice(0, 10).join("\n") : "  无");
+  const pass = results.filter(r => r.ok).length;
+  console.log("\n结果：" + pass + "/" + results.length + " 通过");
+
 
   results.filter(r => !r.ok).forEach(r => console.log("  ✗ " + r.name + " | " + r.detail));
   await browser.close();
