@@ -609,6 +609,23 @@ tr:hover td { background: var(--panel-solid); }
     document.documentElement.style.zoom = z;
   } catch (e) {}
 })();
+/* 主题：服务端注入的 __THEME__ 是权威值（存在面板配置里）→ 换浏览器/清数据/换设备都一致。
+   本地 localStorage 只做兜底（服务端取不到时用），首帧即正确，不会先闪默认色 */
+window.__SERVER_THEME__ = "__THEME__";
+window.__SERVER_THEME_EXPLICIT__ = "__THEME_EXPLICIT__";   // 0=面板还没存过主题（老版本升级）
+(function () {
+  function apply() {
+    try {
+      // 面板存过主题 → 以面板为准（跨设备统一）；没存过 → 先用本机原有的，启动后再迁移到面板
+      var t = (window.__SERVER_THEME_EXPLICIT__ === "1")
+        ? window.__SERVER_THEME__
+        : (localStorage.getItem("fw_theme") || window.__SERVER_THEME__ || "dark");
+      if (document.body) document.body.dataset.theme = t;
+    } catch (e) {}
+  }
+  apply();
+  document.addEventListener("DOMContentLoaded", apply);   // <head> 执行时 body 还没生成
+})();
 /* 看门狗：若主脚本因任何资源卡住而没能执行，登录框也必须出现，
    否则用户看到的是"只有主题背景 + 标签一直转圈"，完全不知道能做什么（用户实测） */
 setTimeout(function () {
@@ -1844,6 +1861,7 @@ async function bootLoad() {
       clearNetBanner();
       refreshAll();
       checkVersionHandshake();
+      syncThemeFromServer();
       return;
     } catch (e) {
       netBanner("面板暂时无法响应（可能正在重启或升级）—— 第 " + i + "/3 次重试：" + e.message);
@@ -2429,11 +2447,15 @@ const THEMES = [
   { id: "pixel-dark",   n: "像素·暗",    c: ["#ffd23f", "#13131d"] },
 ];
 function themeName(t) { const x = THEMES.find(v => v.id === t); return x ? x.n : "主题"; }
-function setTheme(t) {
+function setTheme(t, sync) {
   if (!THEMES.some(v => v.id === t)) t = "dark";
   document.body.dataset.theme = t;
   localStorage.setItem("fw_theme", t);
   paintThemeBtns();
+  if (sync) {   // 用户主动切换 → 存到面板配置（其它浏览器/设备/手机平板都会跟随）
+    api("POST", "/api/theme", { theme: t }).then(() => toast("主题已保存到面板（所有设备统一）", "okk"))
+      .catch(e => toast("主题已在本机生效，但保存到面板失败：" + e.message, "err"));
+  }
 }
 function paintThemeBtns() {
   const grid = $("thm_grid");
@@ -2452,7 +2474,7 @@ function openTheme() {
       it.className = "th-item";
       it.dataset.t = x.id;
       it.innerHTML = '<span class="th-dot"><i style="background:' + x.c[0] + '"></i><i style="background:' + x.c[1] + '"></i></span><span>' + x.n + '</span>';
-      it.onclick = () => { setTheme(x.id); toast("主题已切换: " + x.n, "okk"); closeTheme(); };
+      it.onclick = () => { setTheme(x.id, true); toast("主题已切换: " + x.n, "okk"); closeTheme(); };
       grid.appendChild(it);
     });
   }
@@ -2529,7 +2551,23 @@ window.addEventListener("resize", () => {
   clearTimeout(_zt);
   _zt = setTimeout(() => { if ((localStorage.getItem("ui_zoom") || "auto") === "auto") applyZoomForce(); }, 250);
 });
-setTheme(localStorage.getItem("fw_theme") || "dark");
+// 与 head 里的首帧逻辑保持一致：面板存过主题→以面板为准；没存过→先用本机原有的（启动后迁移到面板）
+setTheme((window.__SERVER_THEME_EXPLICIT__ === "1")
+  ? (window.__SERVER_THEME__ || "dark")
+  : (localStorage.getItem("fw_theme") || window.__SERVER_THEME__ || "dark"));
+async function syncThemeFromServer() {
+  try {
+    const d = await api("GET", "/api/theme", null, 10000);
+    if (!d.theme) return;
+    if (!d.explicit) {
+      // 面板还没存过主题：把本机当前主题迁移上去（以后所有设备统一），
+      // 避免"升级后被默认主题覆盖"这种掉主题的情况
+      const loc = localStorage.getItem("fw_theme") || document.body.dataset.theme;
+      if (loc && THEMES.some(v => v.id === loc)) { setTheme(loc, true); return; }
+    }
+    if (document.body.dataset.theme !== d.theme) setTheme(d.theme);
+  } catch (e) {}
+}
 applyZoomForce();
 
 /* ---------- 分组导航 tabs ---------- */

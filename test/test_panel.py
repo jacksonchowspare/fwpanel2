@@ -6035,5 +6035,53 @@ class TestSystem(unittest.TestCase):
         c.close()
 
 
+    def test_theme_persisted_on_server(self):
+        """主题存服务端（用户要求固定）：换浏览器/清数据/换设备都一致；免鉴权可读、鉴权才可写"""
+        import http.client, re as _re
+        c = http.client.HTTPConnection("127.0.0.1", 17991, timeout=20)
+        # 读：免鉴权（登录页也要按主题渲染）
+        c.request("GET", "/api/theme")
+        r = c.getresponse(); d = json.loads(r.read())
+        self.assertEqual(r.status, 200)
+        self.assertEqual(set(d["themes"]), set(panel.THEME_IDS))
+        # 面板还没存过主题时，explicit=false（前端据此做一次性迁移，避免升级后掉主题）
+        c.request("GET", "/")
+        r = c.getresponse(); body0 = r.read().decode()
+        self.assertIn('__SERVER_THEME_EXPLICIT__ = "0"', body0)
+        self.assertFalse(d.get("explicit"), "未存过主题时应 explicit=false")
+        # 写：未鉴权禁止
+        c.request("POST", "/api/theme", json.dumps({"theme": "vibes-dark"}),
+                  {"Content-Type": "application/json"})
+        r = c.getresponse(); r.read()
+        self.assertEqual(r.status, 401, "未登录不能改面板主题")
+        # 写：鉴权后生效并落盘
+        c.request("POST", "/api/theme", json.dumps({"theme": "vibes-dark"}),
+                  {"Content-Type": "application/json", "Authorization": "Bearer " + self.token})
+        r = c.getresponse(); r.read()
+        self.assertEqual(r.status, 200)
+        c.request("GET", "/api/theme")
+        r = c.getresponse()
+        self.assertEqual(json.loads(r.read())["theme"], "vibes-dark")
+        self.assertEqual(panel.get_theme(self.cfg), "vibes-dark")
+        # 首页 HTML 注入该主题，且不留占位符（首帧即正确，换浏览器不会先闪默认色）
+        c.request("GET", "/")
+        r = c.getresponse(); body = r.read().decode()
+        self.assertIn('__SERVER_THEME__ = "vibes-dark"', body)
+        self.assertIn('__SERVER_THEME_EXPLICIT__ = "1"', body)
+        self.assertNotIn("__THEME__", body)
+        # 非法主题拒绝
+        c.request("POST", "/api/theme", json.dumps({"theme": "nope"}),
+                  {"Content-Type": "application/json", "Authorization": "Bearer " + self.token})
+        r = c.getresponse(); r.read()
+        self.assertEqual(r.status, 400)
+        # 前后端主题清单必须一致（防两边漂移）
+        html = open(os.path.join(panel.STATIC_DIR, "index.html")).read()
+        m = _re.search(r"const THEMES = \[(.*?)\];", html, _re.S)
+        self.assertTrue(m, "前端找不到面板主题清单 const THEMES")
+        ids = _re.findall(r'id: "([a-z\-]+)"', m.group(1))
+        self.assertEqual(set(ids), set(panel.THEME_IDS), "前后端主题清单不一致：%s" % ids)
+        c.close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

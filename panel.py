@@ -53,8 +53,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.6"
+CURRENT_VERSION = "3.2.7"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
+# 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
+THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
+             "vibes-light", "vibes-dark", "pixel-light", "pixel-dark")
+THEME_DEFAULT = "dark"
+
+
+def get_theme(config):
+    """当前主题：存在 config.json 里 → 换浏览器/清缓存/换设备都一致（用户要求固定）"""
+    t = (config.get("theme") or "").strip()
+    return t if t in THEME_IDS else THEME_DEFAULT
 # 测试时用环境变量覆盖配置目录（单测/冒烟测试）
 BASE_DIR = os.environ.get("FW_TEST_DIR", "/etc/fwpanel")
 APP_DIR = os.environ.get("FW_APP_DIR", "/usr/local/lib/fwpanel")
@@ -6393,6 +6403,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_proxy()
         elif path == "/api/version":
             self._api_version()
+        elif path == "/api/theme":
+            self._api_theme()
         elif path == "/api/system":
             self._api_system()
         elif path == "/api/system/dns/test":
@@ -7061,6 +7073,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_cert_action(path.rsplit("/", 1)[1])
         elif path == "/api/proxy":
             self._api_proxy_add()
+        elif path == "/api/theme":
+            self._api_theme_set()
         elif path == "/api/system/swap":
             self._api_system_swap()
         elif path == "/api/system/swappiness":
@@ -7179,6 +7193,16 @@ class PanelHandler(BaseHTTPRequestHandler):
             ctype = "text/html; charset=utf-8"
             # 注入当前版本号（登录页底部显示）
             data = data.replace(b"__VERSION__", CURRENT_VERSION.encode())
+            # 主题也在服务端注入：换浏览器/清掉本地数据后，首帧依然是用户选的主题
+            try:
+                _t = get_theme(self.server.config).encode()
+            except Exception:
+                _t = THEME_DEFAULT.encode()
+            try:
+                _exp = b"1" if "theme" in (self.server.config.data or {}) else b"0"
+            except Exception:
+                _exp = b"0"
+            data = data.replace(b"__THEME__", _t).replace(b"__THEME_EXPLICIT__", _exp)
         elif name.endswith(".js"):
             ctype = "application/javascript; charset=utf-8"
         elif name.endswith(".css"):
@@ -7598,6 +7622,34 @@ class PanelHandler(BaseHTTPRequestHandler):
 
     # ---------------- 应用（一键部署，v3.1.0） ----------------
     # ---------------- 系统设置（v3.2.0） ----------------
+    def _api_theme(self):
+        """GET /api/theme → 当前主题（免鉴权：登录页也要按它渲染）"""
+        # explicit=False 表示面板配置里还没存过主题（老版本升级上来的情况）——
+        # 前端此时会把浏览器里已有的主题一次性迁移到服务端，避免升级后被默认主题覆盖
+        try:
+            explicit = "theme" in (self.server.config.data or {})
+        except Exception:
+            explicit = False
+        self._send(200, {"theme": get_theme(self.server.config), "explicit": explicit,
+                         "themes": list(THEME_IDS)})
+
+    def _api_theme_set(self):
+        """POST /api/theme {theme} → 存到面板配置（所有设备/浏览器统一）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        data = self._read_json()
+        t = str(data.get("theme", "")).strip()
+        if t not in THEME_IDS:
+            self._send(400, {"error": "未知主题：%s（可选：%s）" % (t, "、".join(THEME_IDS))})
+            return
+        try:
+            self.server.config.set("theme", t)
+        except Exception as e:
+            self._send(500, {"error": "保存主题失败：%s" % e})
+            return
+        self._send(200, {"ok": True, "theme": t})
+
     def _api_version(self):
         """GET /api/version → 版本 + 进程启动时间（前端用来做"升级后自动刷新"握手）
         必须 no-store：否则浏览器缓存后握手失效，用户又得清缓存"""

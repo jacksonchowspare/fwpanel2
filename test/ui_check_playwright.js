@@ -334,6 +334,24 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
       sysShapes.some(s => s.display === "grid"), JSON.stringify(sysShapes));
 
   // ---- 退出登录后不能有残留浮层（否则登录页被遮住 = "打不开"）----
+    {   // 主题固定在服务端（换浏览器/清数据/换设备都一致）
+    const before = await page.evaluate(async () => (await api("GET", "/api/theme")).theme);
+    const target = before === "vibes-dark" ? "pixel-dark" : "vibes-dark";
+    await page.evaluate(async (t) => { setTheme(t, true); await new Promise(r => setTimeout(r, 900)); }, target);
+    const onServer = await page.evaluate(async () => (await api("GET", "/api/theme")).theme);
+    rec(onServer === target, "界面切换主题会保存到面板（所有设备跟随）", before + " → " + onServer);
+    const ctx2 = await browser.newContext();
+    const p2 = await ctx2.newPage();
+    await p2.goto(URL, { waitUntil: "domcontentloaded" });
+    await p2.waitForTimeout(900);
+    const fresh = await p2.evaluate(() => document.body.dataset.theme);
+    rec(fresh === target, "全新浏览器（无本地数据）首帧就是面板保存的主题", "首帧=" + fresh);
+    await ctx2.close();
+    await page.evaluate(async (t) => { setTheme(t, true); await new Promise(r => setTimeout(r, 700)); }, before);
+    const restored = await page.evaluate(async () => (await api("GET", "/api/theme")).theme);
+    rec(restored === before, "主题已还原为运行前的值（不留测试痕迹）", before + " → " + restored);
+  }
+
   {
     await page.evaluate(() => { window._verTried = 1; window.__savedApi = api; window.api = async () => ({ version: "99.99.99" }); });
     await page.evaluate(() => checkVersionHandshake());
