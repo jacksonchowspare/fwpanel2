@@ -406,6 +406,57 @@ const rec = (name, ok, detail) => { results.push({ name, ok: !!ok, detail: detai
     await page.unroute("**/static/vendor/xterm.js");
   }
 
+  // ---- 慢网加载（文档还在传输）不能误报"页面资源加载异常"（v3.2.8 修复）----
+  // 旧看门狗只看"6 秒"这一个条件：首页 450KB，网速慢或浏览器把后台标签加载节流时，
+  // 6 秒还没解析到主脚本就弹出"页面资源加载异常"，面板其实完全健康（用户实测复现）。
+  {
+    const cSlow = await browser.newContext({ ignoreHTTPSErrors: true });
+    const pSlow = await cSlow.newPage();
+    const cdpSlow = await cSlow.newCDPSession(pSlow);
+    await cdpSlow.send("Network.enable");
+    // 25KB/s：首页约 7 秒才传完（>6 秒阈值），正是用户遇到的场景
+    await cdpSlow.send("Network.emulateNetworkConditions", {
+      offline: false, latency: 300, downloadThroughput: 25 * 1024, uploadThroughput: 25 * 1024,
+    });
+    await pSlow.goto(URL, { waitUntil: "domcontentloaded", timeout: 90000 }).catch(() => {});
+    await pSlow.waitForTimeout(2500);
+    const slow = await pSlow.evaluate(() => ({
+      login: !document.getElementById("login").classList.contains("hidden"),
+      box: !!document.getElementById("boot_watchdog"),
+      ready: document.readyState,
+    }));
+    rec("慢网加载登录页不误报【页面资源加载异常】(看门狗按状态判断而非死等6秒)",
+        slow.login && !slow.box, JSON.stringify(slow));
+    await cSlow.close();
+  }
+
+  // ---- 主脚本真的没执行（真异常）时，看门狗仍必须给用户出路 ----
+  {
+    const cBad = await browser.newContext({ ignoreHTTPSErrors: true });
+    const pBad = await cBad.newPage();
+    await pBad.route(u => u.pathname === "/" || u.pathname === "", async route => {
+      const r = await route.fetch();
+      let body = await r.text();
+      // 模拟"主脚本没跑起来"：去掉启动分支的两个界面入口（真异常：文档加载完却没有任何界面）
+      body = body.replace(/showLogin\(\);/g, ";").replace(/showMain\(\); await refreshAll\(\);/g, ";");
+      await route.fulfill({ response: r, body });
+    });
+    await pBad.goto(URL, { waitUntil: "load", timeout: 60000 }).catch(() => {});
+    await pBad.waitForTimeout(9500);
+    const stuck = await pBad.evaluate(() => {
+      const box = document.getElementById("boot_watchdog");
+      return {
+        box: !!box,
+        login: !document.getElementById("login").classList.contains("hidden"),
+        hasBtn: !!document.querySelector("#boot_watchdog button"),
+        text: box ? box.innerText.replace(/\s+/g, " ").slice(0, 40) : "",
+      };
+    });
+    rec("主脚本真没执行时看门狗仍给提示+重新加载按钮（兜底能力没丢）",
+        stuck.box && stuck.login && stuck.hasBtn, JSON.stringify(stuck.text));
+    await cBad.close();
+  }
+
   console.log("\n== 控制台错误 ==");
   const real = errors.filter(e => !/favicon|net::ERR_ABORTED/i.test(e));
   console.log(real.length ? real.slice(0, 10).join("\n") : "  无");

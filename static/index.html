@@ -626,35 +626,62 @@ window.__SERVER_THEME_EXPLICIT__ = "__THEME_EXPLICIT__";   // 0=面板还没存�
   apply();
   document.addEventListener("DOMContentLoaded", apply);   // <head> 执行时 body 还没生成
 })();
-/* 看门狗：若主脚本因任何资源卡住而没能执行，登录框也必须出现，
-   否则用户看到的是"只有主题背景 + 标签一直转圈"，完全不知道能做什么（用户实测） */
-setTimeout(function () {
-  try {
-    var lg = document.getElementById("login"), mn = document.getElementById("main");
-    if (!lg || !mn) return;
-    if (lg.classList.contains("hidden") && mn.classList.contains("hidden")) {
-      lg.classList.remove("hidden");
-      var fab = document.getElementById("btn_theme_fab");
-      if (fab) fab.style.display = "inline-block";
-      if (!document.getElementById("boot_watchdog")) {
-        var box = lg.querySelector(".panel") || lg;
-        var d = document.createElement("div");
-        d.id = "boot_watchdog";
-        d.style.cssText = "margin-top:12px;padding:10px 12px;border:1px dashed var(--border);border-radius:10px;"
-          + "font-size:12px;line-height:1.7;color:var(--muted);text-align:left";
-        d.innerHTML = "<b style=\"color:var(--danger)\">页面资源加载异常</b>（面板可能正在重启或升级，"
-          + "或网络中断）。请点下面按钮重新加载，不需要清理浏览器缓存。";
-        var btn = document.createElement("button");
-        btn.className = "btn";
-        btn.style.cssText = "width:100%;margin-top:8px";
-        btn.textContent = "重新加载";
-        btn.onclick = function () { location.replace(location.pathname + "?_r=" + Date.now()); };
-        d.appendChild(btn);
-        box.appendChild(d);
+/* 看门狗（v3.2.8 重做）：若主脚本因任何资源卡住而没能执行，登录框也必须出现，
+   否则用户看到的是"只有主题背景 + 标签一直转圈"，完全不知道能做什么（用户实测）。
+   ⚠ 旧版只看"页面开始后 6 秒"这一个条件：网速慢（我们的首页 450KB / 字体 1MB）或浏览器把
+   后台标签的加载节流时，6 秒还没解析到主脚本就误报"页面资源加载异常"——面板其实完全健康
+   （用户实测复现）。新版按状态判断：document 还在 loading 就顺延重试，
+   只有「文档已经加载完却仍然没有任何界面」才算真异常；界面迟到出现时自动撤掉提示框。 */
+(function () {
+  var T0 = Date.now(), MAX_WAIT = 25000, GIVE_UP = 180000, alarmed = false;
+  // 判据必须是"主脚本是否接管"：不能用"登录框可见"——showBox 自己会强制显示登录框，
+  // 用可见性判断会导致下一轮 tick 把刚弹出的提示框撤掉（真异常时提示一闪即没）。
+  function booted() {
+    if (window.__FW_UI_READY__) return true;   // 主脚本接管时置位（最可靠）
+    var mn = document.getElementById("main");
+    return !!mn && !mn.classList.contains("hidden");
+  }
+  function clearBox() {
+    var b = document.getElementById("boot_watchdog");
+    if (b && b.parentNode) b.parentNode.removeChild(b);
+  }
+  function showBox() {
+    if (document.getElementById("boot_watchdog")) return;   // 已提示过
+    var lg = document.getElementById("login");
+    if (!lg) return;
+    lg.classList.remove("hidden");
+    var fab = document.getElementById("btn_theme_fab");
+    if (fab) fab.style.display = "inline-block";
+    var box = lg.querySelector(".panel") || lg;
+    var d = document.createElement("div");
+    d.id = "boot_watchdog";
+    d.style.cssText = "margin-top:12px;padding:10px 12px;border:1px dashed var(--border);border-radius:10px;"
+      + "font-size:12px;line-height:1.7;color:var(--muted);text-align:left";
+    d.innerHTML = "<b style=\"color:var(--danger)\">页面加载受阻</b>（面板可能正在重启或升级，"
+      + "或网络较慢/中断）。请点下面按钮重新加载，不需要清理浏览器缓存。";
+    var btn = document.createElement("button");
+    btn.className = "btn";
+    btn.style.cssText = "width:100%;margin-top:8px";
+    btn.textContent = "重新加载";
+    btn.onclick = function () { location.replace(location.pathname + "?_r=" + Date.now()); };
+    d.appendChild(btn);
+    box.appendChild(d);
+  }
+  function tick() {
+    try {
+      if (booted()) { clearBox(); return; }              // 主脚本已接管（迟到也算）→ 撤掉提示
+      if (!alarmed &&
+          (document.readyState === "complete" || Date.now() - T0 >= MAX_WAIT)) {
+        // 文档还在加载（慢网 / 后台标签被节流）不算异常；加载完了却没有任何界面才是真异常
+        showBox();
+        alarmed = true;
       }
-    }
-  } catch (e) {}
-}, 6000);
+    } catch (e) {}
+    if (!booted() && Date.now() - T0 < GIVE_UP) setTimeout(tick, 3000);
+  }
+  setTimeout(tick, 6000);
+  window.addEventListener("load", function () { setTimeout(tick, 500); });
+})();
 </script>
 </head>
 <body>
@@ -1870,8 +1897,8 @@ async function bootLoad() {
   }
   netBanner("面板无响应，可能正在重启或升级。恢复后点右侧按钮即可（不需要清理浏览器缓存）");
 }
-function showLogin() { closeAllFloating(); fedUiReset(); $("login").classList.remove("hidden"); $("main").classList.add("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "inline-block"; }
-function showMain()  { $("login").classList.add("hidden"); $("main").classList.remove("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "none"; }
+function showLogin() { window.__FW_UI_READY__ = true; closeAllFloating(); fedUiReset(); $("login").classList.remove("hidden"); $("main").classList.add("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "inline-block"; }
+function showMain()  { window.__FW_UI_READY__ = true; $("login").classList.add("hidden"); $("main").classList.remove("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "none"; }
 async function login() {
   try {
     const d = await api("POST", "/api/login", { username: $("lg_user").value, password: $("lg_pass").value });
