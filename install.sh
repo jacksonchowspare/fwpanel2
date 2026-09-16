@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.27"
+readonly SCRIPT_VERSION="3.2.28"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -241,6 +241,10 @@ do_upgrade() {
     if [ -s "$tmpdir/github-logo.png" ]; then
         mkdir -p "$APP_DIR/static"
         atomic_put "$tmpdir/github-logo.png" "$APP_DIR/static/github-logo.png" 644
+    fi
+    if [ -s "$tmpdir/install.sh" ]; then
+        # 顺便用刚下载的这份刷新 fwp 脚本缓存（免联网；缓存是旧版就在这里纠正）
+        install_shortcut "$tmpdir/install.sh" >/dev/null 2>&1 || log_warn "刷新脚本缓存失败（fwp 可能仍是旧脚本）"
     fi
     if [ -s "$tmpdir/install.sh" ] && [ -f "$0" ]; then
         # 仅当 $0 是实体脚本文件时才就地更新它——管道模式（curl | sudo bash）下 $0 是 "bash"，
@@ -732,6 +736,39 @@ else
 fi
 fi
 
+# 显式请求更新脚本：先自己抓最新脚本放进缓存，再交给它跑 --update-script。
+# 这样即使本地缓存是"没有菜单、也没有 --update-script"的老脚本（用户实测踩到），这条命令也能用。
+case "${1:-}" in
+    --update-script|update-script)
+        echo "[fwp] 正在获取最新安装脚本..." >&2
+        tmp="$(mktemp)"
+        ok=0
+        if command -v curl >/dev/null 2>&1; then
+            if command -v timeout >/dev/null 2>&1; then timeout 25 curl -fsSL -o "$tmp" "$URL" && ok=1
+            else curl -fsSL -m 25 -o "$tmp" "$URL" && ok=1; fi
+        fi
+        if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
+            if command -v timeout >/dev/null 2>&1; then timeout 25 wget -q -O "$tmp" "$URL" && ok=1
+            else wget -q -T 25 -O "$tmp" "$URL" && ok=1; fi
+        fi
+        if [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null; then
+            mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
+            chmod 0755 "$tmp" 2>/dev/null || true
+            mv "$tmp" "$CACHE" || rm -f "$tmp"
+        else
+            rm -f "$tmp"
+            echo "[fwp] 下载脚本失败（网络不通或 GitHub 不可达），本地缓存未改动" >&2
+            exit 1
+        fi
+        exec bash "$CACHE" --update-script ;;
+esac
+
+# 本地缓存是"没有菜单"的老脚本时给明确提示（否则用户会困惑：为什么 fwp 没有菜单）
+if ! grep -q 'interactive_channel_menu' "$CACHE" 2>/dev/null; then
+    echo "[fwp] 提示：本地脚本是旧版（没有菜单，也不支持 --update-script）。" >&2
+    echo "       运行 sudo fwp --update-script 可更新脚本（会自动联网获取最新版）" >&2
+fi
+
 if [ "$(id -u)" -eq 0 ]; then
 exec bash "$CACHE" "$@"
 fi
@@ -747,15 +784,19 @@ sed -i -e "s|__CACHE__|$APP_DIR/$CACHED_SCRIPT_NAME|g" -e "s|__URL__|$RAW_INSTAL
 chmod 0755 "$WRAPPER_PATH" 2>/dev/null || true
 }
 
-install_shortcut() {
+install_shortcut() {   # $1（可选）= 已知可用的新版脚本地路径（如升级流程刚下载的那份）
     # 生成快捷命令 fwp：以后直接敲 fwp 就能进菜单，不用再翻一键安装命令
-    local cache="$APP_DIR/$CACHED_SCRIPT_NAME" tmp ok="0"
+    local cache="$APP_DIR/$CACHED_SCRIPT_NAME" tmp ok="0" known="${1:-}" cached_ver=""
 
     mkdir -p "$APP_DIR" /usr/local/bin 2>/dev/null || true
     tmp="$(mktemp)"
 
-    # ① 实体脚本方式运行（sudo bash install.sh）：直接把自己复制成缓存
-    if [ -f "$0" ] && [ "$0" != "$cache" ]; then
+    # ① 首选调用方给的本地副本（免联网；管道升级流程手上就有现成的新版）
+    if [ -n "$known" ] && [ -s "$known" ] && grep -q 'SCRIPT_VERSION=' "$known" 2>/dev/null && bash -n "$known" 2>/dev/null; then
+        cp "$known" "$tmp" 2>/dev/null && ok="1"
+    fi
+    # ② 实体脚本方式运行（sudo bash install.sh）：直接把自己复制成缓存
+    if [ "$ok" != "1" ] && [ -f "$0" ] && [ "$0" != "$cache" ]; then
         cp "$0" "$tmp" 2>/dev/null && ok="1"
     fi
     # ② 管道方式运行（curl | sudo bash）：$0 是 "bash"，只能按官方地址抓一份
@@ -787,6 +828,12 @@ install_shortcut() {
         log_info "快捷命令已就绪：以后直接输入 ${C_BOLD}fwp${C_RESET} 即可打开本菜单"
     else
         log_warn "快捷命令未完全就绪（可重跑一键安装命令重试）"
+    fi
+    # 缓存版本必须与本脚本一致：否则 fwp 打开的是旧脚本（旧版连菜单都没有，用户实测困惑过）
+    cached_ver="$(grep -m1 -o 'SCRIPT_VERSION="[0-9.]*"' "$cache" 2>/dev/null | tr -d '"' | cut -d= -f2)"
+    if [ -n "$cached_ver" ] && [ "$cached_ver" != "$SCRIPT_VERSION" ]; then
+        log_warn "脚本缓存版本不一致：缓存 v$cached_ver / 当前 v$SCRIPT_VERSION"
+        log_warn "→ 请运行 ${C_BOLD}fwp --update-script${C_RESET} 更新缓存（否则 fwp 打开的仍是旧脚本）"
     fi
 }
 

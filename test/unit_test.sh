@@ -746,6 +746,56 @@ env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="$(cat "$SCRIP
 grep -q 'readonly WRAPPER_PATH="/usr/local/bin/fwp"' /tmp/fwtest/app/install.sh \
     && ok "管道模式下按官方地址抓到完整脚本并入库" || bad "管道模式抓取入库异常"
 
+# ②b 旧缓存（没有菜单的老脚本，模拟用户机器上那份 v2.1.24）必须给出明确提示，不能让人猜
+cp /tmp/fwtest/app/install.sh /tmp/fwtest/app/keep_new.sh
+cat > /tmp/fwtest/app/install.sh <<'OLDEOF'
+#!/usr/bin/env bash
+readonly SCRIPT_VERSION="2.1.24"
+usage() { echo "旧脚本用法"; }
+case "${1:-}" in --help) usage; exit 0 ;; esac
+echo "old-script-ran: $*"
+OLDEOF
+chmod 755 /tmp/fwtest/app/install.sh
+out=$(env -i PATH=/tmp/fwtest/badbin:/usr/bin:/bin HOME=/tmp timeout 20 sh /tmp/fwtest/bin/fwp --help 2>&1)
+case "$out" in *"本地脚本是旧版"*) ok "旧版缓存会提示“本地脚本是旧版 + 用 --update-script 更新”" ;;
+                *) bad "旧版缓存没有任何提示: $(printf '%s' "$out" | head -3)" ;; esac
+
+# ②c fwp --update-script 自带联网能力：缓存是老脚本也能用（用户实测踩到的坑）
+cat > /tmp/fwtest/fakebin/curl <<'FEOF'
+#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+printf '%s' "$FAKE_BODY" > "$out"
+FEOF
+chmod +x /tmp/fwtest/fakebin/curl
+# 假的 bash 单独放一个目录：不能污染 /tmp/fwtest/fakebin，后面还有测试要用它家的 curl 桩
+mkdir -p /tmp/fwtest/fakebash
+cat > /tmp/fwtest/fakebash/bash <<'BEOF'
+#!/bin/bash
+# 冒充“最新脚本被调用”：把收到的参数写下来
+echo "SCRIPT_INVOKED_ARGS: $*"
+BEOF
+chmod +x /tmp/fwtest/fakebash/bash
+out=$(env -i PATH=/tmp/fwtest/fakebash:/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp \
+      FAKE_BODY="#!/usr/bin/env bash
+readonly SCRIPT_VERSION=\"9.9.9\"
+echo newest-script" \
+      timeout 20 sh /tmp/fwtest/bin/fwp --update-script 2>&1)
+grep -q 'SCRIPT_VERSION="9.9.9"' /tmp/fwtest/app/install.sh \
+    && ok "fwp --update-script 会把最新脚本写进缓存" || bad "缓存没被更新"
+case "$out" in *SCRIPT_INVOKED_ARGS:*--update-script*) ok "更新后交给新脚本执行 --update-script" ;;
+                *) bad "没有把 --update-script 交给新脚本: $(printf '%s' "$out" | head -3)" ;; esac
+cp /tmp/fwtest/app/keep_new.sh /tmp/fwtest/app/install.sh
+
+# ②d install_shortcut 优先用调用方给的本地副本（免联网；curl 是坏的，只能靠本地副本）
+cp "$SCRIPT" /tmp/fwtest/known_new.sh
+rm -f /tmp/fwtest/app/install.sh
+env -i PATH=/tmp/fwtest/badbin:/usr/bin:/bin HOME=/tmp \
+    bash -c 'source "$1"; install_shortcut /tmp/fwtest/known_new.sh' bash "$TMPF" >/tmp/fwtest/sc.out 2>&1 || true
+cmp -s /tmp/fwtest/app/install.sh /tmp/fwtest/known_new.sh \
+    && ok "install_shortcut 用给定的本地副本建缓存（不依赖网络）" || bad "没采用给定的本地副本"
+grep -q "快捷命令已就绪" /tmp/fwtest/sc.out && ok "采用本地副本后照常报告就绪" || bad "本地副本路径没走到就绪分支"
+
 # ③ 包装器实跑：联网失败时回退本地缓存并正常进入脚本（--help 只打印用法，不会安装）
 out=$(env -i PATH=/tmp/fwtest/badbin:/usr/bin:/bin HOME=/tmp sh /tmp/fwtest/bin/fwp --help 2>&1)
 case "$out" in *用法*|*Usage*) ok "联网失败仍能用本地缓存打开脚本（fwp --help 正常）" ;; *) bad "包装器回退失败: $out" ;; esac
