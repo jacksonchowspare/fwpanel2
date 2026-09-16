@@ -423,6 +423,119 @@ ls /tmp/fwupg-cur/panel.py.bak.* >/dev/null 2>&1 && echo "  ✓ 升级前已备�
 ' )
 rm -rf /tmp/fwupg-cur /tmp/fwupg-tmp /tmp/fwupg-cwd /tmp/install_funcs_ug.sh
 
+echo "== 首次安装：自定义凭据询问（yes 自定义 / no 随机） =="
+# FW_MENU=1 让 prompt_read 从 stdin 读；真实场景由 menu_can_read 决定 /dev/tty 或 stdin
+rm -rf /tmp/fakebin_cred && mkdir -p /tmp/fakebin_cred
+ln -sf "$(command -v bash)" /tmp/fakebin_cred/bash
+cred_run() {  # $1=输入（多行）
+    printf '%s\n' "$1" | env -i PATH=/tmp/fakebin_cred FW_MENU=1 HOME=/tmp bash -c '
+        source '"$TMPF"'
+        ACTION=install; YES=0; PANEL_USER=""; PANEL_PASS=""; MENU_SRC=""
+        ask_custom_credentials >/dev/null 2>&1
+        printf "USER=[%s] PASS=[%s]" "$PANEL_USER" "$PANEL_PASS"'
+}
+cred_rc() {   # 同上，但只返回退出码（错误路径用）
+    printf '%s\n' "$1" | env -i PATH=/tmp/fakebin_cred FW_MENU=1 HOME=/tmp bash -c '
+        source '"$TMPF"'
+        ACTION=install; YES=0; PANEL_USER=""; PANEL_PASS=""; MENU_SRC=""
+        ask_custom_credentials' >/dev/null 2>&1
+}
+[ "$(cred_run '')" = "USER=[] PASS=[]" ] && ok "直接回车 → 不自行设定（走随机）" || bad "回车应答后仍写了凭据"
+[ "$(cred_run 'no')" = "USER=[] PASS=[]" ] && ok "选 no → 随机生成" || bad "选 no 竟然自行设定"
+[ "$(cred_run 'yes
+admin
+admin
+MyPass1234
+MyPass1234')" = "USER=[admin] PASS=[MyPass1234]" ] && ok "选 yes → 用户名+密码各两次确认后生效" || bad "yes 路径凭据未生效"
+[ "$(cred_run 'y
+adm_1
+adm_1
+longpassword
+longpassword')" = "USER=[adm_1] PASS=[longpassword]" ] && ok "y 也认；下划线用户名可用" || bad "y 路径异常"
+[ "$(cred_run 'yes
+admin
+adminx
+admin
+admin
+pw12345678
+pw12345678')" = "USER=[admin] PASS=[pw12345678]" ] && ok "用户名两次不一致 → 重问后可成功" || bad "用户名不一致未重问"
+[ "$(cred_run 'yes
+a
+admin
+admin
+short
+pw12345678
+pw12345678')" = "USER=[admin] PASS=[pw12345678]" ] && ok "用户名过短 → 重问；密码过短也重问" || bad "非法值未重问"
+for setup in 'YES=1' 'PANEL_USER=envuser' 'PANEL_PASS=EnvPass123' 'ACTION=check'; do
+    got=$(printf 'yes\nadmin\nadmin\nMyPass1234\nMyPass1234\n' | env -i PATH=/tmp/fakebin_cred FW_MENU=1 HOME=/tmp FW_SETUP="$setup" bash -c '
+        source '"$TMPF"'
+        ACTION=install; YES=0; PANEL_USER=""; PANEL_PASS=""; MENU_SRC=""
+        eval "$FW_SETUP"
+        ask_custom_credentials >/dev/null 2>&1
+        printf "USER=[%s] PASS=[%s]" "$PANEL_USER" "$PANEL_PASS"' 2>/dev/null)
+    case "$setup" in
+        YES=1)                 [ "$got" = "USER=[] PASS=[]" ] && ok "-y 时跳过凭据询问" || bad "-y 时仍在问: $got" ;;
+        PANEL_USER=envuser)    [ "$got" = "USER=[envuser] PASS=[]" ] && ok "--user 已给时不再询问" || bad "--user 时异常: $got" ;;
+        PANEL_PASS=EnvPass123) [ "$got" = "USER=[] PASS=[EnvPass123]" ] && ok "--password 已给时不再询问" || bad "--password 时异常: $got" ;;
+        ACTION=check)          [ "$got" = "USER=[] PASS=[]" ] && ok "非安装动作（体检等）不询问" || bad "非安装动作仍在问: $got" ;;
+    esac
+done
+cred_rc 'yes
+a
+b
+c
+d
+e
+f' && bad "用户名错 3 次竟然成功退出" || ok "用户名错 3 次 → 报错退出"
+
+# 走 /dev/tty + 密码不回显（script 造 pty；故意不设 FW_MENU，验证真实交互路径）
+# ⚠ 密码必须「隔一会儿再送」：把整段输入一次性塞进 pty 时，输入在 read -s 生效前就已被终端回显，
+#   那是测试方法的假象，不是代码问题
+if command -v script >/dev/null 2>&1; then
+    probe="$(mktemp)"
+    { echo "source $TMPF"
+      echo 'ACTION=install; YES=0; PANEL_USER=""; PANEL_PASS=""; MENU_SRC=""'
+      echo 'ask_custom_credentials >/dev/null 2>&1'
+      echo 'echo "USER=[$PANEL_USER] PASS=[$PANEL_PASS] MENU_SRC=$MENU_SRC"'; } > "$probe"
+    out=$({ printf 'yes\nadmin\nadmin\n'; sleep 1.5; printf 'Secret12345\n'; sleep 1.5; printf 'Secret12345\n'; } \
+        | env -i PATH=/tmp/fakebin_menu:/usr/bin HOME=/root TERM=dumb script -qec "cat $probe | bash" /dev/null 2>&1 || true)
+    case "$out" in
+        *"MENU_SRC=tty"*) case "$out" in
+                              *"PASS=[Secret12345]"*) ok "pty 真实交互：走 /dev/tty 且凭据生效" ;;
+                              *) bad "pty 凭据未生效: $out" ;;
+                          esac ;;
+        *) bad "pty 场景未走 /dev/tty: $out" ;;
+    esac
+    n=$(printf '%s' "$out" | grep -o "Secret12345" | wc -l)
+    [ "$n" -eq 1 ] && ok "pty 真实交互：密码输入不回显（全文只出现 1 次=脚本自身回显）" \
+        || bad "密码被回显（出现 $n 次，应为 1）"
+    rm -f "$probe"
+fi
+
+rm -rf /tmp/fakebin_cred
+
+echo "== 安装摘要文案：管道模式不得印出「sudo bash bash …」 =="
+sum_pipe=$(bash -c 'source '"$TMPF"'
+    PANEL_BIND=0.0.0.0; PANEL_PORT=17890; PANEL_USER=admin; PANEL_PASS=GzPass2026
+    print_summary' 2>&1 || true)
+case "$sum_pipe" in
+    *"bash bash"*) bad "管道模式摘要印出了不可用的命令（bash bash）" ;;
+    *"菜单选 5) 改密码"*) ok "管道模式摘要给出的是可照做的指引（菜单选 5 / 重跑一键命令）" ;;
+    *) bad "管道模式摘要缺少改密码指引: $(printf '%s' "$sum_pipe" | tail -6)" ;;
+esac
+# 实体脚本模式（$0 是文件）应引用脚本自身路径
+sum_file=$(cat > /tmp/fw_sum_probe.sh <<EOF
+source $TMPF
+PANEL_BIND=0.0.0.0; PANEL_PORT=17890; PANEL_USER=admin; PANEL_PASS=GzPass2026
+print_summary
+EOF
+bash /tmp/fw_sum_probe.sh 2>&1 || true)
+case "$sum_file" in
+    *"/tmp/fw_sum_probe.sh --change-password"*) ok "实体脚本模式摘要引用 \$0 路径（可照抄执行）" ;;
+    *) bad "实体脚本模式摘要异常: $(printf '%s' "$sum_file" | tail -6)" ;;
+esac
+rm -f /tmp/fw_sum_probe.sh
+
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
 rm -f "$TMPF" /tmp/install_funcs_fw.sh

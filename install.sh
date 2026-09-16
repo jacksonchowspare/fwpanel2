@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.14"
+readonly SCRIPT_VERSION="3.2.15"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -290,7 +290,8 @@ $SCRIPT_NAME（安装脚本 v$SCRIPT_VERSION）—— 简易VPS管理面板2.0�
 
 用法:
   sudo bash $0                           交互式菜单：安装正式版/测试版/指定版本、环境体检、改密码、卸载
-  sudo bash $0 -y                        无人值守：跳过菜单，直接装/升【最新正式版】
+  sudo bash $0 -y                        无人值守：跳过菜单与凭据询问，直接装/升【最新正式版】
+                                          （首次安装默认询问是否自定义用户名/密码，回车=随机）
   sudo bash $0 --beta                    安装/升级【最新测试版】（尝鲜通道）
   sudo bash $0 -p 17890                  指定面板端口
   sudo bash $0 --bind 127.0.0.1          仅本机访问（默认 0.0.0.0 开放远程）
@@ -564,6 +565,82 @@ print_banner() {
     echo "  安装脚本 : v$SCRIPT_VERSION（本脚本自身版本，非面板版本）"
     echo "  目标版本 : 面板 $ver（$label）"
     echo "=================================================="
+}
+
+prompt_read() {   # $1=变量名 $2=提示语 $3=1 表示不回显（密码）
+    local __v=""
+    [ -n "$MENU_SRC" ] || menu_can_read || return 1
+    printf '%s' "$2"
+    if [ "${3:-}" = "1" ]; then
+        case "$MENU_SRC" in
+            tty)   IFS= read -rs __v < /dev/tty || true ;;
+            stdin) IFS= read -rs __v || true ;;
+        esac
+        printf '\n'
+    else
+        case "$MENU_SRC" in
+            tty)   IFS= read -r __v < /dev/tty || true ;;
+            stdin) IFS= read -r __v || true ;;
+        esac
+    fi
+    printf -v "$1" '%s' "$__v"
+    return 0
+}
+
+# ------------------------- 首次安装：可自定义登录凭据 -------------------------
+# 只在这四个条件同时成立时询问：首次安装（check_existing 判定为未安装）+ 没给 --user/--password
+# + 有可读终端 + 没加 -y。非交互场景（systemd/cron/CI/管道无终端/-y）一律静默随机生成，绝不阻塞。
+ask_custom_credentials() {
+    [ "$ACTION" = "install" ] || return 0
+    [ "$YES" = "1" ] && return 0
+    if [ -n "$PANEL_USER" ] || [ -n "$PANEL_PASS" ]; then
+        return 0                     # 命令行已指定（--user/--password），尊重参数
+    fi
+    menu_can_read || return 0        # 无终端：直接随机
+
+    local ans="" u1="" u2="" p1="" p2="" tries=0
+    echo ""
+    echo "  首次安装：面板登录凭据"
+    echo "    默认随机生成（安装结束时打印一次，不写入任何文件）"
+    prompt_read ans "  是否自行设定用户名和密码？(yes/no，直接回车 = no 随机生成): " || return 0
+    case "$ans" in
+        y|Y|yes|YES|Yes) ;;
+        *) log_info "已选择：随机生成用户名和密码"; return 0 ;;
+    esac
+
+    while :; do
+        prompt_read u1 "  请输入用户名（3-32 位字母/数字/下划线）: " || return 0
+        if [[ "$u1" =~ ^[A-Za-z0-9_]{3,32}$ ]]; then
+            prompt_read u2 "  请再次输入用户名: " || return 0
+            if [ "$u1" = "$u2" ]; then
+                PANEL_USER="$u1"
+                break
+            fi
+            log_warn "两次输入的用户名不一致，请重新输入"
+        else
+            log_warn "用户名需为 3-32 位字母/数字/下划线，请重新输入"
+        fi
+        tries=$((tries + 1))
+        [ "$tries" -ge 3 ] && error "用户名输入有误（已重试 3 次）；可改用 --user 参数，或重跑后选随机凭据"
+    done
+
+    tries=0
+    while :; do
+        prompt_read p1 "  请输入密码（至少 8 位）: " 1 || return 0
+        if [ "${#p1}" -ge 8 ]; then
+            prompt_read p2 "  请再次输入密码: " 1 || return 0
+            if [ "$p1" = "$p2" ]; then
+                PANEL_PASS="$p1"
+                break
+            fi
+            log_warn "两次输入的密码不一致，请重新输入"
+        else
+            log_warn "密码至少 8 位，请重新输入"
+        fi
+        tries=$((tries + 1))
+        [ "$tries" -ge 3 ] && error "密码输入有误（已重试 3 次）；可改用 --password 参数"
+    done
+    log_info "已使用你设定的凭据（用户名: $PANEL_USER，密码不回显、安装结束会再打印一次）"
 }
 
 installed_panel_version() {
@@ -908,8 +985,14 @@ print_summary() {
     echo "  登录密码 : ${PANEL_PASS}"
     echo "------------------------------------------------------------------"
     echo "  ${C_RED}⚠ 凭据仅显示这一次，不会写入任何文件，请立即记下！${C_RESET}"
-    echo "  忘记密码: sudo bash $0 --change-password"
-    echo "  升级正式版: sudo bash $0    |   尝鲜测试版: sudo bash $0 --beta"
+    if [ -f "$0" ]; then
+        echo "  忘记密码: sudo bash $0 --change-password"
+        echo "  升级 / 换通道: sudo bash $0（加 --beta 装测试版，--version vX.Y.Z 指定版本）"
+    else
+        # 管道模式（curl | sudo bash）下 $0 是 "bash"，直接引用会印出 "sudo bash bash ..." 这种不可用的命令
+        echo "  忘记密码: 重跑一键安装命令 → 菜单选 5) 改密码"
+        echo "  升级 / 换通道: 重跑一键安装命令 → 菜单选 1 / 2 / 3（或加 --beta / --version vX.Y.Z）"
+    fi
     echo "  面板内可修改密码；SSH(22) 始终放行防锁死"
     echo "  查看日志: journalctl -u fwpanel -f"
     echo "=================================================================="
@@ -920,6 +1003,7 @@ do_install() {
     resolve_src_tag          # 先解析目标版本，横幅才能显示目标面板版本
     print_banner
     check_os; check_root; check_arch; check_tools; check_existing
+    ask_custom_credentials   # 首次安装才问（升级不走这里）；无终端/-y 静默随机
     resolve_params
     install_deps
     deploy_files
