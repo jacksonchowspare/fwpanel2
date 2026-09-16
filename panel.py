@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.32"
+CURRENT_VERSION = "3.2.33"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 # 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
 THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
@@ -5570,6 +5570,38 @@ def dns_restore():
 
 
 # ---------- 时间与时区 ----------
+# 常用时区排在最前：下拉一打开就是它们，不用在 600 个里翻
+COMMON_TIMEZONES = [
+    "Asia/Shanghai", "Asia/Hong_Kong", "Asia/Taipei", "Asia/Singapore", "Asia/Tokyo",
+    "Asia/Seoul", "Asia/Bangkok", "Asia/Kolkata", "Asia/Dubai", "UTC",
+    "Europe/London", "Europe/Paris", "Europe/Berlin", "Europe/Moscow",
+    "America/New_York", "America/Chicago", "America/Los_Angeles", "Australia/Sydney",
+]
+
+
+def timezone_list():
+    """可用时区（本机 zone.tab 为准，取不到时退回内置常用的那几个）。"""
+    zones = []
+    try:
+        with open("/usr/share/zoneinfo/zone.tab") as f:
+            for line in f:
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split("\t")
+                if len(parts) >= 3:
+                    tz = parts[2].strip()
+                    if tz and "/" in tz:
+                        zones.append(tz)
+    except OSError:
+        pass
+    seen, out = set(), []
+    for z in COMMON_TIMEZONES + zones:
+        if z not in seen:
+            seen.add(z)
+            out.append(z)
+    return out
+
+
 def time_status():
     st = {"timezone": "", "time": "", "ntp": None, "ntp_synced": None, "rtc": ""}
     try:
@@ -6461,6 +6493,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_theme()
         elif path == "/api/system":
             self._api_system()
+        elif path == "/api/system/timezones":
+            self._send(200, {"zones": timezone_list(),
+                             "current": time_status().get("timezone", "")})
         elif path == "/api/system/dns/test":
             self._api_system_dns_test()
         elif path == "/api/apps":

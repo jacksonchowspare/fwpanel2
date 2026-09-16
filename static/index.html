@@ -1415,11 +1415,13 @@ window.addEventListener("error", function (ev) {
           <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg> 时间与主机名</h2>
           <div id="sys_time" style="font-size:13px;margin-bottom:10px">检测中...</div>
           <div class="form-row">
-            <input id="sys_tz" placeholder="时区（如 Asia/Shanghai）" style="width:190px">
+            <input id="sys_tz" list="sys_tz_list" autocomplete="off" placeholder="时区（输入关键字筛选，如 shanghai）" style="width:230px">
+            <datalist id="sys_tz_list"></datalist>
             <button class="btn ghost" onclick="sysTimeSave()">设置时区</button>
-            <button class="btn ghost" onclick="sysNtpToggle(true)">开启 NTP</button>
-            <button class="btn ghost" onclick="sysNtpToggle(false)">关闭</button>
+            <button class="btn ghost" id="btn_ntp_on" onclick="sysNtpToggle(true)">开启 NTP</button>
+            <button class="btn ghost" id="btn_ntp_off" onclick="sysNtpToggle(false)">关闭 NTP</button>
           </div>
+          <div style="color:var(--muted);font-size:12px;margin-top:-2px">时区可直接点输入框从下拉里选（常用时区排在最前），也可以输入关键字筛选，如 <code style="font-family:'0xProto',ui-monospace,monospace">shanghai</code>。</div>
           <div style="border-top:1px dashed var(--border);margin:12px 0 10px"></div>
           <div id="sys_host" style="font-size:13px;margin-bottom:10px">检测中...</div>
           <div class="form-row">
@@ -1438,9 +1440,9 @@ window.addEventListener("error", function (ev) {
           <div style="color:var(--muted);font-size:12px;margin-bottom:10px">BBR 为 Google 的 TCP 拥塞控制算法，可提升网络传输速度（需 Linux 4.9+ 内核）</div>
           <div id="sys_ipv6" style="font-size:13px;margin-bottom:8px">检测中...</div>
           <div class="form-row" style="margin-bottom:8px">
-            <button class="btn ghost" onclick="sysIpv6('v4_first')">IPv4 优先</button>
-            <button class="btn ghost" onclick="sysIpv6('disable')">禁用 IPv6</button>
-            <button class="btn ghost" onclick="sysIpv6('enable')">开启 IPv6</button>
+            <button class="btn ghost" id="sys_v6_v4first" onclick="sysIpv6('v4_first')">IPv4 优先</button>
+            <button class="btn ghost" id="sys_v6_disable" onclick="sysIpv6('disable')">禁用 IPv6</button>
+            <button class="btn ghost" id="sys_v6_enable" onclick="sysIpv6('enable')">开启 IPv6</button>
           </div>
           <div style="color:var(--muted);font-size:12px">IPv4 优先 = IPv6 保持开启但优先走 IPv4；禁用/开启立即生效（sysctl + gai.conf）</div>
         </div>
@@ -2470,7 +2472,6 @@ async function showCertPathsSolo(domain) {
 }
 
 /* ---------- IPv6 设置 ---------- */
-const IPV6_LABEL = { v4_first: "🌐 IPv4 优先", disabled: "🚫 已禁用", enabled: "✅ 已开启（默认）" };
 async function loadIpv6() {
   // v3.2.0：IPv6 控件已搬到「系统」页（#sys_ipv6），这里只在系统页在场时刷新它。
   // 旧写法直接写 #ipv6_status，元素搬走后会抛 null 异常（真浏览器回归抓到）
@@ -2479,8 +2480,9 @@ async function loadIpv6() {
   try {
     const d = await api("GET", "/api/ipv6");
     if (sysData.ipv6 !== undefined) sysData.ipv6 = d;
-    el.innerHTML = '<div style="display:flex;gap:8px"><span style="color:var(--muted);min-width:88px">IPv6</span><span>'
-      + esc(IPV6_LABEL[d.status] || d.status || "-") + "</span></div>";
+    // 渲染统一走 renderIpv6Ui()：以前这里自己拼文案（还另有一套映射表），
+    // 与系统页那套是两份，改一处另一处不跟着变——就是 BBR 按钮同类的坑
+    renderIpv6Ui((d && (d.status || d.mode)) || "");
   } catch (e) { el.textContent = "状态获取失败"; }
 }
 /* ---------- BBR ---------- */
@@ -3412,7 +3414,26 @@ function renderSysDnsTest(list) {
     + esc(t.domain) + " " + esc(t.ok ? (t.addrs || []).join("/") + "　" + t.ms + "ms" : (t.error || "")) + "</span>").join("　");
 }
 
+/* 时区列表（v3.2.33）：后端读本机 /usr/share/zoneinfo/zone.tab，列出来的都是真能用的。
+   以前只有个纯输入框，得手打 Asia/Shanghai 这种名字，用户反馈太麻烦。 */
+let tzList = [], tzLoading = false;
+async function loadTimezones() {
+  if (tzList.length || tzLoading) return tzList;
+  tzLoading = true;
+  try {
+    const d = await api("GET", "/api/system/timezones");
+    tzList = (d && d.zones) || [];
+    const dl = $("sys_tz_list");
+    if (dl && tzList.length) dl.innerHTML = tzList.map(z => '<option value="' + esc(z) + '"></option>').join("");
+  } catch (e) {
+    tzList = [];            // 拉不到列表不影响手输，只是没有下拉可选
+  }
+  tzLoading = false;
+  return tzList;
+}
+
 function renderSysTime(d) {
+  loadTimezones();          // 首屏把下拉填好（只拉一次）
   const t = d.time || {};
   $("sys_time").innerHTML = '<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">当前</span><span>'
     + esc((t.timezone || "-") + "　" + (t.time || "")) + "</span></div>"
@@ -3420,12 +3441,43 @@ function renderSysTime(d) {
     + (t.ntp === null || t.ntp === undefined ? "-" : (t.ntp ? "已开启" : "已关闭"))
     + (t.ntp_synced ? "（已同步）" : "") + "</span></div>";
   if ($("sys_tz") && !$("sys_tz").value) $("sys_tz").value = t.timezone || "";
+  // NTP：把和当前状态相反的那个按钮收起来（和防火墙开关同一套路）
+  const ntpOn = $("btn_ntp_on"), ntpOff = $("btn_ntp_off");
+  if (ntpOn && ntpOff) {
+    // 状态未知（null）时必须两个都恢复显示：否则会沿用上一次的隐藏结果，
+    // 只剩「开启 NTP」而 NTP 其实是开着的，用户就没路可走了
+    const unknown = (t.ntp === null || t.ntp === undefined);
+    ntpOn.style.display = (unknown || !t.ntp) ? "inline-block" : "none";
+    ntpOff.style.display = (unknown || t.ntp) ? "inline-block" : "none";
+  }
 }
 
 function renderSysHost(d) {
   $("sys_host").innerHTML = '<div style="display:flex;gap:8px"><span style="color:var(--muted);min-width:88px">当前主机名</span><span>'
     + esc(d.hostname || "-") + "</span></div>";
   if ($("sys_hostname") && !$("sys_hostname").value) $("sys_hostname").value = d.hostname || "";
+}
+
+/* IPv6 状态渲染的唯一出口（v3.2.33）：状态文字 + 三个按钮的可用性一起管。
+   当前已是某种状态时，对应按钮标「（当前）」并禁用——避免用户点了没反应还以为是坏的。 */
+function renderIpv6Ui(st) {
+  const norm = ({ disable: "disabled", enable: "enabled" })[st] || st;
+  const modeTxt = norm === "disabled" ? "🚫 已禁用"
+    : (norm === "v4_first" ? "🌐 IPv4 优先（IPv6 仍开启）"
+    : (norm === "enabled" ? "✅ 已开启（默认）" : "未知（点「刷新」重试）"));
+  const el = $("sys_ipv6");
+  if (el) {
+    el.innerHTML = '<div style="display:flex;gap:8px"><span style="color:var(--muted);min-width:88px">IPv6</span><span>'
+      + esc(modeTxt) + "</span></div>";
+  }
+  const map = { sys_v6_enable: "enabled", sys_v6_disable: "disabled", sys_v6_v4first: "v4_first" };
+  Object.keys(map).forEach(function (id) {
+    const b = $(id);
+    if (!b) return;
+    const cur = norm === map[id];
+    b.disabled = cur;
+    b.textContent = b.textContent.replace(/（当前）$/, "") + (cur ? "（当前）" : "");
+  });
 }
 
 /* BBR 状态渲染的唯一出口（v3.2.32）：
@@ -3457,11 +3509,7 @@ function renderSysNet(d) {
   renderBbrUi();
   // /api/system 的 ipv6 字段可能是字符串（旧接口语义）也可能是对象，两种都要认
   const v6st = (typeof v6 === "string") ? v6 : (v6.status || v6.mode || "");
-  const modeTxt = v6st === "disabled" || v6st === "disable" ? "🚫 已禁用"
-    : (v6st === "v4_first" ? "🌐 IPv4 优先（IPv6 仍开启）"
-    : (v6st === "enabled" || v6st === "enable" ? "✅ 已开启（默认）" : "未知（点「刷新」重试）"));
-  $("sys_ipv6").innerHTML = '<div style="display:flex;gap:8px"><span style="color:var(--muted);min-width:88px">IPv6</span><span>'
-    + esc(modeTxt) + (v6.gai_conf || v6.sysctl ? "" : "") + "</span></div>";
+  renderIpv6Ui(v6st);
   if ($("sys_panel_port")) {
     $("sys_panel_port").innerHTML = '<div style="display:flex;gap:8px"><span style="color:var(--muted);min-width:88px">当前端口</span><span>'
       + esc(String(d.panel_port || "-")) + "</span></div>";
@@ -3540,9 +3588,14 @@ function sysDnsRestore() {
   sysRun("/api/system/dns", { action: "restore" });
 }
 
-function sysTimeSave() {
+async function sysTimeSave() {
   const tz = ($("sys_tz").value || "").trim();
-  if (!tz) { toast("请填时区，如 Asia/Shanghai", "err"); return; }
+  if (!tz) { toast("请选择或输入时区，如 Asia/Shanghai", "err"); return; }
+  const list = await loadTimezones();
+  if (list.length && list.indexOf(tz) < 0) {
+    toast("没有这个时区：" + tz + "（可点输入框从下拉里选）", "err");
+    return;
+  }
   sysRun("/api/system/time", { tz });
 }
 

@@ -6555,5 +6555,74 @@ class TestFrontendBbrUi(unittest.TestCase):
         self.assertTrue(os.path.isfile(os.path.join(self.root, "test", "frontend_bbr_ui_test.js")))
 
 
+class TestTimezonesAndSysControls(unittest.TestCase):
+    """v3.2.33：时区改成可选（下拉），系统页控件全部状态驱动。"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(cls.root, "static", "index.html"), encoding="utf-8") as f:
+            cls.html = f.read()
+        with open(os.path.join(cls.root, "panel.py"), encoding="utf-8") as f:
+            cls.panel = f.read()
+
+    def test_timezone_list_nonempty(self):
+        z = panel.timezone_list()
+        self.assertGreater(len(z), 10, "时区列表不该这么少")
+        self.assertIn("Asia/Shanghai", z)
+
+    def test_common_timezones_first(self):
+        z = panel.timezone_list()
+        self.assertEqual(z[0], panel.COMMON_TIMEZONES[0], "常用时区必须排最前（下拉一打开就能选）")
+        self.assertEqual(len(z), len(set(z)), "列表不得有重复项")
+        # 常用块必须完整体现在最前面
+        self.assertEqual(z[:len(panel.COMMON_TIMEZONES)], panel.COMMON_TIMEZONES)
+
+    def test_timezones_endpoint_registered(self):
+        self.assertIn('"/api/system/timezones"', self.panel)
+        self.assertIn("timezone_list()", self.panel)
+
+    def test_fallback_when_zoneinfo_missing(self):
+        # zone.tab 不存在时也要给出可用列表（不能返回空）
+        orig = panel.timezone_list
+        with unittest.mock.patch("builtins.open", side_effect=OSError("no zone.tab")):
+            z = panel.timezone_list()
+        self.assertEqual(z, panel.COMMON_TIMEZONES)
+
+    def test_tz_input_supports_dropdown(self):
+        self.assertIn('id="sys_tz"', self.html)
+        self.assertIn('list="sys_tz_list"', self.html)
+        self.assertIn('id="sys_tz_list"', self.html)
+        self.assertIn("<datalist", self.html)
+
+    def test_tz_save_validates_locally(self):
+        self.assertIn("loadTimezones", self.html)
+        self.assertIn("list.indexOf(tz) < 0", self.html)
+        # 拉不到列表时不得拦截（否则用户彻底改不了时区）
+        idx = self.html.index("async function sysTimeSave(")
+        seg = self.html[idx:idx + 700]
+        self.assertIn("list.length &&", seg)
+
+    def test_ipv6_buttons_state_driven(self):
+        for bid in ("sys_v6_enable", "sys_v6_disable", "sys_v6_v4first"):
+            self.assertIn('id="%s"' % bid, self.html)
+        self.assertIn("function renderIpv6Ui(", self.html)
+        # #sys_ipv6 只在两处取用：renderIpv6Ui 渲染 + loadIpv6 的存在性守卫（后者已改为调函数）
+        self.assertEqual(self.html.count('$("sys_ipv6")'), 2)
+        self.assertNotIn("IPV6_LABEL", self.html, "旧的两份文案映射必须彻底删掉")
+
+    def test_ntp_buttons_have_ids_and_reset(self):
+        self.assertIn('id="btn_ntp_on"', self.html)
+        self.assertIn('id="btn_ntp_off"', self.html)
+        idx = self.html.index("function renderSysTime(")
+        seg = self.html[idx:idx + 1400]
+        self.assertIn("unknown", seg, "状态未知分支必须存在（否则会沿用上次隐藏结果）")
+        self.assertIn('ntpOn.style.display', seg)
+
+    def test_frontend_tests_present(self):
+        for f in ("frontend_bbr_ui_test.js", "frontend_sys_controls_test.js"):
+            self.assertTrue(os.path.isfile(os.path.join(self.root, "test", f)), f)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
