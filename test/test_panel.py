@@ -6192,5 +6192,87 @@ class TestResetAccount(unittest.TestCase):
         self.assertEqual(self._disk()["password_hash"], before, "中断后不应改动密码")
 
 
+class TestFrontendPanelPortRedirect(unittest.TestCase):
+    """v3.2.25：改完面板端口后前端必须自动跳到新端口。
+
+    实测反馈：系统页的「修改面板端口」按钮改完不跳转，用户得自己改地址栏；
+    带跳转逻辑的 setPanelPort() 反而没有任何按钮绑定（死代码）。
+    两个入口现在统一走 afterPanelPortChange()。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "static", "index.html"), encoding="utf-8") as f:
+            cls.html = f.read()
+
+    def test_shared_helper_exists(self):
+        self.assertIn("function afterPanelPortChange(", self.html,
+                      "缺少统一的改端口后跳转助手")
+
+    def test_both_entrypoints_call_helper(self):
+        self.assertIn("afterPanelPortChange(p)", self.html,
+                      "系统页「修改面板端口」按钮没有走跳转逻辑")
+        self.assertIn("afterPanelPortChange(port)", self.html,
+                      "面板设置弹窗没有走跳转逻辑")
+
+    def test_system_button_no_longer_uses_plain_sysrun(self):
+        # sysRun 只弹提示、末尾 loadSystem()，改完端口不会跳
+        self.assertNotIn('sysRun("/api/system/panel-port"', self.html)
+
+    def test_waits_for_new_port_before_jumping(self):
+        # 服务重启有窗口期，必须轮询探测（no-cors fetch）而不是定时硬跳
+        self.assertIn("no-cors", self.html)
+        self.assertIn("LIMIT = 30000", self.html, "等待应有上限，不能让用户卡死")
+        self.assertNotIn("setTimeout(() => { location.href = target; }, 3000);", self.html,
+                         "旧的固定 3 秒死跳会导致浏览器「无法连接」")
+
+    def test_via_proxy_reload_not_port_jump(self):
+        # 反代域名访问（无端口/80/443）应当原地刷新，不应跳到带端口的地址
+        self.assertIn('viaProxy', self.html)
+        self.assertIn('curPort === "" || curPort === "80" || curPort === "443"', self.html)
+
+    def test_jump_logic_behaves_in_node(self):
+        """用 node 在假浏览器环境里真跑一遍跳转逻辑（直连/超时/反代/端口未变 4 个场景）"""
+        import glob as _glob
+        import shutil as _shutil
+        import subprocess as _subprocess
+        node = _shutil.which("node") or next(
+            iter(_glob.glob(os.path.expanduser("~/.local/bin/node"))
+                 + _glob.glob(os.path.expanduser("~/.hermes/node/bin/node"))), None)
+        if not node:
+            self.skipTest("环境里没有 node，跳过跳转逻辑测试")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        script = os.path.join(root, "test", "frontend_port_redirect_test.js")
+        r = _subprocess.run([node, script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(r.returncode, 0, "跳转逻辑测试失败：\n" + r.stdout + r.stderr)
+        self.assertNotIn("FAIL", r.stdout, r.stdout)
+
+    def test_inline_js_syntax(self):
+        """内联 JS 必须能过 node --check（改动 index.html 后最容易出的问题）"""
+        import glob as _glob
+        import re as _re
+        import shutil as _shutil
+        import tempfile as _tempfile
+        import subprocess as _subprocess
+        node = _shutil.which("node") or next(
+            iter(_glob.glob(os.path.expanduser("~/.local/bin/node"))
+                 + _glob.glob(os.path.expanduser("~/.hermes/node/bin/node"))), None)
+        if not node:
+            self.skipTest("环境里没有 node，跳过 JS 语法检查")
+        blocks = _re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", self.html, _re.S)
+        self.assertTrue(blocks, "没找到内联 script 块")
+        for i, b in enumerate(blocks):
+            with _tempfile.NamedTemporaryFile("w", suffix=".js", delete=False) as f:
+                f.write(b)
+                path = f.name
+            try:
+                r = _subprocess.run([node, "--check", path], capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0,
+                                 f"第 {i+1} 个内联 script 块语法错误：{r.stderr.strip()[:300]}")
+            finally:
+                os.unlink(path)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
