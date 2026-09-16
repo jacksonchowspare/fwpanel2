@@ -796,6 +796,23 @@ cmp -s /tmp/fwtest/app/install.sh /tmp/fwtest/known_new.sh \
     && ok "install_shortcut 用给定的本地副本建缓存（不依赖网络）" || bad "没采用给定的本地副本"
 grep -q "快捷命令已就绪" /tmp/fwtest/sc.out && ok "采用本地副本后照常报告就绪" || bad "本地副本路径没走到就绪分支"
 
+# ②e 非 root 且缓存不可写（root 所有）时，--update-script 必须先提权重跑，
+#     否则 mv 会卡在 "overriding mode 0755?" 交互提问上（用户实测踩到）
+grep -q 'mv "$tmp" "$CACHE"' /tmp/fwtest/bin/fwp && bad "包装器里还有裸 mv（会弹交互提问）" \
+    || ok "包装器里的 mv 一律带 -f（脚本不会弹交互提问）"
+mkdir -p /tmp/fwtest/elevbin
+cat > /tmp/fwtest/elevbin/sudo <<'SEOF'
+#!/bin/sh
+echo "SUDO_CALLED: $*"
+exit 0
+SEOF
+chmod +x /tmp/fwtest/elevbin/sudo
+chmod 444 /tmp/fwtest/app/install.sh          # 模拟 root 所有、当前用户不可写
+out=$(env -i PATH=/tmp/fwtest/elevbin:/usr/bin:/bin HOME=/tmp timeout 20 sh /tmp/fwtest/bin/fwp --update-script 2>&1)
+case "$out" in *"SUDO_CALLED: sh /tmp/fwtest/bin/fwp --update-script"*) ok "缓存不可写时自动 sudo 提权重跑（不再卡在 mv 提问）" ;;
+                *) bad "没有提权: $(printf '%s' "$out" | head -3)" ;; esac
+chmod 644 /tmp/fwtest/app/install.sh
+
 # ③ 包装器实跑：联网失败时回退本地缓存并正常进入脚本（--help 只打印用法，不会安装）
 out=$(env -i PATH=/tmp/fwtest/badbin:/usr/bin:/bin HOME=/tmp sh /tmp/fwtest/bin/fwp --help 2>&1)
 case "$out" in *用法*|*Usage*) ok "联网失败仍能用本地缓存打开脚本（fwp --help 正常）" ;; *) bad "包装器回退失败: $out" ;; esac

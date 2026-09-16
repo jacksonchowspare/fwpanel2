@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.29"
+readonly SCRIPT_VERSION="3.2.30"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -690,7 +690,7 @@ do_update_script() {
     newv="$(grep -m1 -o 'SCRIPT_VERSION="[0-9.]*"' "$tmp" | tr -d '"' | cut -d= -f2)"
     mkdir -p "$APP_DIR"
     chmod 0755 "$tmp"
-    mv "$tmp" "$cache"
+    mv -f "$tmp" "$cache"
     # 顺手刷新快捷命令本体：老版本机器不必重装面板（不重启服务）就能拿到修好的 fwp
     write_shortcut_wrapper
     if [ "$newv" = "$SCRIPT_VERSION" ]; then
@@ -727,7 +727,7 @@ if [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/n
    && { ! command -v bash >/dev/null 2>&1 || bash -n "$tmp" 2>/dev/null; }; then
     mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
     chmod 0755 "$tmp" 2>/dev/null || true
-    mv "$tmp" "$CACHE" || rm -f "$tmp"
+    mv -f "$tmp" "$CACHE" || rm -f "$tmp"
 else
     rm -f "$tmp"
     echo "[fwp] 获取脚本失败（网络不通或 GitHub 不可达）" >&2
@@ -740,6 +740,17 @@ fi
 # 这样即使本地缓存是"没有菜单、也没有 --update-script"的老脚本（用户实测踩到），这条命令也能用。
 case "${1:-}" in
     --update-script|update-script)
+        # 缓存是 root 所有的 /usr/local/lib 下的文件：非 root 直接替换会撞上
+        # "mv: replace …, overriding mode 0755?" 交互提问（且答 yes 也是 Permission denied）。
+        # 所以先自己提权重跑一次，在 root 下完成下载/替换。
+        if [ "$(id -u)" != "0" ] && { [ ! -w "$CACHE" ] || [ ! -w "$(dirname "$CACHE")" ]; }; then
+            if command -v sudo >/dev/null 2>&1; then
+                echo "[fwp] 脚本缓存需要 root 权限，正在通过 sudo 提权..." >&2
+                exec sudo sh "$0" --update-script
+            fi
+            echo "[fwp] 需要 root 权限才能更新 $CACHE，请用：sudo fwp --update-script" >&2
+            exit 1
+        fi
         echo "[fwp] 正在获取最新安装脚本..." >&2
         tmp="$(mktemp)"
         ok=0
@@ -754,7 +765,7 @@ case "${1:-}" in
         if [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null; then
             mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
             chmod 0755 "$tmp" 2>/dev/null || true
-            mv "$tmp" "$CACHE" || rm -f "$tmp"
+            mv -f "$tmp" "$CACHE" || rm -f "$tmp"
         else
             rm -f "$tmp"
             echo "[fwp] 下载脚本失败（网络不通或 GitHub 不可达），本地缓存未改动" >&2
@@ -812,7 +823,7 @@ install_shortcut() {   # $1（可选）= 已知可用的新版脚本地路径（
     # 校验后才入库（半截下载/错误页不能覆盖缓存）
     if [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q "SCRIPT_VERSION=" "$tmp" 2>/dev/null && bash -n "$tmp" 2>/dev/null; then
         chmod 0755 "$tmp"
-        mv "$tmp" "$cache"
+        mv -f "$tmp" "$cache"
         ok="1"
     else
         rm -f "$tmp"
