@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.37"
+CURRENT_VERSION = "3.2.38"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 # 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
 THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
@@ -5660,16 +5660,113 @@ def set_timezone(tz):
         return False, f"设置时区异常：{e}"
 
 
-def set_ntp(enable):
+NTP_VIRT_BLOCKED = ("lxc", "lxc-libvirt", "openvz", "docker", "podman", "systemd-nspawn", "wsl", "proot")
+
+
+def ntp_unit_files():
+    """系统里存在的 NTP 实现（systemd 单元名 + 状态），用来诊断 timedatectl 为什么开不起来。"""
+    try:
+        r = subprocess.run(["systemctl", "list-unit-files", "--no-pager", "--type=service"],
+                           capture_output=True, text=True, timeout=15)
+        if r.returncode != 0:
+            return []
+        found = []
+        for ln in r.stdout.splitlines():
+            f = ln.split()
+            if not f:
+                continue
+            if f[0] in ("systemd-timesyncd.service", "chronyd.service", "ntp.service", "ntpsec.service"):
+                found.append((f[0], f[1] if len(f) > 1 else ""))
+        return found
+    except Exception:
+        return []
+
+
+def ntp_diagnose():
+    """NTP 设置失败时给出真正的原因和可执行的下一步。
+
+    返回 (code, message, can_fix)；can_fix=True 表示面板能一键搞定（装服务 / 解除 mask）。
+    """
+    virt = ""
+    try:
+        r = subprocess.run(["systemd-detect-virt"], capture_output=True, text=True, timeout=10)
+        virt = (r.stdout or "").strip()
+    except Exception:
+        virt = ""
+    if virt and virt != "none" and virt in NTP_VIRT_BLOCKED:
+        return ("container",
+                f"这台机器是容器（{virt}），时间由宿主机内核统一管理，容器内无法开启 NTP（该由宿主机/服务商负责）",
+                False)
+    units = ntp_unit_files()
+    if not units:
+        pkgs = ntp_pkg_candidates()
+        if pkgs:
+            return ("missing",
+                    f"系统里没有 NTP 服务（systemd-timesyncd / chrony 都没有）。面板可以一键安装 {pkgs[0]} 并开启",
+                    True)
+        return ("missing", "系统里没有 NTP 服务，且没识别出可用的包管理器，请手动安装 chrony 或 systemd-timesyncd", False)
+    masked = [n for n, st in units if st == "masked"]
+    if masked:
+        return ("masked", "NTP 服务被屏蔽（" + "、".join(masked) + "）。面板可以一键解除屏蔽并开启", True)
+    return ("unknown",
+            "系统里有 NTP 服务，但 timedatectl 仍无法启用（可能被其它配置覆盖）：" + "、".join(n for n, _ in units),
+            False)
+
+
+def ntp_pkg_candidates():
+    """按发行版给出要装的 NTP 包名（Arch/多数发行版的 timesyncd 随 systemd 提供，不用装）"""
+    mgr = pkg_mgr()
+    if mgr == "apt":
+        return ["systemd-timesyncd"]
+    if mgr == "dnf":
+        return ["chrony"]
+    return []
+
+
+def install_ntp_service():
+    """安装（缺则装）并启动 NTP 服务，返回 (ok, msg)"""
+    if DRY_RUN:
+        return True, "DRY_RUN: 安装并启用 NTP 服务"
+    pkgs = ntp_pkg_candidates()
+    if pkgs:
+        ok, msg = install_pkgs(pkgs)
+        if not ok:
+            return False, "安装 NTP 服务失败：" + msg
+    started = []
+    for unit in ("systemd-timesyncd.service", "chronyd.service", "ntp.service", "ntpsec.service"):
+        if not (os.path.isfile("/lib/systemd/system/" + unit) or os.path.isfile("/usr/lib/systemd/system/" + unit)):
+            continue
+        subprocess.run(["systemctl", "unmask", unit], capture_output=True, text=True, timeout=20)
+        r = subprocess.run(["systemctl", "enable", "--now", unit], capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            started.append(unit)
+    if not started:
+        return False, "NTP 服务装上了但没能启动，请手动执行：systemctl enable --now systemd-timesyncd"
+    return True, "NTP 服务已就绪（" + "、".join(started) + "）"
+
+
+def set_ntp(enable, install=False):
+    """$install=True 时先确保系统有 NTP 服务（装/解 mask），再 set-ntp。
+
+    返回 (ok, msg, fix)：fix 非空时前端给出「一键修复」入口（install_ntp）。
+    """
+    fix = ""
+    if install and enable:
+        ok, msg = install_ntp_service()
+        if not ok:
+            return False, msg, ""
     try:
         r = subprocess.run(["timedatectl", "set-ntp", "true" if enable else "false"],
                            capture_output=True, text=True, timeout=30)
         if r.returncode != 0:
-            return False, "设置失败（可能需要 systemd-timesyncd/chrony 支持）：" + (r.stderr or r.stdout).strip()[:160]
+            raw = (r.stderr or r.stdout).strip()[:160]
+            _code, hint, can = ntp_diagnose()
+            return False, (raw + "｜" + hint if raw else hint), ("install_ntp" if (can and not install) else "")
         st = time_status()
-        return True, f"NTP 自动同步已{'开启' if enable else '关闭'}（同步状态：{'已同步' if st.get('ntp_synced') else '未同步'})"
+        note = "（已同步）" if st.get("ntp_synced") else "（刚开启，稍等片刻才会同步）"
+        return True, f"NTP 自动同步已{'开启' if enable else '关闭'}{note}", fix
     except Exception as e:
-        return False, f"设置 NTP 异常：{e}"
+        return False, f"设置 NTP 异常：{e}", ""
 
 
 # ---------- 主机名 ----------
@@ -7819,11 +7916,12 @@ class PanelHandler(BaseHTTPRequestHandler):
         if token is None:
             return
         data = self._read_json()
+        fix = ""
         if str(data.get("action", "")).lower() == "ntp":
-            ok, msg = set_ntp(bool(data.get("enable")))
+            ok, msg, fix = set_ntp(bool(data.get("enable")), install=bool(data.get("install")))
         else:
             ok, msg = set_timezone(data.get("tz"))
-        self._send(200 if ok else 400, {"ok": ok, "msg": msg, "error": "" if ok else msg})
+        self._send(200 if ok else 400, {"ok": ok, "msg": msg, "fix": fix, "error": "" if ok else msg})
 
     def _api_system_hostname(self):
         token = self._require_auth()

@@ -1842,7 +1842,13 @@ async function api(method, path, body, timeoutMs) {
   let data = {};
   try { data = await r.json(); } catch (e) {}
   if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error(data.error || "未登录"); }
-  if (!r.ok) throw new Error(data.error || ("HTTP " + r.status));
+  if (!r.ok) {
+    // 把后端的修复建议带出来：例如 NTP 没装服务时会返回 fix="install_ntp"，
+    // 前端据此直接弹「一键安装并开启」，而不是只丢一句失败提示
+    const err = new Error(data.error || ("HTTP " + r.status));
+    err.fix = data.fix || "";
+    throw err;
+  }
   return data;
 }
 
@@ -3698,7 +3704,26 @@ async function sysTimeSave() {
   sysRun("/api/system/time", { tz });
 }
 
-function sysNtpToggle(on) { sysRun("/api/system/time", { action: "ntp", enable: !!on }); }
+/* NTP 开关（v3.2.38）
+   最小化 Debian/Ubuntu 镜像常常连 systemd-timesyncd 都没装，timedatectl 会直接回
+   "Failed to set ntp: NTP not supported"（用户伦敦那台 Debian 13 实测）。
+   现在后端会先诊断原因，前端据此给「一键安装并开启」入口，而不是只报一句失败。 */
+async function sysNtpSet(on, install) {
+  try {
+    const d = await api("POST", "/api/system/time", { action: "ntp", enable: !!on, install: !!install });
+    toast(d.msg || "完成", "okk");
+    loadSystem();
+  } catch (e) {
+    if (e.fix === "install_ntp") {
+      confirmPanel((e.message || "系统里没有 NTP 服务") + "\n\n要现在装一个并开启吗？"
+                   + "\n（Debian/Ubuntu 装轻量的 systemd-timesyncd，RHEL 系装 chrony，约几十秒）",
+                   () => sysNtpSet(true, true), "🔧 安装 NTP 服务");
+      return;
+    }
+    toast(e.message || "设置失败", "err");
+  }
+}
+function sysNtpToggle(on) { sysNtpSet(on, false); }
 
 function sysHostSave() {
   const n = ($("sys_hostname").value || "").trim();

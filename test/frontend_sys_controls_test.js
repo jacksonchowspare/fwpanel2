@@ -35,7 +35,8 @@ function check(cond, label, extra) {
 }
 
 const names = ["renderIpv6Ui", "renderSysTime", "loadTimezones", "tzItemHtml", "tzRender",
-               "tzOpen", "tzClose", "tzToggle", "tzInput", "tzKey", "sysTimeSave"];
+               "tzOpen", "tzClose", "tzToggle", "tzInput", "tzKey", "sysTimeSave",
+               "sysNtpSet", "sysNtpToggle"];
 const srcs = names.map(extract);
 names.forEach((n, i) => { if (!srcs[i]) { console.log("FAIL 找不到 " + n + "()"); process.exit(1); } });
 
@@ -65,6 +66,10 @@ global.$ = (id) => els[id] || null;
 global.esc = (s) => String(s == null ? "" : s);
 const toasts = [];
 global.toast = (m, k) => toasts.push([String(m), k || ""]);
+let cfm = null;
+global.confirmPanel = (msg, onOk, title) => { cfm = { msg: String(msg || ""), onOk: onOk, title: title || "" }; };
+let loaded = 0;
+global.loadSystem = () => { loaded++; };
 let posted = [];
 global.sysRun = (p, b) => posted.push([p, b]);
 let apiResult = null, apiCalls = [];
@@ -74,7 +79,8 @@ global.api = async (m, p) => { apiCalls.push(m + " " + p); if (apiResult instanc
 const PRELUDE = "let tzList = [], tzCommon = [], tzLoading = false, tzBound = false;\n";
 const F = new Function(PRELUDE + srcs.join("\n") + "\nreturn {" +
     "renderIpv6Ui: renderIpv6Ui, renderSysTime: renderSysTime, loadTimezones: loadTimezones, tzRender: tzRender," +
-    "tzOpen: tzOpen, tzClose: tzClose, tzToggle: tzToggle, tzInput: tzInput, tzKey: tzKey, sysTimeSave: sysTimeSave};")();
+    "tzOpen: tzOpen, tzClose: tzClose, tzToggle: tzToggle, tzInput: tzInput, tzKey: tzKey, " +
+    "sysTimeSave: sysTimeSave, sysNtpSet: sysNtpSet, sysNtpToggle: sysNtpToggle};")();
 
 function fireList(ev, target) {
     (els.tz_list._h[ev] || []).forEach(fn => fn({ target: target, preventDefault() {} }));
@@ -202,6 +208,26 @@ function isOpen() { return els.tz_pop.classList.contains("show"); }
     F.renderSysTime({ time: { timezone: "Asia/Shanghai", time: "x", ntp: null } });
     check(els.btn_ntp_on.style.display === "inline-block" && els.btn_ntp_off.style.display === "inline-block",
           "状态未知 → 两个按钮都留着（不给用户死路）");
+
+    console.log("⑪ NTP 开不起来时给一键安装入口（Debian 最小镜像实测 NTP not supported）");
+    posted = []; toasts.length = 0; cfm = null;
+    global.api = async (m, p, body) => {
+        posted.push([p, body]);
+        if (body && body.install) return { ok: true, msg: "NTP 自动同步已开启" };
+        const e = new Error("Failed to set ntp: NTP not supported｜系统里没有 NTP 服务（systemd-timesyncd / chrony 都没有）。面板可以一键安装 systemd-timesyncd 并开启");
+        e.fix = "install_ntp";
+        throw e;
+    };
+    await F.sysNtpToggle(true);
+    check(posted.length === 1 && posted[0][1].install === false, "先按原样试一次开启（install=false）", JSON.stringify(posted));
+    check(cfm !== null && /安装 NTP 服务/.test(cfm.title), "失败后弹出「安装 NTP 服务」确认框", cfm ? cfm.title : "未弹框");
+    check(cfm && /systemd-timesyncd/.test(cfm.msg), "说明里讲清楚要装什么", cfm ? cfm.msg.slice(0, 40) : "");
+    cfm.onOk();
+    await new Promise(r => setTimeout(r, 10));
+    check(posted.length === 2 && posted[1][1].install === true && posted[1][1].enable === true,
+          "点确认后带 install=true 再请求一次（真正去装）", JSON.stringify(posted[1]));
+    check(toasts.some(x => /NTP 自动同步已开启/.test(x[0])), "装完提示成功", JSON.stringify(toasts.slice(-1)));
+    check(loaded >= 1, "操作完会刷新系统页状态");
 
     console.log(failures === 0 ? "\n全部通过 ✓" : "\n失败 " + failures + " 项 ✗");
     process.exit(failures === 0 ? 0 : 1);

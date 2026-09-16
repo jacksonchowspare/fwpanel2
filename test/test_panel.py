@@ -6647,5 +6647,99 @@ class TestTimezonesAndSysControls(unittest.TestCase):
             self.assertTrue(os.path.isfile(os.path.join(self.root, "test", f)), f)
 
 
+class TestSystemNtp(unittest.TestCase):
+    """v3.2.38：NTP 开不起来要能说清原因，能修的给一键修复入口。
+
+    用户实测（london 那台 Debian 13）：timedatectl set-ntp 回 "Failed to set ntp: NTP not supported"，
+    因为最小镜像里连 systemd-timesyncd 都没装。
+    """
+
+    def test_diagnose_missing_service(self):
+        with unittest.mock.patch.object(panel, "ntp_unit_files", return_value=[]), \
+             unittest.mock.patch.object(panel, "ntp_pkg_candidates", return_value=["systemd-timesyncd"]), \
+             unittest.mock.patch("subprocess.run",
+                                 return_value=types.SimpleNamespace(returncode=0, stdout="none", stderr="")):
+            code, msg, can = panel.ntp_diagnose()
+        self.assertEqual(code, "missing")
+        self.assertTrue(can, "没装 NTP 服务是可修的（装一个）")
+        self.assertIn("一键安装", msg)
+
+    def test_diagnose_container_not_fixable(self):
+        with unittest.mock.patch("subprocess.run",
+                                 return_value=types.SimpleNamespace(returncode=0, stdout="lxc\n", stderr="")):
+            code, msg, can = panel.ntp_diagnose()
+        self.assertEqual(code, "container")
+        self.assertFalse(can, "容器里时间由宿主机管，面板不该假装修得好")
+        self.assertIn("容器", msg)
+
+    def test_diagnose_masked(self):
+        with unittest.mock.patch.object(panel, "ntp_unit_files",
+                                        return_value=[("systemd-timesyncd.service", "masked")]), \
+             unittest.mock.patch("subprocess.run",
+                                 return_value=types.SimpleNamespace(returncode=0, stdout="none", stderr="")):
+            code, msg, can = panel.ntp_diagnose()
+        self.assertEqual(code, "masked")
+        self.assertTrue(can)
+        self.assertIn("屏蔽", msg)
+
+    def test_set_ntp_failure_offers_fix(self):
+        def fake_run(cmd, **kw):
+            if list(cmd[:2]) == ["timedatectl", "set-ntp"]:
+                return types.SimpleNamespace(returncode=1, stdout="",
+                                             stderr="Failed to set ntp: NTP not supported")
+            return types.SimpleNamespace(returncode=0, stdout="none", stderr="")
+
+        with unittest.mock.patch("subprocess.run", side_effect=fake_run), \
+             unittest.mock.patch.object(panel, "ntp_unit_files", return_value=[]), \
+             unittest.mock.patch.object(panel, "ntp_pkg_candidates", return_value=["systemd-timesyncd"]):
+            ok, msg, fix = panel.set_ntp(True)
+        self.assertFalse(ok)
+        self.assertEqual(fix, "install_ntp", "可修的情况必须把 fix 带回去给前端")
+        self.assertIn("NTP not supported", msg)
+        self.assertIn("一键安装", msg)
+
+    def test_set_ntp_install_path_runs_set_ntp(self):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(list(cmd))
+            return types.SimpleNamespace(returncode=0, stdout="yes", stderr="")
+
+        with unittest.mock.patch("subprocess.run", side_effect=fake_run), \
+             unittest.mock.patch.object(panel, "install_ntp_service", return_value=(True, "NTP 服务已就绪")), \
+             unittest.mock.patch.object(panel, "time_status", return_value={"ntp_synced": False}):
+            ok, msg, fix = panel.set_ntp(True, install=True)
+        self.assertTrue(ok)
+        self.assertIn("已开启", msg)
+        self.assertTrue(any(c[:3] == ["timedatectl", "set-ntp", "true"] for c in calls),
+                        "装完服务必须再调一次 timedatectl set-ntp true")
+
+    def test_install_ntp_service_dry_run(self):
+        ok, msg = panel.install_ntp_service()      # 测试环境 FW_DRY_RUN=1，不会真装包
+        self.assertTrue(ok)
+        self.assertIn("DRY_RUN", msg)
+
+    def test_pkg_choice_per_distro(self):
+        with unittest.mock.patch.object(panel, "pkg_mgr", return_value="apt"):
+            self.assertEqual(panel.ntp_pkg_candidates(), ["systemd-timesyncd"])
+        with unittest.mock.patch.object(panel, "pkg_mgr", return_value="dnf"):
+            self.assertEqual(panel.ntp_pkg_candidates(), ["chrony"])
+        with unittest.mock.patch.object(panel, "pkg_mgr", return_value="pacman"):
+            self.assertEqual(panel.ntp_pkg_candidates(), [], "Arch 的 timesyncd 随 systemd 提供，不该装包")
+
+    def test_frontend_offers_one_click_install(self):
+        with open(os.path.join(self.__class__.root, "static", "index.html"), encoding="utf-8") as f:
+            html = f.read()
+        self.assertIn("err.fix = data.fix", html, "api() 要把修复建议带出来")
+        self.assertIn('e.fix === "install_ntp"', html)
+        self.assertIn("function sysNtpSet(", html)
+        self.assertIn("install: !!install", html)
+        self.assertIn("function sysNtpToggle(", html, "菜单里的 onclick 目标必须还在")
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
