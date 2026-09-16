@@ -632,6 +632,9 @@ sh -n /tmp/fwtest/bin/fwp 2>/dev/null && ok "包装器语法通过（POSIX sh）
 grep -q 'CACHE="/tmp/fwtest/app/install.sh"' /tmp/fwtest/bin/fwp && ok "包装器里缓存路径已正确展开（占位符已替换）" || bad "包装器缓存路径未展开"
 grep -q 'exec bash "$CACHE"' /tmp/fwtest/bin/fwp && ok "包装器转交脚本执行（保留参数）" || bad "包装器缺少 exec 逻辑"
 grep -q 'id -u' /tmp/fwtest/bin/fwp && ok "非 root 时自动 sudo 提权" || bad "包装器缺提权逻辑"
+# 真机抓到过：用 sh -n 校验 bash 脚本，在 Debian/Ubuntu（sh=dash）上永远失败 → 缓存永不刷新
+if grep -qF '&& sh -n "$tmp"' /tmp/fwtest/bin/fwp; then bad "包装器用 sh -n 校验缓存（dash 上必然失败）"
+else grep -qF 'bash -n "$tmp"' /tmp/fwtest/bin/fwp && ok "缓存校验用 bash -n（不是 sh -n）" || bad "包装器缺少语法校验"; fi
 
 # ①b 菜单里会提示快捷入口（包装器存在时才提示；这里重建一份最小 PATH 的 stub 目录）
 rm -rf /tmp/fakebin_fwp && mkdir -p /tmp/fakebin_fwp

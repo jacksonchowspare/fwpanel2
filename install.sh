@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.21"
+readonly SCRIPT_VERSION="3.2.22"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -700,10 +700,12 @@ CACHE="__CACHE__"
 URL="__URL__"
 
 # 能联网就刷新缓存（校验通过才替换，半截下载/错误页一律不采用）
+# ⚠ 校验必须用 bash -n：install.sh 是 bash 脚本（含 bash 专有语法），Debian/Ubuntu 上 sh 是 dash，sh -n 必然失败
 if command -v curl >/dev/null 2>&1; then
     tmp="$(mktemp)"
     if curl -fsSL -m 8 "$URL" -o "$tmp" 2>/dev/null && [ -s "$tmp" ] \
-       && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null && sh -n "$tmp" 2>/dev/null; then
+       && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null \
+       && { ! command -v bash >/dev/null 2>&1 || bash -n "$tmp" 2>/dev/null; }; then
         mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
         mv "$tmp" "$CACHE" 2>/dev/null || rm -f "$tmp"
     else
