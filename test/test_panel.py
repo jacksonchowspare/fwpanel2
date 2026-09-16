@@ -10,6 +10,7 @@ import tempfile
 import threading
 import types
 import unittest
+import unittest.mock
 import urllib.request
 
 # ---- 必须在 import panel 前设置测试环境 ----
@@ -6081,6 +6082,111 @@ class TestSystem(unittest.TestCase):
         ids = _re.findall(r'id: "([a-z\-]+)"', m.group(1))
         self.assertEqual(set(ids), set(panel.THEME_IDS), "前后端主题清单不一致：%s" % ids)
         c.close()
+
+
+class TestResetAccount(unittest.TestCase):
+    """reset-account 子命令（安装脚本菜单 5：改用户名/密码）+ 本机凭据记录（菜单 7 回查）"""
+
+    def setUp(self):
+        self.bak_dir = panel.BASE_DIR            # FW_TEST_DIR
+        self.cfg_path = panel.CONFIG_FILE
+        self.cred_path = panel.LOCAL_CRED_FILE
+        # 本文件全局把 Config.__init__ 换成空 dict（避免读真实配置）；本类要验证“改凭据不动其他字段”，
+        # 必须恢复成真实行为：先读盘再整表回写（Config.set 是 self.data[key]=v + save 全量写回）
+        self._patched_init = panel.Config.__init__
+        panel.Config.__init__ = lambda self: setattr(self, "data", self._load())
+        for f in (self.cfg_path, self.cred_path):
+            if os.path.exists(f):
+                os.remove(f)
+
+    def tearDown(self):
+        panel.Config.__init__ = self._patched_init
+        for f in (self.cfg_path, self.cred_path, self.cred_path + ".tmp"):
+            if os.path.exists(f):
+                os.remove(f)
+
+    def _disk(self):
+        with open(self.cfg_path, encoding="utf-8") as f:
+            return json.load(f)
+
+    def _seed_config(self, user="olduser", pwd="OldPass123"):
+        with open(self.cfg_path, "w", encoding="utf-8") as f:
+            json.dump({"username": user, "password_hash": panel.hash_password(pwd),
+                       "port": 17890}, f)
+
+    def _run(self, answers, passwords):
+        """answers 依次喂给 input()，passwords 依次喂给 getpass.getpass()"""
+        ai, pi = iter(answers), iter(passwords)
+        with unittest.mock.patch("builtins.input", lambda *a: next(ai)), \
+             unittest.mock.patch("getpass.getpass", lambda *a: next(pi)):
+            panel.cmd_reset_account()
+
+    def test_reset_account_changes_username_and_password(self):
+        self._seed_config()
+        # input: 新用户名 + 再次确认；getpass: 新密码 + 再次确认
+        self._run(["newuser", "newuser"], ["NewPass456", "NewPass456"])
+        with open(self.cfg_path, encoding="utf-8") as f:
+            disk = json.load(f)
+        self.assertEqual(disk["username"], "newuser")
+        self.assertTrue(panel.verify_password("NewPass456", disk["password_hash"]))
+        self.assertFalse(panel.verify_password("OldPass123", disk["password_hash"]))
+        with open(self.cred_path, encoding="utf-8") as f:
+            cred = json.load(f)
+        self.assertEqual(cred["username"], "newuser")
+        self.assertEqual(cred["password"], "NewPass456")          # 菜单 7 靠它回查
+        self.assertEqual(stat.S_IMODE(os.stat(self.cred_path).st_mode), 0o600)
+        self.assertEqual(disk["port"], 17890, "改凭据不应丢掉其他配置字段")
+
+    def test_reset_account_username_only_keeps_password(self):
+        self._seed_config()
+        before = self._disk()["password_hash"]
+        self._run(["newuser", "newuser"], [""])                   # 密码回车 = 不改
+        with open(self.cfg_path, encoding="utf-8") as f:
+            disk = json.load(f)
+        self.assertEqual(disk["username"], "newuser")
+        self.assertEqual(disk["password_hash"], before)
+        self.assertTrue(panel.verify_password("OldPass123", disk["password_hash"]))
+        self.assertEqual(disk["port"], 17890)
+
+    def test_reset_account_password_only(self):
+        self._seed_config()
+        self._run([""], ["OnlyNew789", "OnlyNew789"])             # 用户名回车 = 不改
+        with open(self.cfg_path, encoding="utf-8") as f:
+            disk = json.load(f)
+        self.assertEqual(disk["username"], "olduser")
+        self.assertTrue(panel.verify_password("OnlyNew789", disk["password_hash"]))
+        self.assertEqual(disk["port"], 17890)
+
+    def test_reset_account_nothing_changed(self):
+        self._seed_config()
+        before = self._disk()
+        self._run([""], [""])
+        with open(self.cfg_path, encoding="utf-8") as f:
+            disk = json.load(f)
+        self.assertEqual(disk, before)
+        self.assertFalse(os.path.exists(self.cred_path), "没改动就不该写凭据记录")
+
+    def test_reset_account_rejects_bad_input_then_accepts(self):
+        self._seed_config()
+        # 用户名：非法 → 两次不一致 → 正确；密码：太短 → 两次不一致 → 正确
+        self._run(["ab", "newuser", "newuserx", "newuser", "newuser"],
+                  ["short", "GoodPass123", "GoodPass456", "GoodPass123", "GoodPass123"])
+        with open(self.cfg_path, encoding="utf-8") as f:
+            disk = json.load(f)
+        self.assertEqual(disk["username"], "newuser")
+        self.assertTrue(panel.verify_password("GoodPass123", disk["password_hash"]))
+
+    def test_reset_password_also_records_credentials(self):
+        self._seed_config()
+        with unittest.mock.patch("getpass.getpass", lambda *a: "RecordedPw1"):
+            panel.cmd_reset_password()
+        with open(self.cred_path, encoding="utf-8") as f:
+            cred = json.load(f)
+        self.assertEqual(cred["password"], "RecordedPw1")
+        self.assertEqual(stat.S_IMODE(os.stat(self.cred_path).st_mode), 0o600)
+
+    def test_read_local_credentials_missing_returns_empty(self):
+        self.assertEqual(panel._read_local_credentials(), {})
 
 
 if __name__ == "__main__":

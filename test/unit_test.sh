@@ -359,6 +359,7 @@ menu_action() {  # $1=输入
         do_check() { echo "DO_CHECK_CALLED"; }
         do_change_password() { echo "DO_CHANGE_PW_CALLED"; }
         do_uninstall() { echo "DO_UNINSTALL_CALLED"; }
+        do_show_login_info() { echo "DO_SHOW_INFO_CALLED"; }
         interactive_channel_menu
         echo "MENU_RETURNED BETA=$BETA VERSION_TAG=$VERSION_TAG"' 2>/dev/null
 }
@@ -368,10 +369,11 @@ t6y="$(menu_action '6
 yes')"; case "$t6y" in *DO_UNINSTALL_CALLED*) case "$t6y" in *MENU_RETURNED*) bad "选 6 确认后不该继续走安装" ;; *) ok "菜单 6) 卸载 → 确认 yes 后执行卸载" ;; esac ;; *) bad "选 6+yes 未触发卸载: $t6y" ;; esac
 t6n="$(menu_action '6
 no')"; case "$t6n" in *DO_UNINSTALL_CALLED*) bad "选 6 输入 no 竟然还卸载了" ;; *) case "$t6n" in *MENU_RETURNED*) bad "取消卸载后不该继续安装" ;; *) ok "菜单 6) 卸载 → 未确认则取消，不做任何改动" ;; esac ;; esac
+t7info="$(menu_action 7)"; case "$t7info" in *DO_SHOW_INFO_CALLED*) case "$t7info" in *MENU_RETURNED*) bad "选 7 不该继续走安装" ;; *) ok "菜单 7) 查看登录信息 → 展示并退出（不走安装）" ;; esac ;; *) bad "选 7 未触发登录信息展示: $t7info" ;; esac
 t1="$(menu_action 1)"; case "$t1" in *MENU_RETURNED*) ok "菜单 1) 仍正常进入安装流程" ;; *) bad "选 1 未回到安装流程: $t1" ;; esac
-t7="$(menu_action '7
-7
-7')"; case "$t7" in *MENU_RETURNED*) ok "乱填 3 次 → 按默认正式版继续安装" ;; *) bad "乱填后未回到安装流程: $t7" ;; esac
+t9="$(menu_action '9
+9
+9')"; case "$t9" in *MENU_RETURNED*) ok "乱填 3 次 → 按默认正式版继续安装" ;; *) bad "乱填后未回到安装流程: $t9" ;; esac
 
 # 管道模式（curl | sudo bash）下 stdin 是脚本自身，菜单必须改走 /dev/tty —— 用 script 造 pty 模拟真实场景
 if command -v script >/dev/null 2>&1; then
@@ -514,14 +516,45 @@ fi
 
 rm -rf /tmp/fakebin_cred
 
+echo "== 菜单 7) 查看登录信息：地址/反代域名/用户名/密码（含缺失凭据记录的情况） =="
+rm -rf /tmp/fwinfo && mkdir -p /tmp/fwinfo/etc
+cat > /tmp/fwinfo/etc/config.json <<'EOF'
+{"port": 17890, "bind": "0.0.0.0", "username": "jackson", "mode": "strict"}
+EOF
+cat > /tmp/fwinfo/etc/credentials.json <<'EOF'
+{"username": "jackson", "password": "MyPanel2026", "updated_at": "2026-09-16 20:30:00"}
+EOF
+cat > /tmp/fwinfo/etc/proxies.json <<'EOF'
+[{"domain": "sg1panel.isusz.com", "target_port": 17890, "ssl": false, "cert_ref": "sg1panel.isusz.com"}]
+EOF
+head -n -1 "$SCRIPT" | sed 's|readonly ETC_DIR="/etc/fwpanel"|readonly ETC_DIR="/tmp/fwinfo/etc"|' > /tmp/fwinfo/install_info.sh
+infoline() {  # $1=要匹配的片段 $2=说明
+    local out="$3"
+    case "$out" in *"$1"*) ok "$2" ;; *) bad "$2 —— 输出里没有「$1」: $(printf '%s' "$out" | tail -8)" ;; esac
+}
+out=$(env -i PATH=/usr/bin:/bin HOME=/root bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; do_show_login_info' 2>&1)
+infoline ":17890" "显示面板地址（含端口）" "$out"
+infoline "反代地址 : https://sg1panel.isusz.com" "显示反代域名（cert_ref 复用证书 → https）" "$out"
+infoline "用户名   : jackson" "显示用户名" "$out"
+infoline "密码     : MyPanel2026" "显示密码（来自本机 credentials.json）" "$out"
+# 没有凭据记录时必须说清楚（老版本装的机器），并给出可行指引
+rm -f /tmp/fwinfo/etc/credentials.json
+out2=$(env -i PATH=/usr/bin:/bin HOME=/root bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; do_show_login_info' 2>&1)
+infoline "未记录明文" "无凭据记录时说明密码不可反查" "$out2"
+infoline "菜单 5) 修改用户名和密码" "无凭据记录时指向菜单 5" "$out2"
+# 该功能需要 root：check_root 必须被调用
+grep -q "do_show_login_info() {" /tmp/fwinfo/install_info.sh &&     sed -n '/^do_show_login_info()/,/^}/p' /tmp/fwinfo/install_info.sh | head -3 | grep -q "check_root" \
+    && ok "查看登录信息前先 check_root（需 root 权限）" || bad "缺少 check_root 保护"
+rm -rf /tmp/fwinfo
+
 echo "== 安装摘要文案：管道模式不得印出「sudo bash bash …」 =="
 sum_pipe=$(bash -c 'source '"$TMPF"'
     PANEL_BIND=0.0.0.0; PANEL_PORT=17890; PANEL_USER=admin; PANEL_PASS=GzPass2026
     print_summary' 2>&1 || true)
 case "$sum_pipe" in
     *"bash bash"*) bad "管道模式摘要印出了不可用的命令（bash bash）" ;;
-    *"菜单选 5) 改密码"*) ok "管道模式摘要给出的是可照做的指引（菜单选 5 / 重跑一键命令）" ;;
-    *) bad "管道模式摘要缺少改密码指引: $(printf '%s' "$sum_pipe" | tail -6)" ;;
+    *"菜单选 5) 改用户名密码"*) ok "管道模式摘要给出的是可照做的指引（菜单选 5 / 重跑一键命令）" ;;
+    *) bad "管道模式摘要缺少改凭据指引: $(printf '%s' "$sum_pipe" | tail -6)" ;;
 esac
 # 实体脚本模式（$0 是文件）应引用脚本自身路径
 sum_file=$(cat > /tmp/fw_sum_probe.sh <<EOF

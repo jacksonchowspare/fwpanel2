@@ -23,6 +23,7 @@ fwpanel2 — 简易VPS管理面板2.0（适配 Debian 13 / nftables）
 用法：
   fwpanel serve [--port N] [--bind IP]    启动面板（默认）
   fwpanel reset-password                  重置面板密码（交互式）
+  fwpanel reset-account                    修改面板用户名和/或密码（交互式，回车=不改）
   fwpanel apply                           仅应用规则（供 systemd 启动时调用）
 """
 
@@ -53,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.15"
+CURRENT_VERSION = "3.2.16"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 # 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
 THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
@@ -9568,8 +9569,99 @@ class PanelServer(ThreadingHTTPServer):
         self.auth = auth
 
 
+LOCAL_CRED_FILE = os.path.join(BASE_DIR, "credentials.json")
+
+
+def _record_local_credentials(username, password):
+    """把明文凭据记到 config 同目录的 credentials.json（0600，仅 root 可读）。
+
+    用途：安装脚本菜单「7) 查看面板登录信息」——出问题时本机 root 能直接查回用户名/密码。
+    明文只落在这一处，不留别的副本；不想要这个便利可以直接删除该文件（面板功能不受影响）。
+    """
+    try:
+        os.makedirs(BASE_DIR, exist_ok=True)
+        tmp = LOCAL_CRED_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"username": username, "password": password,
+                       "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+                      f, ensure_ascii=False, indent=2)
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, LOCAL_CRED_FILE)
+    except Exception as exc:  # 记录失败不影响改密本身
+        print(f"（提示：本地凭据记录写入失败: {exc}）", file=sys.stderr)
+
+
+def _read_local_credentials():
+    """读回本机凭据记录；不存在或读不出返回 {}"""
+    try:
+        with open(LOCAL_CRED_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def cmd_reset_account():
+    """交互式修改用户名和/或密码（安装脚本菜单「5) 修改用户名和密码」调用）。
+
+    两项都可以不动（直接回车跳过）；改了哪项就更新哪项，明文同时记到 credentials.json
+    供菜单「查看登录信息」回查。
+    """
+    if not os.path.exists(CONFIG_FILE):
+        print("面板未初始化，请先运行安装脚本", file=sys.stderr)
+        sys.exit(1)
+    cfg = Config()
+    import getpass
+    cur_user = cfg.get("username", "")
+    print(f"当前用户名: {cur_user}（用户名：直接回车 = 不修改）")
+    new_user = cur_user
+    while True:
+        u = input("新用户名（3-32 位字母/数字/下划线，回车 = 不改）: ").strip()
+        if not u:
+            break
+        if not re.fullmatch(r"[A-Za-z0-9_]{3,32}", u):
+            print("用户名需为 3-32 位字母/数字/下划线")
+            continue
+        if input("再次输入新用户名: ").strip() != u:
+            print("两次输入不一致")
+            continue
+        new_user = u
+        break
+
+    print("密码（直接回车 = 不修改）")
+    new_pw = ""
+    while True:
+        p1 = getpass.getpass("新密码（至少 8 位，回车 = 不改）: ")
+        if not p1:
+            break
+        if len(p1) < 8:
+            print("密码太短")
+            continue
+        if getpass.getpass("再次输入新密码: ") != p1:
+            print("两次输入不一致")
+            continue
+        new_pw = p1
+        break
+
+    changed = []
+    if new_user != cur_user:
+        cfg.set("username", new_user)
+        changed.append("用户名")
+    if new_pw:
+        cfg.set("password_hash", hash_password(new_pw))
+        changed.append("密码")
+    if not changed:
+        print("未做任何修改")
+        return
+    recorded_pw = new_pw or _read_local_credentials().get("password", "")
+    _record_local_credentials(new_user, recorded_pw)
+    print(f"已更新: {'、'.join(changed)}（用户名: {new_user}）")
+    if not new_pw:
+        print("提示：本次没改密码，本机记录里保留的是上次记录的密码明文")
+
+
 def cmd_reset_password():
-    """交互式重置密码（安装脚本 --change-password 调用）"""
+    """交互式重置密码（安装脚本 --change-password 调用；老版脚本路径）"""
     if not os.path.exists(CONFIG_FILE):
         print("面板未初始化，请先运行安装脚本", file=sys.stderr)
         sys.exit(1)
@@ -9586,6 +9678,7 @@ def cmd_reset_password():
             continue
         break
     cfg.set("password_hash", hash_password(p1))
+    _record_local_credentials(cfg.get("username", ""), p1)
     print("密码已更新")
 
 
@@ -9677,7 +9770,7 @@ def ensure_proxy_entry_ports(store):
 def main():
     parser = argparse.ArgumentParser(description="fwpanel2 简易VPS管理面板2.0")
     parser.add_argument("cmd", nargs="?", default="serve",
-                        choices=["serve", "reset-password", "apply", "open-port"])
+                        choices=["serve", "reset-password", "reset-account", "apply", "open-port"])
     parser.add_argument("arg1", nargs="?", help="open-port 的端口（如 8080 或 8080/udp）")
     parser.add_argument("arg2", nargs="?", help="open-port 的协议（tcp/udp，默认 tcp）")
     parser.add_argument("--port", type=int, default=None,
@@ -9689,6 +9782,9 @@ def main():
     config = Config()
     if args.cmd == "reset-password":
         cmd_reset_password()
+        return
+    if args.cmd == "reset-account":
+        cmd_reset_account()
         return
     if args.cmd == "apply":
         cmd_apply(config)

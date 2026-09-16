@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.15"
+readonly SCRIPT_VERSION="3.2.16"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -289,7 +289,7 @@ usage() {
 $SCRIPT_NAME（安装脚本 v$SCRIPT_VERSION）—— 简易VPS管理面板2.0（Debian 13 · nftables）
 
 用法:
-  sudo bash $0                           交互式菜单：安装正式版/测试版/指定版本、环境体检、改密码、卸载
+  sudo bash $0                           交互式菜单：安装正式版/测试版/指定版本、环境体检、改用户名密码、查看登录信息、卸载
   sudo bash $0 -y                        无人值守：跳过菜单与凭据询问，直接装/升【最新正式版】
                                           （首次安装默认询问是否自定义用户名/密码，回车=随机）
   sudo bash $0 --beta                    安装/升级【最新测试版】（尝鲜通道）
@@ -650,6 +650,104 @@ installed_panel_version() {
     sed -n 's/^CURRENT_VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$p" 2>/dev/null | head -n 1 || true
 }
 
+# ------------------------- 凭据记录与回查 -------------------------
+# 明文凭据只落在 $ETC_DIR/credentials.json（0600，仅 root 可读），用于忘记密码时在本机 root 下回查。
+# 不想留这份明文副本：直接删除该文件即可（面板功能不受影响，但忘了密码就只能设新的）。
+record_local_credentials() {
+    python3 - "$ETC_DIR/credentials.json" "$PANEL_USER" "$PANEL_PASS" <<'EOF' || log_warn "凭据记录写入失败（不影响安装）"
+import datetime, json, os, sys
+path, user, pw = sys.argv[1], sys.argv[2], sys.argv[3]
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump({"username": user, "password": pw,
+               "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
+              f, ensure_ascii=False, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+EOF
+    log_info "登录凭据已记录到 $ETC_DIR/credentials.json（仅 root 可读）；忘记时可用菜单 7) 查看"
+}
+
+cfg_field() {   # $1=config.json 字段名 → 输出值（失败输出空）
+    python3 - "$ETC_DIR/config.json" "$1" <<'EOF' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get(sys.argv[2], ""))
+except Exception:
+    pass
+EOF
+}
+
+do_show_login_info() {
+    check_root
+    [ -f "$ETC_DIR/config.json" ] || error "面板未安装，无法查看登录信息"
+
+    local ip port bind user pw updated domain
+    ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)"
+    [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    [ -n "$ip" ] || ip="<服务器IP>"
+    port="$(cfg_field port)"
+    bind="$(cfg_field bind)"
+    user="$(cfg_field username)"
+
+    echo ""
+    echo "  面板地址 : http://${ip}:${port}"
+    if [ "$bind" = "127.0.0.1" ]; then
+        echo "             （配置为仅本机监听：本机 ssh -L ${port}:127.0.0.1:${port} root@${ip} 后访问 127.0.0.1:${port}）"
+    fi
+    # 反向代理域名（有代理指向面板端口就一并列出，方便直接点开）
+    if [ -f "$ETC_DIR/proxies.json" ]; then
+        domain="$(python3 - "$ETC_DIR/proxies.json" "$port" <<'EOF' 2>/dev/null || true
+import json, sys
+try:
+    ps = json.load(open(sys.argv[1]))
+except Exception:
+    ps = []
+port = str(sys.argv[2])
+for p in (ps if isinstance(ps, list) else []):
+    if str(p.get("target_port")) == port and p.get("domain"):
+        scheme = "https" if (p.get("ssl") or p.get("cert_ref")) else "http"
+        print(f"{scheme}://{p['domain']}")
+EOF
+)"
+        if [ -n "$domain" ]; then
+            echo "  反代地址 : $domain"
+        fi
+    fi
+    echo "  用户名   : ${user:-（未设置）}"
+
+    pw=""; updated=""
+    if [ -f "$ETC_DIR/credentials.json" ]; then
+        pw="$(python3 - "$ETC_DIR/credentials.json" <<'EOF' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("password", ""))
+except Exception:
+    pass
+EOF
+)"
+        updated="$(python3 - "$ETC_DIR/credentials.json" <<'EOF' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("updated_at", ""))
+except Exception:
+    pass
+EOF
+)"
+    fi
+    if [ -n "$pw" ]; then
+        echo "  密码     : $pw"
+        [ -n "$updated" ] && echo "             （本机记录时间: $updated）"
+    else
+        echo "  密码     : 未记录明文（面板只存 pbkdf2 哈希，无法反查）"
+        echo "             需要可用得会：菜单 5) 修改用户名和密码 设一个新的（会同时记录到本机）"
+    fi
+    echo ""
+    echo "  说明：以上密码来自本机 $ETC_DIR/credentials.json（仅 root 可读）；"
+    echo "        面板登录校验用的是哈希、不是这份明文；不需要这份便利可删除该文件。"
+    echo ""
+}
+
 # ------------------------- 交互式版本选择菜单 -------------------------
 # 只在这三种条件同时成立时出现：无 --beta / --version 参数 + 有可用终端 + 没加 --yes。
 # 让用户直接选通道，不用记 --beta / --version。
@@ -720,13 +818,14 @@ interactive_channel_menu() {
     echo "    3) 安装指定版本  手动输入版本号（不用带 v，例如 3.1.1）"
     echo "    ------------------------------------------------------------"
     echo "    4) 环境体检      只检查系统环境与依赖，不改动任何东西"
-    echo "    5) 改密码        交互式修改面板登录密码（至少 8 位，输两遍）"
+    echo "    5) 改用户名密码  交互式修改面板登录用户名和/或密码（回车 = 该项不改）"
     echo "    6) 卸载          停止服务并删除程序文件（保留 /etc/fwpanel 配置与规则）"
+    echo "    7) 查看登录信息  显示面板登录地址、用户名、密码（需 root）"
     echo ""
 
     ans=""; tries=0
     while :; do
-        printf '  请输入 1 - 6 后回车（直接回车 = 1 安装正式版）: '
+        printf '  请输入 1 - 7 后回车（直接回车 = 1 安装正式版）: '
         menu_read ans || return 0
         case "$ans" in
             ""|1)  log_info "已选择：安装正式版"; return 0 ;;
@@ -740,7 +839,7 @@ interactive_channel_menu() {
             5)     echo ""
                    do_change_password
                    echo ""
-                   log_info "密码修改流程结束"
+                   log_info "凭据修改流程结束"
                    exit 0 ;;
             6)     echo ""
                    printf '  确认卸载 fwpanel？输入 yes 确认，其他内容取消: '
@@ -751,12 +850,14 @@ interactive_channel_menu() {
                        *) log_warn "已取消卸载（未做任何改动）" ;;
                    esac
                    exit 0 ;;
+            7)     do_show_login_info
+                   exit 0 ;;
             *)     tries=$((tries + 1))
                    if [ "$tries" -ge 3 ]; then
                        log_warn "输入无效，按默认处理：安装正式版"
                        return 0
                    fi
-                   log_warn "输入无效：$ans（请填 1 - 6）" ;;
+                   log_warn "输入无效：$ans（请填 1 - 7）" ;;
         esac
     done
 
@@ -984,13 +1085,15 @@ print_summary() {
     echo "  登录用户 : ${PANEL_USER}"
     echo "  登录密码 : ${PANEL_PASS}"
     echo "------------------------------------------------------------------"
-    echo "  ${C_RED}⚠ 凭据仅显示这一次，不会写入任何文件，请立即记下！${C_RESET}"
+    echo "  ${C_RED}⚠ 请立即记下以上凭据${C_RESET}（本机也留了一份：$ETC_DIR/credentials.json，仅 root 可读，"
+    echo "    忘记时可用本脚本菜单 7) 查看；不需要可删除该文件）"
     if [ -f "$0" ]; then
-        echo "  忘记密码: sudo bash $0 --change-password"
+        echo "  改用户名/密码: sudo bash $0 --change-password"
         echo "  升级 / 换通道: sudo bash $0（加 --beta 装测试版，--version vX.Y.Z 指定版本）"
     else
         # 管道模式（curl | sudo bash）下 $0 是 "bash"，直接引用会印出 "sudo bash bash ..." 这种不可用的命令
-        echo "  忘记密码: 重跑一键安装命令 → 菜单选 5) 改密码"
+        echo "  改用户名/密码: 重跑一键安装命令 → 菜单选 5) 改用户名密码"
+        echo "  查看登录凭据: 同一菜单 7) 查看登录信息（需 root）"
         echo "  升级 / 换通道: 重跑一键安装命令 → 菜单选 1 / 2 / 3（或加 --beta / --version vX.Y.Z）"
     fi
     echo "  面板内可修改密码；SSH(22) 始终放行防锁死"
@@ -1008,6 +1111,7 @@ do_install() {
     install_deps
     deploy_files
     write_config
+    record_local_credentials   # 明文凭据记到 $ETC_DIR/credentials.json(600)，供菜单 7 回查
     install_service
     print_summary
 }
@@ -1038,13 +1142,19 @@ do_uninstall() {
 
 do_change_password() {
     check_root
-    [ -f "$ETC_DIR/config.json" ] || error "面板未安装，无法修改密码"
-    log_info "交互式重置面板密码（至少 8 位，输入两遍确认）..."
-    # 管道模式（curl | sudo bash）下 stdin 是脚本自身，密码输入必须走 /dev/tty
+    [ -f "$ETC_DIR/config.json" ] || error "面板未安装，无法修改凭据"
+    local sub="reset-account"
+    if ! grep -q '"reset-account"' "$APP_DIR/panel.py" 2>/dev/null; then
+        # 旧版面板只有 reset-password（只能改密码）
+        sub="reset-password"
+        log_warn "当前面板版本较旧，本次只能改密码（不支持改用户名）；升级后可改用户名"
+    fi
+    log_info "交互式修改面板登录凭据（用户名/密码，直接回车 = 该项不改）..."
+    # 管道模式（curl | sudo bash）下 stdin 是脚本自身，输入必须走 /dev/tty
     if { : < /dev/tty; } 2>/dev/null; then
-        python3 "$APP_DIR/panel.py" reset-password < /dev/tty
+        python3 "$APP_DIR/panel.py" "$sub" < /dev/tty
     else
-        python3 "$APP_DIR/panel.py" reset-password
+        python3 "$APP_DIR/panel.py" "$sub"
     fi
 }
 
