@@ -633,6 +633,12 @@ grep -q 'CACHE="/tmp/fwtest/app/install.sh"' /tmp/fwtest/bin/fwp && ok "包装�
 grep -q 'exec bash "$CACHE"' /tmp/fwtest/bin/fwp && ok "包装器转交脚本执行（保留参数）" || bad "包装器缺少 exec 逻辑"
 grep -q 'id -u' /tmp/fwtest/bin/fwp && ok "非 root 时自动 sudo 提权" || bad "包装器缺提权逻辑"
 
+# ①b 菜单里会提示快捷入口（包装器存在时才提示；这里重建一份最小 PATH 的 stub 目录）
+rm -rf /tmp/fakebin_fwp && mkdir -p /tmp/fakebin_fwp
+for _c in bash sh sed head awk grep cat id uname dirname mktemp tee tail sort tr; do ln -sf "$(command -v "$_c")" "/tmp/fakebin_fwp/$_c"; done
+out=$(printf '8\n' | env -i PATH=/tmp/fakebin_fwp FW_MENU=1 HOME=/tmp bash -c 'source "$1"; ACTION=install; VERSION_TAG=""; BETA=0; YES=0; MENU_SRC=""; interactive_channel_menu' bash "$TMPF" 2>&1)
+case "$out" in *"快捷入口 : 以后直接输入 fwp"*) ok "菜单会提示 fwp 快捷入口" ;; *) bad "菜单没提示快捷入口" ;; esac
+
 # ② 管道模式：$0 是 "bash" → 按官方地址抓；抓到垃圾内容不得覆盖已有缓存
 mkdir -p /tmp/fwtest/fakebin /tmp/fwtest/badbin
 cat > /tmp/fwtest/fakebin/curl <<'FEOF'
@@ -665,7 +671,7 @@ case "$out" in *用法*|*Usage*) ok "联网失败仍能用本地缓存打开脚�
 env -i PATH=/usr/bin:/bin HOME=/tmp bash -c 'source "$1"; check_root() { :; }; systemctl() { return 1; }; do_uninstall' bash "$TMPF" >/dev/null 2>&1
 [ -e /tmp/fwtest/bin/fwp ] && bad "卸载后快捷命令仍在" || ok "卸载会删除快捷命令 fwp"
 [ -e /tmp/fwtest/app ] && bad "卸载后程序目录仍在" || ok "卸载会删除程序目录（缓存一并清掉）"
-rm -rf /tmp/fwtest
+rm -rf /tmp/fwtest /tmp/fakebin_fwp
 
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
