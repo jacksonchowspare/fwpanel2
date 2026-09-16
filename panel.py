@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.16"
+CURRENT_VERSION = "3.2.17"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 # 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
 THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
@@ -9611,7 +9611,15 @@ def cmd_reset_account():
         print("面板未初始化，请先运行安装脚本", file=sys.stderr)
         sys.exit(1)
     cfg = Config()
-    import getpass
+    try:
+        _interactive_change_account(cfg)
+    except (EOFError, KeyboardInterrupt):
+        print("\n输入被中断（没有读到完整内容），已取消 —— 未做任何修改", file=sys.stderr)
+        sys.exit(1)
+
+
+def _interactive_change_account(cfg):
+    import getpass          # 函数内 import 是局部名，helper 必须自己 import（曾漏掉→NameError）
     cur_user = cfg.get("username", "")
     print(f"当前用户名: {cur_user}（用户名：直接回车 = 不修改）")
     new_user = cur_user
@@ -9667,6 +9675,18 @@ def cmd_reset_password():
         sys.exit(1)
     cfg = Config()
     import getpass
+    try:
+        p1, p2 = _interactive_reset_password()
+    except (EOFError, KeyboardInterrupt):
+        print("\n输入被中断（没有读到完整内容），已取消 —— 未做任何修改", file=sys.stderr)
+        sys.exit(1)
+    cfg.set("password_hash", hash_password(p1))
+    _record_local_credentials(cfg.get("username", ""), p1)
+    print("密码已更新")
+
+
+def _interactive_reset_password():
+    import getpass
     while True:
         p1 = getpass.getpass("输入新密码（至少 8 位）: ")
         if len(p1) < 8:
@@ -9676,10 +9696,7 @@ def cmd_reset_password():
         if p1 != p2:
             print("两次输入不一致")
             continue
-        break
-    cfg.set("password_hash", hash_password(p1))
-    _record_local_credentials(cfg.get("username", ""), p1)
-    print("密码已更新")
+        return p1, p2
 
 
 def cmd_apply(config):

@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.16"
+readonly SCRIPT_VERSION="3.2.17"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -716,7 +716,7 @@ EOF
     fi
     echo "  用户名   : ${user:-（未设置）}"
 
-    pw=""; updated=""
+    pw=""; updated=""; note=""
     if [ -f "$ETC_DIR/credentials.json" ]; then
         pw="$(python3 - "$ETC_DIR/credentials.json" <<'EOF' 2>/dev/null || true
 import json, sys
@@ -734,12 +734,25 @@ except Exception:
     pass
 EOF
 )"
+        note="$(python3 - "$ETC_DIR/credentials.json" <<'EOF' 2>/dev/null || true
+import json, sys
+try:
+    print(json.load(open(sys.argv[1])).get("note", ""))
+except Exception:
+    pass
+EOF
+)"
     fi
     if [ -n "$pw" ]; then
         echo "  密码     : $pw"
         [ -n "$updated" ] && echo "             （本机记录时间: $updated）"
     else
-        echo "  密码     : 未记录明文（面板只存 pbkdf2 哈希，无法反查）"
+        echo "  密码     : 未记录明文"
+        if [ -n "$note" ]; then
+            echo "             $note"
+        else
+            echo "             （面板只存 pbkdf2 哈希，无法反查）"
+        fi
         echo "             需要可用得会：菜单 5) 修改用户名和密码 设一个新的（会同时记录到本机）"
     fi
     echo ""
@@ -1156,6 +1169,34 @@ do_change_password() {
     else
         python3 "$APP_DIR/panel.py" "$sub"
     fi
+    if [ "$sub" = "reset-password" ]; then
+        # 旧版面板不会回传新密码 → 把本机记录里的密码清掉并标注，
+        # 避免菜单「查看登录信息」继续显示那个已经作废的旧密码
+        mark_credentials_stale
+    fi
+}
+
+mark_credentials_stale() {
+    python3 - "$ETC_DIR/credentials.json" <<'EOF' 2>/dev/null || true
+import datetime, json, os, sys
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as f:
+        d = json.load(f)
+except Exception:
+    sys.exit(0)
+if not isinstance(d, dict):
+    sys.exit(0)
+d["password"] = ""
+d["note"] = "密码已在本机修改过（旧版面板未回传新密码），这里不再显示旧密码"
+d["updated_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+tmp = path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(d, f, ensure_ascii=False, indent=2)
+os.chmod(tmp, 0o600)
+os.replace(tmp, path)
+EOF
+    log_info "本机凭据记录里的密码已标记为失效（旧版面板不回传新密码）"
 }
 
 # ============================== 入口 ==============================

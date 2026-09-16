@@ -6188,6 +6188,26 @@ class TestResetAccount(unittest.TestCase):
     def test_read_local_credentials_missing_returns_empty(self):
         self.assertEqual(panel._read_local_credentials(), {})
 
+    def test_reset_account_eof_is_graceful(self):
+        """输入被中断（管道里没给够输入 / Ctrl+D）要干净退出，不能抛 traceback"""
+        self._seed_config()
+        with unittest.mock.patch("builtins.input", side_effect=EOFError), \
+             unittest.mock.patch("getpass.getpass", side_effect=EOFError):
+            with self.assertRaises(SystemExit) as cm:
+                panel.cmd_reset_account()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(self._disk()["username"], "olduser", "中断后不应改动配置")
+        self.assertFalse(os.path.exists(self.cred_path))
+
+    def test_reset_password_eof_is_graceful(self):
+        self._seed_config()
+        before = self._disk()["password_hash"]
+        with unittest.mock.patch("getpass.getpass", side_effect=EOFError):
+            with self.assertRaises(SystemExit) as cm:
+                panel.cmd_reset_password()
+        self.assertEqual(cm.exception.code, 1)
+        self.assertEqual(self._disk()["password_hash"], before, "中断后不应改动密码")
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -545,6 +545,19 @@ infoline "菜单 5) 修改用户名和密码" "无凭据记录时指向菜单 5"
 # 该功能需要 root：check_root 必须被调用
 grep -q "do_show_login_info() {" /tmp/fwinfo/install_info.sh &&     sed -n '/^do_show_login_info()/,/^}/p' /tmp/fwinfo/install_info.sh | head -3 | grep -q "check_root" \
     && ok "查看登录信息前先 check_root（需 root 权限）" || bad "缺少 check_root 保护"
+# 旧版面板（无 reset-account）改完密码：本机记录里的旧密码必须作废 + 标注，不能让菜单 7 显示过期密码
+cat > /tmp/fwinfo/etc/credentials.json <<'EOF'
+{"username": "jackson", "password": "StaleWrongPw", "updated_at": "2026-09-16 20:30:00"}
+EOF
+env -i PATH=/usr/bin:/bin HOME=/root bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; mark_credentials_stale' >/dev/null 2>&1
+if python3 -c "
+import json,sys
+d = json.load(open('/tmp/fwinfo/etc/credentials.json'))
+sys.exit(0 if d.get('password') == '' and '旧版面板' in d.get('note','') else 1)
+"; then ok "旧版面板改密后：本机记录里的旧密码已清空并标注"; else bad "旧密码没被作废（菜单 7 会显示过期密码）"; fi
+out3=$(env -i PATH=/usr/bin:/bin HOME=/root bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; do_show_login_info' 2>&1)
+infoline "旧版面板未回传新密码" "菜单 7 显示「已作废」说明而不是过期密码" "$out3"
+case "$out3" in *StaleWrongPw*) bad "菜单 7 仍然把过期密码显示出来了" ;; *) ok "菜单 7 不再显示过期密码" ;; esac
 rm -rf /tmp/fwinfo
 
 echo "== 安装摘要文案：管道模式不得印出「sudo bash bash …」 =="
