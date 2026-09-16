@@ -644,6 +644,45 @@ grep -q "run_with_timeout 4 curl" <(sed -n '/^menu_preview_tag() {/,/^}/p' "$SCR
     && ok "menu_preview_tag 用 run_with_timeout 4（不再是 12 秒 × 2 次）" || bad "预览查询缺少硬超时"
 grep -q "网络不通会自动跳过" "$SCRIPT" && ok "菜单先给出可见的查询提示（不是黑屏干等）" || bad "菜单没有查询提示"
 
+echo "== 原子落盘：升级时不会让面板读到半截 index.html =="
+mkdir -p /tmp/fwatom/dst
+python3 - <<'PYEOF'
+open("/tmp/fwatom/old.html","w").write("OLD" * 200000)
+open("/tmp/fwatom/new.html","w").write("NEW" * 200000)
+PYEOF
+printf 'old-content\n' > /tmp/fwatom/dst/index.html
+atomic_put /tmp/fwatom/new.html /tmp/fwatom/dst/index.html 644
+cmp -s /tmp/fwatom/dst/index.html /tmp/fwatom/new.html \
+    && ok "atomic_put 完成内容替换" || bad "atomic_put 内容不对"
+[ "$(stat -c %a /tmp/fwatom/dst/index.html)" = "644" ] && ok "atomic_put 设置了权限 644" || bad "权限不对"
+ls /tmp/fwatom/dst/.index.html.new.* >/dev/null 2>&1 && bad "atomic_put 留下临时文件垃圾" || ok "atomic_put 不留临时文件"
+# 关键性质：替换过程中并发读取，只能读到"完整旧版"或"完整新版"，绝不会有半截
+( for i in $(seq 1 400); do md5sum /tmp/fwatom/dst/index.html 2>/dev/null | awk '{print $1}'; done > /tmp/fwatom/seen.txt ) &
+reader=$!
+for i in $(seq 1 12); do atomic_put /tmp/fwatom/new.html /tmp/fwatom/dst/index.html 644; done
+wait $reader
+old_md5=$(md5sum /tmp/fwatom/old.html | awk '{print $1}')
+new_md5=$(md5sum /tmp/fwatom/new.html | awk '{print $1}')
+bad_reads=$(grep -vc -e "^$old_md5$" -e "^$new_md5$" /tmp/fwatom/seen.txt || true)
+[ "$bad_reads" = "0" ] && ok "并发读取 400 次全部是完整文件（原子替换生效）" \
+    || bad "有 $bad_reads 次读到半截文件"
+# 对照：原来的 cp 覆盖方式会读到半截（证明这个修复不是想当然）
+( for i in $(seq 1 400); do md5sum /tmp/fwatom/dst/index.html 2>/dev/null | awk '{print $1}'; done > /tmp/fwatom/seen_cp.txt ) &
+reader=$!
+for i in $(seq 1 12); do cp /tmp/fwatom/new.html /tmp/fwatom/dst/index.html; done
+wait $reader
+cp_bad=$(grep -vc -e "^$old_md5$" -e "^$new_md5$" /tmp/fwatom/seen_cp.txt || true)
+echo "    （对照）旧写法 cp 覆盖时读到半截的次数: $cp_bad"
+rm -rf /tmp/fwatom
+
+echo "== install.sh 部署静态文件必须走原子替换 =="
+grep -q 'cp "$tmpdir/index.html" "$APP_DIR/static/index.html"' "$SCRIPT" \
+    && bad "升级路径仍是 cp 直接覆盖（会产生半截文件）" || ok "升级路径已改为原子替换"
+grep -q 'install -m 644 "$src_html" "$APP_DIR/static/index.html"' "$SCRIPT" \
+    && bad "deploy_files 仍是 install 直接覆盖" || ok "deploy_files 已改为原子替换"
+grep -q 'atomic_put "$src_html" "$APP_DIR/static/index.html" 644' "$SCRIPT" \
+    && ok "index.html 走 atomic_put" || bad "index.html 没走 atomic_put"
+
 echo "== run_with_timeout：硬超时能杀掉卡死进程（网络黑洞场景）=="
 cat > /tmp/fwtest_hang.sh <<'HEOF'
 #!/bin/sh

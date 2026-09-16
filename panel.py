@@ -54,12 +54,44 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.26"
+CURRENT_VERSION = "3.2.27"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 # 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
 THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
              "vibes-light", "vibes-dark", "pixel-light", "pixel-dark")
 THEME_DEFAULT = "dark"
+
+
+def atomic_install(src, dst, mode=0o644):
+    """把 src 覆盖到 dst：先写同目录临时文件，再 os.replace 原子替换。
+
+    ⚠ 不要用 shutil.copy2 / cp 直接覆盖运行中的静态文件：那是"先截断再写"，
+    升级过程中正好打开面板，就会拿到半截 index.html —— 内联主脚本语法错误，
+    登录页弹"页面加载受阻"（用户实测）。原子替换后，读到的要么是旧完整版、要么是新完整版。
+    """
+    d = os.path.dirname(dst) or "."
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, ".%s.new-%d" % (os.path.basename(dst), os.getpid()))
+    try:
+        shutil.copyfile(src, tmp)
+        os.chmod(tmp, mode)
+        os.replace(tmp, dst)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def _safe_theme_name(raw, fallback):
+    """注入到 <script> 字符串里的主题名必须做白名单校验：
+    值里带引号/换行会把 window.__SERVER_THEME__ = "..."; 这行搞成语法错误，
+    整段内联主脚本都跑不起来（表现同样是登录页"页面加载受阻"）。"""
+    v = (raw or "").strip()
+    if v and re.fullmatch(r"[A-Za-z0-9_-]{1,32}", v):
+        return v
+    return fallback
 
 
 def get_theme(config):
@@ -881,13 +913,12 @@ def perform_upgrade(tag=None):
         if os.path.exists(panel_logo):
             shutil.copy2(panel_logo, backup_logo)
         # 替换
-        os.chmod(new_py, 0o755)
-        shutil.copy2(new_py, panel_py)
-        shutil.copy2(new_html, panel_html)
+        atomic_install(new_py, panel_py, 0o755)
+        atomic_install(new_html, panel_html, 0o644)
         if new_logo and os.path.exists(new_logo):
-            shutil.copy2(new_logo, panel_logo)
+            atomic_install(new_logo, panel_logo, 0o644)
         if new_ico and os.path.exists(new_ico):
-            shutil.copy2(new_ico, panel_ico)
+            atomic_install(new_ico, panel_ico, 0o644)
         # 子资源部署（v2.1.20）：vendor / fonts 整目录复制到 static/（缺失跳过）
         for sub in ("vendor", "fonts"):
             src_dir = os.path.join(tmpdir, "static", sub)
@@ -896,20 +927,20 @@ def perform_upgrade(tag=None):
                 os.makedirs(dst_dir, exist_ok=True)
                 for fn in os.listdir(src_dir):
                     try:
-                        shutil.copy2(os.path.join(src_dir, fn), os.path.join(dst_dir, fn))
+                        atomic_install(os.path.join(src_dir, fn), os.path.join(dst_dir, fn), 0o644)
                     except Exception:
                         pass
     except Exception as e:
         # 失败回滚
         try:
             if os.path.exists(backup_py):
-                shutil.copy2(backup_py, panel_py)
+                atomic_install(backup_py, panel_py, 0o755)
             if os.path.exists(backup_html):
-                shutil.copy2(backup_html, panel_html)
+                atomic_install(backup_html, panel_html, 0o644)
             if os.path.exists(backup_logo):
-                shutil.copy2(backup_logo, panel_logo)
+                atomic_install(backup_logo, panel_logo, 0o644)
             if os.path.exists(backup_ico):
-                shutil.copy2(backup_ico, panel_ico)
+                atomic_install(backup_ico, panel_ico, 0o644)
         except Exception:
             pass
         return False, f"升级失败，已自动回滚: {e}"
@@ -7209,7 +7240,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             data = data.replace(b"__VERSION__", CURRENT_VERSION.encode())
             # 主题也在服务端注入：换浏览器/清掉本地数据后，首帧依然是用户选的主题
             try:
-                _t = get_theme(self.server.config).encode()
+                _t = _safe_theme_name(get_theme(self.server.config), THEME_DEFAULT).encode()
             except Exception:
                 _t = THEME_DEFAULT.encode()
             try:

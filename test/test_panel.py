@@ -6380,5 +6380,63 @@ class TestFrontendWiring(unittest.TestCase):
             self.assertIn("confirmPanel(", _js_fn_body(self.html, fn), fn + " 丢了确认弹窗")
 
 
+class TestAtomicDeploy(unittest.TestCase):
+    """v3.2.27：部署静态文件必须原子替换（半截 index.html → 登录页"页面加载受阻"）"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fwatomic-")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_atomic_install_replaces_content_and_mode(self):
+        src = os.path.join(self.tmp, "new.html")
+        dst = os.path.join(self.tmp, "index.html")
+        with open(src, "w") as f:
+            f.write("NEW" * 1000)
+        with open(dst, "w") as f:
+            f.write("OLD" * 1000)
+        panel.atomic_install(src, dst, 0o644)
+        self.assertEqual(open(dst).read(), "NEW" * 1000)
+        self.assertEqual(oct(os.stat(dst).st_mode & 0o777), "0o644")
+        leftovers = [f for f in os.listdir(self.tmp) if ".new-" in f]
+        self.assertFalse(leftovers, "不应留下临时文件：" + str(leftovers))
+
+    def test_atomic_install_never_yields_partial_file(self):
+        """替换过程中旧读者仍看到完整旧内容（说明是 rename 而不是原地截断）"""
+        src = os.path.join(self.tmp, "new.html")
+        dst = os.path.join(self.tmp, "index.html")
+        with open(src, "w") as f:
+            f.write("NEW" * 5000)
+        with open(dst, "w") as f:
+            f.write("OLD" * 5000)
+        with open(dst) as fd:               # 替换前打开的老句柄
+            panel.atomic_install(src, dst, 0o644)
+            self.assertEqual(fd.read(), "OLD" * 5000, "老句柄读到的应是完整旧内容")
+        with open(dst) as fd:
+            self.assertEqual(fd.read(), "NEW" * 5000)
+
+    def test_upgrade_path_uses_atomic_install(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "panel.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("atomic_install(new_html, panel_html", src)
+        self.assertNotIn("shutil.copy2(new_html, panel_html)", src,
+                         "面板内升级又改回非原子覆盖了")
+        self.assertNotIn("shutil.copy2(backup_html, panel_html)", src,
+                         "回滚也要原子（否则回滚瞬间同样是半截文件）")
+
+    def test_theme_injection_is_sanitized(self):
+        """主题名会被注入到 <script> 字符串里，带引号会毁掉整段主脚本"""
+        self.assertEqual(panel._safe_theme_name('dark";alert(1)//', "dark"), "dark")
+        self.assertEqual(panel._safe_theme_name("", "dark"), "dark")
+        self.assertEqual(panel._safe_theme_name("neon-dark_2", "dark"), "neon-dark_2")
+        self.assertEqual(panel._safe_theme_name("好" * 40, "dark"), "dark")
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "panel.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn("_safe_theme_name(get_theme(", src, "服务端注入主题前没有做白名单校验")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.26"
+readonly SCRIPT_VERSION="3.2.27"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -233,14 +233,14 @@ do_upgrade() {
     cp "$APP_DIR/panel.py" "$bak" 2>/dev/null && log_info "已备份旧版本: $bak"
     ls -t "$APP_DIR"/panel.py.bak.* 2>/dev/null | tail -n +4 | xargs -r rm -f
     # 覆盖安装
-    cp "$tmpdir/panel.py" "$APP_DIR/panel.py"
+    atomic_put "$tmpdir/panel.py" "$APP_DIR/panel.py" 755
     if [ -s "$tmpdir/index.html" ]; then
         mkdir -p "$APP_DIR/static"
-        cp "$tmpdir/index.html" "$APP_DIR/static/index.html"
+        atomic_put "$tmpdir/index.html" "$APP_DIR/static/index.html" 644
     fi
     if [ -s "$tmpdir/github-logo.png" ]; then
         mkdir -p "$APP_DIR/static"
-        cp "$tmpdir/github-logo.png" "$APP_DIR/static/github-logo.png"
+        atomic_put "$tmpdir/github-logo.png" "$APP_DIR/static/github-logo.png" 644
     fi
     if [ -s "$tmpdir/install.sh" ] && [ -f "$0" ]; then
         # 仅当 $0 是实体脚本文件时才就地更新它——管道模式（curl | sudo bash）下 $0 是 "bash"，
@@ -249,11 +249,11 @@ do_upgrade() {
     fi
     if [ -d "$tmpdir/fonts" ]; then
         mkdir -p "$APP_DIR/static/fonts"
-        cp "$tmpdir/fonts/"*.woff2 "$APP_DIR/static/fonts/" 2>/dev/null || true
+        atomic_put_dir "$tmpdir/fonts" "$APP_DIR/static/fonts"
     fi
     if [ -d "$tmpdir/vendor" ]; then
         mkdir -p "$APP_DIR/static/vendor"
-        cp "$tmpdir/vendor/"*.js "$tmpdir/vendor/"*.css "$APP_DIR/static/vendor/" 2>/dev/null || true
+        atomic_put_dir "$tmpdir/vendor" "$APP_DIR/static/vendor"
     fi
     rm -rf "$tmpdir"
     # 语法校验
@@ -805,6 +805,27 @@ run_with_timeout() {   # $1=秒数，其余=要执行的命令；硬超时（能
 }
 
 
+atomic_put() {   # $1=源文件 $2=目标文件 $3=权限（默认 644）
+    # 先写同目录临时文件再 mv -f 原子替换。⚠ 别直接 cp 覆盖正在被面板读取的静态文件：
+    # cp 是"先截断再写"，升级时正好打开面板就会拿到半截 index.html → 内联脚本语法错误 →
+    # 登录页弹"页面加载受阻"（用户实测）。
+    local src="$1" dst="$2" mode="${3:-644}" tmp
+    [ -s "$src" ] || return 1
+    tmp="$(dirname "$dst")/.$(basename "$dst").new.$$"
+    install -m "$mode" "$src" "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+    mv -f "$tmp" "$dst"
+}
+
+atomic_put_dir() {   # $1=源目录 $2=目标目录：逐个原子替换（不动源里没有的旧文件）
+    local src="$1" dst="$2" f
+    [ -d "$src" ] || return 0
+    mkdir -p "$dst"
+    for f in "$src"/*; do
+        [ -f "$f" ] || continue
+        atomic_put "$f" "$dst/$(basename "$f")" 644 || log_warn "部署失败: $(basename "$f")"
+    done
+}
+
 cleanup_plaintext_credentials() {
     if [ -f "$ETC_DIR/credentials.json" ]; then
         rm -f "$ETC_DIR/credentials.json" "$ETC_DIR/credentials.json.tmp" 2>/dev/null || true
@@ -1095,24 +1116,24 @@ deploy_files() {
     fi
 
     mkdir -p "$APP_DIR/static"
-    install -m 755 "$src_py" "$APP_DIR/panel.py"
-    install -m 644 "$src_html" "$APP_DIR/static/index.html"
+    atomic_put "$src_py" "$APP_DIR/panel.py" 755
+    atomic_put "$src_html" "$APP_DIR/static/index.html" 644
     if [ -f "$src_ico" ]; then
-        install -m 644 "$src_ico" "$APP_DIR/static/favicon.ico"
+        atomic_put "$src_ico" "$APP_DIR/static/favicon.ico" 644
     fi
     # 字体目录:本地(tar/目录)安装直接复制;管道安装已下载到 tmp_src
     local fonts_src="$script_dir/static/fonts"
     if [ -n "$tmp_src" ]; then fonts_src="$tmp_src/static/fonts"; fi
     if [ -d "$fonts_src" ]; then
         mkdir -p "$APP_DIR/static/fonts"
-        cp -f "$fonts_src/"*.woff2 "$APP_DIR/static/fonts/" 2>/dev/null || true
+        atomic_put_dir "$fonts_src" "$APP_DIR/static/fonts"
     fi
     # vendor（xterm.js 等）:本地(tar/目录)安装直接复制;管道安装已下载到 tmp_src
     local vendor_src="$script_dir/static/vendor"
     if [ -n "$tmp_src" ]; then vendor_src="$tmp_src/static/vendor"; fi
     if [ -d "$vendor_src" ]; then
         mkdir -p "$APP_DIR/static/vendor"
-        cp -f "$vendor_src/"*.js "$vendor_src/"*.css "$APP_DIR/static/vendor/" 2>/dev/null || true
+        atomic_put_dir "$vendor_src" "$APP_DIR/static/vendor"
     fi
     [ -n "$tmp_src" ] && rm -rf "$tmp_src"
     log_info "文件部署完成"
