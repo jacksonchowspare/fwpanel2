@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.13"
+readonly SCRIPT_VERSION="3.2.14"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -239,7 +239,9 @@ do_upgrade() {
         mkdir -p "$APP_DIR/static"
         cp "$tmpdir/github-logo.png" "$APP_DIR/static/github-logo.png"
     fi
-    if [ -s "$tmpdir/install.sh" ]; then
+    if [ -s "$tmpdir/install.sh" ] && [ -f "$0" ]; then
+        # 仅当 $0 是实体脚本文件时才就地更新它——管道模式（curl | sudo bash）下 $0 是 "bash"，
+        # 无脑 cp 会在当前目录造出一个名为 bash 的垃圾文件
         cp "$tmpdir/install.sh" "$0" 2>/dev/null || true
     fi
     if [ -d "$tmpdir/fonts" ]; then

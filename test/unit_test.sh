@@ -397,6 +397,32 @@ else
 fi
 rm -rf /tmp/fakebin_menu
 
+echo "== do_upgrade：正式版 2.1.33 选测试版 = 升级（不是跳过） =="
+# 用户实测场景：机器上装的是正式版，菜单选「安装测试版」应升级过去而不是被防降级拦住
+mkdir -p /tmp/fwupg-cur /tmp/fwupg-tmp
+echo 'CURRENT_VERSION = "2.1.33"' > /tmp/fwupg-cur/panel.py
+head -n -1 "$SCRIPT" | sed 's|readonly APP_DIR="/usr/local/lib/fwpanel"|readonly APP_DIR="/tmp/fwupg-cur"|' > /tmp/install_funcs_ug.sh
+mkdir -p /tmp/fwupg-cwd        # 受控工作目录：升级不得在 CWD 造垃圾文件
+( cd /tmp/fwupg-cwd && bash -c '
+source /tmp/install_funcs_ug.sh
+VERSION_TAG=""; BETA=1; SRC_TAG="v9.9.9"
+curl() {   # 只让 panel.py 下载成功（内容 3.2.13），其余文件下载失败走 warn 分支
+  if [[ "$*" == *"/panel.py"* && "$*" == *"-o"* ]]; then
+    printf "#!/usr/bin/env python3\nCURRENT_VERSION = \"3.2.13\"\n" > "$(echo "$*" | grep -oP "(?<=-o )\S+")"
+    return 0
+  fi
+  return 1
+}
+mktemp() { echo /tmp/fwupg-tmp; }
+systemctl() { return 0; }
+out=$(do_upgrade 2>&1)
+echo "$out" | grep -q "升级 v2.1.33 → v3.2.13" && echo "  ✓ 正式版 → 测试版 走「升级」（v2.1.33 → v3.2.13）" || { echo "  ✗ 未升级: $out"; exit 1; }
+grep -q "3.2.13" /tmp/fwupg-cur/panel.py && echo "  ✓ 磁盘 panel.py 已变成 3.2.13" || { echo "  ✗ 磁盘未更新"; exit 1; }
+ls /tmp/fwupg-cur/panel.py.bak.* >/dev/null 2>&1 && echo "  ✓ 升级前已备份旧版本（可回滚）" || { echo "  ✗ 没有备份"; exit 1; }
+[ -e bash ] && { echo "  ✗ CWD 里被写入了垃圾文件 bash"; exit 1; } || echo "  ✓ 管道模式不会在 CWD 造出名为 bash 的垃圾文件（\$0 非实体文件时跳过）"
+' )
+rm -rf /tmp/fwupg-cur /tmp/fwupg-tmp /tmp/fwupg-cwd /tmp/install_funcs_ug.sh
+
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
 rm -f "$TMPF" /tmp/install_funcs_fw.sh
