@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.17"
+CURRENT_VERSION = "3.2.18"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 # 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
 THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
@@ -9569,43 +9569,11 @@ class PanelServer(ThreadingHTTPServer):
         self.auth = auth
 
 
-LOCAL_CRED_FILE = os.path.join(BASE_DIR, "credentials.json")
-
-
-def _record_local_credentials(username, password):
-    """把明文凭据记到 config 同目录的 credentials.json（0600，仅 root 可读）。
-
-    用途：安装脚本菜单「7) 查看面板登录信息」——出问题时本机 root 能直接查回用户名/密码。
-    明文只落在这一处，不留别的副本；不想要这个便利可以直接删除该文件（面板功能不受影响）。
-    """
-    try:
-        os.makedirs(BASE_DIR, exist_ok=True)
-        tmp = LOCAL_CRED_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"username": username, "password": password,
-                       "updated_at": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")},
-                      f, ensure_ascii=False, indent=2)
-        os.chmod(tmp, 0o600)
-        os.replace(tmp, LOCAL_CRED_FILE)
-    except Exception as exc:  # 记录失败不影响改密本身
-        print(f"（提示：本地凭据记录写入失败: {exc}）", file=sys.stderr)
-
-
-def _read_local_credentials():
-    """读回本机凭据记录；不存在或读不出返回 {}"""
-    try:
-        with open(LOCAL_CRED_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
-
-
 def cmd_reset_account():
     """交互式修改用户名和/或密码（安装脚本菜单「5) 修改用户名和密码」调用）。
 
-    两项都可以不动（直接回车跳过）；改了哪项就更新哪项，明文同时记到 credentials.json
-    供菜单「查看登录信息」回查。
+    两项都可以不动（直接回车跳过）；改了哪项就更新哪项。
+    明文不落盘：配置里只写 pbkdf2 哈希（与安装脚本写入方式一致）。
     """
     if not os.path.exists(CONFIG_FILE):
         print("面板未初始化，请先运行安装脚本", file=sys.stderr)
@@ -9661,11 +9629,8 @@ def _interactive_change_account(cfg):
     if not changed:
         print("未做任何修改")
         return
-    recorded_pw = new_pw or _read_local_credentials().get("password", "")
-    _record_local_credentials(new_user, recorded_pw)
     print(f"已更新: {'、'.join(changed)}（用户名: {new_user}）")
-    if not new_pw:
-        print("提示：本次没改密码，本机记录里保留的是上次记录的密码明文")
+    print("（明文密码不落盘：只保存哈希，请自行记好）")
 
 
 def cmd_reset_password():
@@ -9681,7 +9646,6 @@ def cmd_reset_password():
         print("\n输入被中断（没有读到完整内容），已取消 —— 未做任何修改", file=sys.stderr)
         sys.exit(1)
     cfg.set("password_hash", hash_password(p1))
-    _record_local_credentials(cfg.get("username", ""), p1)
     print("密码已更新")
 
 

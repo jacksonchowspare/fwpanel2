@@ -516,48 +516,40 @@ fi
 
 rm -rf /tmp/fakebin_cred
 
-echo "== 菜单 7) 查看登录信息：地址/反代域名/用户名/密码（含缺失凭据记录的情况） =="
+echo "== 菜单 7) 查看登录信息：只显示地址/用户名，密码只能重设（不保存明文） =="
 rm -rf /tmp/fwinfo && mkdir -p /tmp/fwinfo/etc
 cat > /tmp/fwinfo/etc/config.json <<'EOF'
 {"port": 17890, "bind": "0.0.0.0", "username": "jackson", "mode": "strict"}
 EOF
-cat > /tmp/fwinfo/etc/credentials.json <<'EOF'
-{"username": "jackson", "password": "MyPanel2026", "updated_at": "2026-09-16 20:30:00"}
-EOF
 cat > /tmp/fwinfo/etc/proxies.json <<'EOF'
 [{"domain": "sg1panel.isusz.com", "target_port": 17890, "ssl": false, "cert_ref": "sg1panel.isusz.com"}]
 EOF
+# 旧版本（v3.2.16/17）留下的明文凭据文件：重跑脚本必须清理掉
+cat > /tmp/fwinfo/etc/credentials.json <<'EOF'
+{"username": "jackson", "password": "ShouldBeDeleted", "updated_at": "2026-09-16 20:30:00"}
+EOF
 head -n -1 "$SCRIPT" | sed 's|readonly ETC_DIR="/etc/fwpanel"|readonly ETC_DIR="/tmp/fwinfo/etc"|' > /tmp/fwinfo/install_info.sh
-infoline() {  # $1=要匹配的片段 $2=说明
+infoline() {  # $1=匹配片段 $2=说明 $3=输出
     local out="$3"
     case "$out" in *"$1"*) ok "$2" ;; *) bad "$2 —— 输出里没有「$1」: $(printf '%s' "$out" | tail -8)" ;; esac
 }
-out=$(env -i PATH=/usr/bin:/bin HOME=/root bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; do_show_login_info' 2>&1)
+# 直接回车：只看信息，返回
+out=$(printf '\n' | env -i PATH=/usr/bin:/bin HOME=/root FW_MENU=1 bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; do_show_login_info' 2>&1)
 infoline ":17890" "显示面板地址（含端口）" "$out"
 infoline "反代地址 : https://sg1panel.isusz.com" "显示反代域名（cert_ref 复用证书 → https）" "$out"
 infoline "用户名   : jackson" "显示用户名" "$out"
-infoline "密码     : MyPanel2026" "显示密码（来自本机 credentials.json）" "$out"
-# 没有凭据记录时必须说清楚（老版本装的机器），并给出可行指引
-rm -f /tmp/fwinfo/etc/credentials.json
-out2=$(env -i PATH=/usr/bin:/bin HOME=/root bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; do_show_login_info' 2>&1)
-infoline "未记录明文" "无凭据记录时说明密码不可反查" "$out2"
-infoline "菜单 5) 修改用户名和密码" "无凭据记录时指向菜单 5" "$out2"
-# 该功能需要 root：check_root 必须被调用
-grep -q "do_show_login_info() {" /tmp/fwinfo/install_info.sh &&     sed -n '/^do_show_login_info()/,/^}/p' /tmp/fwinfo/install_info.sh | head -3 | grep -q "check_root" \
+infoline "不保存明文" "密码栏说明不保存明文、无法反查" "$out"
+infoline "按 r 回车" "给出重设入口（等同菜单 5）" "$out"
+case "$out" in *ShouldBeDeleted*) bad "竟然把旧版留下的明文密码显示出来了" ;; *) ok "不显示任何明文密码" ;; esac
+# 输入 r → 进入重设流程（用 stub 断言分发）
+out_r=$(printf 'r\n' | env -i PATH=/usr/bin:/bin HOME=/root FW_MENU=1 bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; do_change_password() { echo "DO_CHANGE_PW_CALLED"; }; do_show_login_info' 2>&1)
+case "$out_r" in *DO_CHANGE_PW_CALLED*) ok "输入 r → 直接进入重设流程（不用回菜单）" ;; *) bad "r 入口未生效: $out_r" ;; esac
+# 清理旧版遗留的明文凭据文件
+env -i PATH=/usr/bin:/bin HOME=/root bash -c 'source /tmp/fwinfo/install_info.sh; cleanup_plaintext_credentials' >/dev/null 2>&1
+[ -f /tmp/fwinfo/etc/credentials.json ] && bad "旧版明文凭据文件没被清理" || ok "重跑脚本会清理旧版留下的明文凭据文件"
+# 该功能需要 root
+sed -n '/^do_show_login_info()/,/^}/p' /tmp/fwinfo/install_info.sh | head -3 | grep -q "check_root" \
     && ok "查看登录信息前先 check_root（需 root 权限）" || bad "缺少 check_root 保护"
-# 旧版面板（无 reset-account）改完密码：本机记录里的旧密码必须作废 + 标注，不能让菜单 7 显示过期密码
-cat > /tmp/fwinfo/etc/credentials.json <<'EOF'
-{"username": "jackson", "password": "StaleWrongPw", "updated_at": "2026-09-16 20:30:00"}
-EOF
-env -i PATH=/usr/bin:/bin HOME=/root bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; mark_credentials_stale' >/dev/null 2>&1
-if python3 -c "
-import json,sys
-d = json.load(open('/tmp/fwinfo/etc/credentials.json'))
-sys.exit(0 if d.get('password') == '' and '旧版面板' in d.get('note','') else 1)
-"; then ok "旧版面板改密后：本机记录里的旧密码已清空并标注"; else bad "旧密码没被作废（菜单 7 会显示过期密码）"; fi
-out3=$(env -i PATH=/usr/bin:/bin HOME=/root bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; do_show_login_info' 2>&1)
-infoline "旧版面板未回传新密码" "菜单 7 显示「已作废」说明而不是过期密码" "$out3"
-case "$out3" in *StaleWrongPw*) bad "菜单 7 仍然把过期密码显示出来了" ;; *) ok "菜单 7 不再显示过期密码" ;; esac
 rm -rf /tmp/fwinfo
 
 echo "== 安装摘要文案：管道模式不得印出「sudo bash bash …」 =="

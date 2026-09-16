@@ -6085,23 +6085,22 @@ class TestSystem(unittest.TestCase):
 
 
 class TestResetAccount(unittest.TestCase):
-    """reset-account 子命令（安装脚本菜单 5：改用户名/密码）+ 本机凭据记录（菜单 7 回查）"""
+    """reset-account / reset-password 子命令（安装脚本菜单 5）+ 明文不落盘"""
 
     def setUp(self):
-        self.bak_dir = panel.BASE_DIR            # FW_TEST_DIR
         self.cfg_path = panel.CONFIG_FILE
-        self.cred_path = panel.LOCAL_CRED_FILE
-        # 本文件全局把 Config.__init__ 换成空 dict（避免读真实配置）；本类要验证“改凭据不动其他字段”，
+        self.plain_path = os.path.join(os.path.dirname(self.cfg_path), "credentials.json")
+        # 本文件全局把 Config.__init__ 换成空 dict（避免读真实配置）；本类要验证「改凭据不动其他字段」，
         # 必须恢复成真实行为：先读盘再整表回写（Config.set 是 self.data[key]=v + save 全量写回）
         self._patched_init = panel.Config.__init__
         panel.Config.__init__ = lambda self: setattr(self, "data", self._load())
-        for f in (self.cfg_path, self.cred_path):
+        for f in (self.cfg_path, self.plain_path):
             if os.path.exists(f):
                 os.remove(f)
 
     def tearDown(self):
         panel.Config.__init__ = self._patched_init
-        for f in (self.cfg_path, self.cred_path, self.cred_path + ".tmp"):
+        for f in (self.cfg_path, self.plain_path):
             if os.path.exists(f):
                 os.remove(f)
 
@@ -6123,70 +6122,54 @@ class TestResetAccount(unittest.TestCase):
 
     def test_reset_account_changes_username_and_password(self):
         self._seed_config()
-        # input: 新用户名 + 再次确认；getpass: 新密码 + 再次确认
         self._run(["newuser", "newuser"], ["NewPass456", "NewPass456"])
-        with open(self.cfg_path, encoding="utf-8") as f:
-            disk = json.load(f)
+        disk = self._disk()
         self.assertEqual(disk["username"], "newuser")
         self.assertTrue(panel.verify_password("NewPass456", disk["password_hash"]))
         self.assertFalse(panel.verify_password("OldPass123", disk["password_hash"]))
-        with open(self.cred_path, encoding="utf-8") as f:
-            cred = json.load(f)
-        self.assertEqual(cred["username"], "newuser")
-        self.assertEqual(cred["password"], "NewPass456")          # 菜单 7 靠它回查
-        self.assertEqual(stat.S_IMODE(os.stat(self.cred_path).st_mode), 0o600)
         self.assertEqual(disk["port"], 17890, "改凭据不应丢掉其他配置字段")
+        self.assertFalse(os.path.exists(self.plain_path), "明文密码绝不能落盘")
 
     def test_reset_account_username_only_keeps_password(self):
         self._seed_config()
         before = self._disk()["password_hash"]
-        self._run(["newuser", "newuser"], [""])                   # 密码回车 = 不改
-        with open(self.cfg_path, encoding="utf-8") as f:
-            disk = json.load(f)
+        self._run(["newuser", "newuser"], [""])          # 密码回车 = 不改
+        disk = self._disk()
         self.assertEqual(disk["username"], "newuser")
         self.assertEqual(disk["password_hash"], before)
-        self.assertTrue(panel.verify_password("OldPass123", disk["password_hash"]))
         self.assertEqual(disk["port"], 17890)
+        self.assertFalse(os.path.exists(self.plain_path))
 
     def test_reset_account_password_only(self):
         self._seed_config()
-        self._run([""], ["OnlyNew789", "OnlyNew789"])             # 用户名回车 = 不改
-        with open(self.cfg_path, encoding="utf-8") as f:
-            disk = json.load(f)
+        self._run([""], ["OnlyNew789", "OnlyNew789"])    # 用户名回车 = 不改
+        disk = self._disk()
         self.assertEqual(disk["username"], "olduser")
         self.assertTrue(panel.verify_password("OnlyNew789", disk["password_hash"]))
         self.assertEqual(disk["port"], 17890)
+        self.assertFalse(os.path.exists(self.plain_path))
 
     def test_reset_account_nothing_changed(self):
         self._seed_config()
         before = self._disk()
         self._run([""], [""])
-        with open(self.cfg_path, encoding="utf-8") as f:
-            disk = json.load(f)
-        self.assertEqual(disk, before)
-        self.assertFalse(os.path.exists(self.cred_path), "没改动就不该写凭据记录")
+        self.assertEqual(self._disk(), before)
+        self.assertFalse(os.path.exists(self.plain_path))
 
     def test_reset_account_rejects_bad_input_then_accepts(self):
         self._seed_config()
-        # 用户名：非法 → 两次不一致 → 正确；密码：太短 → 两次不一致 → 正确
         self._run(["ab", "newuser", "newuserx", "newuser", "newuser"],
                   ["short", "GoodPass123", "GoodPass456", "GoodPass123", "GoodPass123"])
-        with open(self.cfg_path, encoding="utf-8") as f:
-            disk = json.load(f)
+        disk = self._disk()
         self.assertEqual(disk["username"], "newuser")
         self.assertTrue(panel.verify_password("GoodPass123", disk["password_hash"]))
 
-    def test_reset_password_also_records_credentials(self):
+    def test_reset_password_writes_no_plaintext(self):
         self._seed_config()
         with unittest.mock.patch("getpass.getpass", lambda *a: "RecordedPw1"):
             panel.cmd_reset_password()
-        with open(self.cred_path, encoding="utf-8") as f:
-            cred = json.load(f)
-        self.assertEqual(cred["password"], "RecordedPw1")
-        self.assertEqual(stat.S_IMODE(os.stat(self.cred_path).st_mode), 0o600)
-
-    def test_read_local_credentials_missing_returns_empty(self):
-        self.assertEqual(panel._read_local_credentials(), {})
+        self.assertTrue(panel.verify_password("RecordedPw1", self._disk()["password_hash"]))
+        self.assertFalse(os.path.exists(self.plain_path), "reset-password 也不能写明文")
 
     def test_reset_account_eof_is_graceful(self):
         """输入被中断（管道里没给够输入 / Ctrl+D）要干净退出，不能抛 traceback"""
@@ -6197,7 +6180,7 @@ class TestResetAccount(unittest.TestCase):
                 panel.cmd_reset_account()
         self.assertEqual(cm.exception.code, 1)
         self.assertEqual(self._disk()["username"], "olduser", "中断后不应改动配置")
-        self.assertFalse(os.path.exists(self.cred_path))
+        self.assertFalse(os.path.exists(self.plain_path))
 
     def test_reset_password_eof_is_graceful(self):
         self._seed_config()
