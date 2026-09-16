@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.18"
+readonly SCRIPT_VERSION="3.2.19"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -270,6 +270,7 @@ do_upgrade() {
 }
 
 do_check() {
+    cleanup_plaintext_credentials    # 任何需要 root 的入口都顺手清掉旧版明文凭据文件（幂等）
     local pv; pv="$(installed_panel_version)"
     echo "================== $SCRIPT_NAME 环境体检 =================="
     echo "  安装脚本 : v$SCRIPT_VERSION"
@@ -673,6 +674,7 @@ EOF
 
 do_show_login_info() {
     check_root
+    cleanup_plaintext_credentials    # 任何需要 root 的入口都顺手清掉旧版明文凭据文件（幂等）
     [ -f "$ETC_DIR/config.json" ] || error "面板未安装，无法查看登录信息"
 
     local ip port bind user domain ans
@@ -1097,6 +1099,7 @@ do_install() {
 do_uninstall() {
     echo "================== $SCRIPT_NAME 卸载模式 =================="
     check_root
+    cleanup_plaintext_credentials    # 任何需要 root 的入口都顺手清掉旧版明文凭据文件（幂等）
     if systemctl list-unit-files 2>/dev/null | grep -q "$SERVICE_NAME"; then
         log_info "停止并禁用服务..."
         systemctl stop "$SERVICE_NAME" 2>/dev/null || true
@@ -1118,6 +1121,7 @@ do_uninstall() {
 
 do_change_password() {
     check_root
+    cleanup_plaintext_credentials    # 任何需要 root 的入口都顺手清掉旧版明文凭据文件（幂等）
     [ -f "$ETC_DIR/config.json" ] || error "面板未安装，无法修改凭据"
     local sub="reset-account"
     if ! grep -q '"reset-account"' "$APP_DIR/panel.py" 2>/dev/null; then

@@ -544,9 +544,17 @@ case "$out" in *ShouldBeDeleted*) bad "竟然把旧版留下的明文密码显�
 # 输入 r → 进入重设流程（用 stub 断言分发）
 out_r=$(printf 'r\n' | env -i PATH=/usr/bin:/bin HOME=/root FW_MENU=1 bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; do_change_password() { echo "DO_CHANGE_PW_CALLED"; }; do_show_login_info' 2>&1)
 case "$out_r" in *DO_CHANGE_PW_CALLED*) ok "输入 r → 直接进入重设流程（不用回菜单）" ;; *) bad "r 入口未生效: $out_r" ;; esac
-# 清理旧版遗留的明文凭据文件
+# 清理旧版遗留的明文凭据文件（函数本身 + 「查看信息」这条真实路径都要清）
+cat > /tmp/fwinfo/etc/credentials.json <<'EOF'
+{"username": "jackson", "password": "ShouldBeDeleted", "updated_at": "2026-09-16 20:30:00"}
+EOF
 env -i PATH=/usr/bin:/bin HOME=/root bash -c 'source /tmp/fwinfo/install_info.sh; cleanup_plaintext_credentials' >/dev/null 2>&1
-[ -f /tmp/fwinfo/etc/credentials.json ] && bad "旧版明文凭据文件没被清理" || ok "重跑脚本会清理旧版留下的明文凭据文件"
+[ -f /tmp/fwinfo/etc/credentials.json ] && bad "旧版明文凭据文件没被清理" || ok "cleanup_plaintext_credentials 会删除旧版遗留文件"
+cat > /tmp/fwinfo/etc/credentials.json <<'EOF'
+{"username": "jackson", "password": "ShouldBeDeleted", "updated_at": "2026-09-16 20:30:00"}
+EOF
+printf '\n' | env -i PATH=/usr/bin:/bin HOME=/root FW_MENU=1 bash -c 'source /tmp/fwinfo/install_info.sh; check_root() { return 0; }; do_show_login_info' >/dev/null 2>&1
+[ -f /tmp/fwinfo/etc/credentials.json ] && bad "「查看登录信息」路径没有清理旧版明文凭据文件" || ok "「查看登录信息」路径也会清理旧版明文凭据文件"
 # 该功能需要 root
 sed -n '/^do_show_login_info()/,/^}/p' /tmp/fwinfo/install_info.sh | head -3 | grep -q "check_root" \
     && ok "查看登录信息前先 check_root（需 root 权限）" || bad "缺少 check_root 保护"
