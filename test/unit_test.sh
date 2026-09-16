@@ -888,6 +888,8 @@ while [ $# -gt 0 ]; do
         *) shift ;;
     esac
 done
+# FAKE_URL_LOG=文件 时把请求的 URL 记下来（用来断言优先取了哪个源）
+[ -n "${FAKE_URL_LOG:-}" ] && printf '%s\n' "$url" >> "$FAKE_URL_LOG"
 # FAKE_FAIL_RAW=1 时模拟"GitHub 直连不通"，用来验证多源回退
 if [ -n "${FAKE_FAIL_RAW:-}" ]; then
     case "$url" in *raw.githubusercontent.com*) exit 22 ;; esac
@@ -920,6 +922,7 @@ while [ $# -gt 0 ]; do
         *) shift ;;
     esac
 done
+[ -n "${FAKE_URL_LOG:-}" ] && printf '%s\n' "$url" >> "$FAKE_URL_LOG"
 if [ -n "${FAKE_FAIL_RAW:-}" ]; then
     case "$url" in *raw.githubusercontent.com*) exit 8 ;; esac
 fi
@@ -954,6 +957,30 @@ grep -q "线上已发布 v9.9.9" /tmp/fwtest/upd6.out && grep -q "同步有延�
 env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="$(cat /tmp/fwtest/bin/samescript.sh)" \
     bash -c 'source "$1"; check_root() { :; }; do_update_script' bash "$TMPF" > /tmp/fwtest/upd7.out 2>&1
 grep -q "同步有延迟" /tmp/fwtest/upd7.out && bad "版本真已是线上最新时不该报"延迟"" || ok "确实最新时不说"同步延迟""
+
+# ③g 知道线上新版号时优先按 tag 取（main 的 CDN 刚发版时还没同步，tag 是就绪的）
+: > /tmp/fwtest/url.log
+cat > /tmp/fwtest/bin/tagscript.sh <<'TEOF'
+#!/usr/bin/env bash
+readonly SCRIPT_VERSION="9.9.9"
+TEOF
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_URL_LOG=/tmp/fwtest/url.log FAKE_BODY="$(cat /tmp/fwtest/bin/tagscript.sh)" \
+    bash -c 'source "$1"; check_root() { :; }; do_update_script 9.9.9' bash "$TMPF" > /tmp/fwtest/upd8.out 2>&1
+first_url="$(head -1 /tmp/fwtest/url.log)"
+case "$first_url" in
+    *"/v9.9.9/"*) ok "知道新版号时优先按 tag 取（避开 main 的 CDN 延迟）：$(printf '%s' "$first_url" | cut -c1-58)..." ;;
+    *) bad "没有优先取 tag：$first_url" ;;
+esac
+grep -q 'SCRIPT_VERSION="9.9.9"' /tmp/fwtest/app/install.sh && ok "tag 源也真的写进了缓存" || bad "tag 源没生效"
+# 不知道新版号（命令行直接 --update-script）时仍从 main 起
+: > /tmp/fwtest/url.log
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_URL_LOG=/tmp/fwtest/url.log FAKE_BODY="$(cat /tmp/fwtest/bin/tagscript.sh)" \
+    bash -c 'source "$1"; check_root() { :; }; menu_preview_tag() { :; }; do_update_script' bash "$TMPF" > /dev/null 2>&1
+case "$(head -1 /tmp/fwtest/url.log)" in
+    *"/main/"*) ok "查不到新版号时退回 main（有新版号才走 tag）" ;;
+    *) bad "无版本信息时没走 main: $(head -1 /tmp/fwtest/url.log)" ;;
+esac
+rm -f /tmp/fwtest/url.log /tmp/fwtest/bin/tagscript.sh
 
 # ③f 包装器也要多源（缓存缺失时才联网那条路）
 grep -q "cdn.jsdelivr.net" /tmp/fwtest/bin/fwp && grep -q "ghproxy.net" /tmp/fwtest/bin/fwp \

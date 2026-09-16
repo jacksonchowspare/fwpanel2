@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.36"
+readonly SCRIPT_VERSION="3.2.37"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -669,13 +669,23 @@ do_update_script() {
     # 显式升级本地缓存的安装脚本（fwp 用的那份）；菜单 9 / 菜单 10 / --update-script 触发
     # $1 = 已知的线上最新版本（可选；菜单里已经查过就传进来，省一次联网）
     check_root
-    local cache="$APP_DIR/$CACHED_SCRIPT_NAME" tmp newv ok="0" src="" known="${1:-}" got="0" v
+    local cache="$APP_DIR/$CACHED_SCRIPT_NAME" tmp newv ok="0" src="" known="${1:-}" got="0" tag_srcs="" v
     tmp="$(mktemp)"
     log_info "正在获取最新安装脚本（最多 25 秒，失败不影响本地使用）..."
     # 多源回退：GitHub 直连 → jsDelivr → ghproxy。
     # 只用 raw 一条路时，国内线路拿不到、或刚发版 CDN 还没同步，都会让"升级脚本"看起来没反应
     # （用户实测：按 9 之后重开还是旧脚本）。
-    for v in "$RAW_INSTALL_URL" \
+    # 知道线上新版号时**直接按 tag 取**：刚发版时 main 的 CDN 往往还没同步
+    # （实测：推送 v3.2.36 后 raw/jsDelivr/ghproxy 三家 @main 都还是 3.2.35，@v3.2.36 已经就绪）。
+    # tag 地址没有这个延迟，所以先试 tag，再退回 main。
+    local tag_srcs=""
+    if [ -n "$known" ] && version_gt "$known" "$SCRIPT_VERSION"; then
+        tag_srcs="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/v$known/$CACHED_SCRIPT_NAME
+https://cdn.jsdelivr.net/gh/jacksonchowspare/fwpanel2@v$known/$CACHED_SCRIPT_NAME
+https://ghproxy.net/https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/v$known/$CACHED_SCRIPT_NAME"
+    fi
+    for v in $tag_srcs \
+             "$RAW_INSTALL_URL" \
              "https://cdn.jsdelivr.net/gh/jacksonchowspare/fwpanel2@main/$CACHED_SCRIPT_NAME" \
              "https://ghproxy.net/$RAW_INSTALL_URL"; do
         ok="0"
