@@ -87,19 +87,24 @@ echo "== do_upgrade 防降级（当前 ≥ 下载版本时跳过） =="
 mkdir -p /tmp/fwpanel-dg-cur /tmp/fwpanel-dg-tmp
 echo 'CURRENT_VERSION = "1.23.20"' > /tmp/fwpanel-dg-cur/panel.py
 head -n -1 "$SCRIPT" | sed 's|readonly APP_DIR="/usr/local/lib/fwpanel"|readonly APP_DIR="/tmp/fwpanel-dg-cur"|' > /tmp/install_funcs_dg.sh
+# curl 必须用「可执行桩 + PATH」，不能用 shell 函数：do_upgrade 的下载现在经过
+# run_with_timeout（timeout 是外部命令），函数桩会被绕过而真的联网
+mkdir -p /tmp/fakebin_dg
+cat > /tmp/fakebin_dg/curl <<'DGCURL'
+#!/bin/bash
+if [[ "$*" == *"/panel.py"* && "$*" == *"-o"* ]]; then
+    printf '#!/usr/bin/env python3\nCURRENT_VERSION = "1.23.19"\n' > "$(echo "$*" | grep -oP '(?<=-o )\S+')"
+    exit 0
+fi
+exit 1
+DGCURL
+chmod +x /tmp/fakebin_dg/curl
 bash -c 'source /tmp/install_funcs_dg.sh
-curl() {
-  if [[ "$*" == *"/panel.py"* && "$*" == *"-o"* ]]; then
-    printf "#!/usr/bin/env python3\nCURRENT_VERSION = \"1.23.19\"\n" > "$(echo "$*" | grep -oP "(?<=-o )\S+")"
-    return 0
-  fi
-  return 1
-}
 mktemp() { echo /tmp/fwpanel-dg-tmp; }
-out=$(do_upgrade 2>&1)
+out=$(PATH=/tmp/fakebin_dg:$PATH do_upgrade 2>&1)
 if echo "$out" | grep -q "不降级"; then echo "  ✓ 防降级生效（1.23.20 ≥ 1.23.19 跳过）"; else echo "  ✗ $out"; exit 1; fi'
 rm -f /tmp/install_funcs_dg.sh
-rm -rf /tmp/fwpanel-dg-cur /tmp/fwpanel-dg-tmp
+rm -rf /tmp/fwpanel-dg-cur /tmp/fwpanel-dg-tmp /tmp/fakebin_dg
 
 echo "== gen_initial_rules 生成 SSH+面板端口放行 =="
 RULES_TMP="$(mktemp -u)"
@@ -319,9 +324,11 @@ v3.1.1"                    "BETA=0 VERSION_TAG=3.1.1"   # 带了 v 也接受
 chk_menu "3
 abc
 3.1.1"                     "BETA=0 VERSION_TAG=3.1.1"   # 格式错 → 重问
-chk_menu "9
-x
-y"                        "BETA=0 VERSION_TAG="        # 乱填 3 次 → 按默认正式版
+# 乱填只提示重问（不再"连错 3 次就按默认装正式版"——循环菜单里那等于强行安装）；
+# 输入耗尽(EOF)后干净退出，BETA 保持默认
+chk_menu "x
+y
+z"                        "BETA=0 VERSION_TAG="
 # 参数/开关给定时不得弹菜单（管道里喂的输入必须原封不动）
 menu_skip() { # $1=已设变量赋值 $2=输入（注意 bash -c 的第一个位置参数是 $0，所以用环境变量传）
     printf '%s\n' "$2" | env -i PATH=/tmp/fakebin_menu FW_MENU=1 HOME=/tmp FW_SKIP_SETUP="$1" bash -c '
@@ -363,6 +370,7 @@ menu_case() {  # $1=输入 → 输出原文（含 stub 调用标记）
         do_change_password() { echo "DO_CHANGE_PW_CALLED"; }
         do_uninstall() { echo "DO_UNINSTALL_CALLED"; }
         do_show_login_info() { echo "DO_SHOW_INFO_CALLED"; }
+        do_update_script() { echo "DO_UPDATE_SCRIPT_CALLED"; }
         interactive_channel_menu
         echo "MENU_RETURNED BETA=$BETA VERSION_TAG=$VERSION_TAG"' 2>&1
 }
@@ -384,6 +392,10 @@ out="$(menu_case '7
 menu_has DO_SHOW_INFO_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
     && ok "7) 查看信息后返回主菜单" || bad "7) 未返回菜单"
 
+out="$(menu_case '9
+8')"
+menu_has DO_UPDATE_SCRIPT_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
+    && ok "9) 更新脚本执行后返回主菜单" || bad "9) 未返回菜单"
 out="$(menu_case '6
 yes
 8')"
@@ -444,16 +456,22 @@ mkdir -p /tmp/fwupg-cur /tmp/fwupg-tmp
 echo 'CURRENT_VERSION = "2.1.33"' > /tmp/fwupg-cur/panel.py
 head -n -1 "$SCRIPT" | sed 's|readonly APP_DIR="/usr/local/lib/fwpanel"|readonly APP_DIR="/tmp/fwupg-cur"|' > /tmp/install_funcs_ug.sh
 mkdir -p /tmp/fwupg-cwd        # 受控工作目录：升级不得在 CWD 造垃圾文件
-( cd /tmp/fwupg-cwd && bash -c '
+# curl 桩必须是「可执行文件 + PATH」：do_upgrade 的下载走 run_with_timeout（timeout 是外部命令），
+# shell 函数桩会被绕过而真的联网
+mkdir -p /tmp/fakebin_ug
+cat > /tmp/fakebin_ug/curl <<'UGCURL'
+#!/bin/bash
+# 只让 panel.py 下载成功（内容 3.2.13），其余文件下载失败走 warn 分支
+if [[ "$*" == *"/panel.py"* && "$*" == *"-o"* ]]; then
+    printf '#!/usr/bin/env python3\nCURRENT_VERSION = "3.2.13"\n' > "$(echo "$*" | grep -oP '(?<=-o )\S+')"
+    exit 0
+fi
+exit 1
+UGCURL
+chmod +x /tmp/fakebin_ug/curl
+( cd /tmp/fwupg-cwd && PATH=/tmp/fakebin_ug:$PATH bash -c '
 source /tmp/install_funcs_ug.sh
 VERSION_TAG=""; BETA=1; SRC_TAG="v9.9.9"
-curl() {   # 只让 panel.py 下载成功（内容 3.2.13），其余文件下载失败走 warn 分支
-  if [[ "$*" == *"/panel.py"* && "$*" == *"-o"* ]]; then
-    printf "#!/usr/bin/env python3\nCURRENT_VERSION = \"3.2.13\"\n" > "$(echo "$*" | grep -oP "(?<=-o )\S+")"
-    return 0
-  fi
-  return 1
-}
 mktemp() { echo /tmp/fwupg-tmp; }
 systemctl() { return 0; }
 out=$(do_upgrade 2>&1)
@@ -462,7 +480,7 @@ grep -q "3.2.13" /tmp/fwupg-cur/panel.py && echo "  ✓ 磁盘 panel.py 已变�
 ls /tmp/fwupg-cur/panel.py.bak.* >/dev/null 2>&1 && echo "  ✓ 升级前已备份旧版本（可回滚）" || { echo "  ✗ 没有备份"; exit 1; }
 [ -e bash ] && { echo "  ✗ CWD 里被写入了垃圾文件 bash"; exit 1; } || echo "  ✓ 管道模式不会在 CWD 造出名为 bash 的垃圾文件（\$0 非实体文件时跳过）"
 ' )
-rm -rf /tmp/fwupg-cur /tmp/fwupg-tmp /tmp/fwupg-cwd /tmp/install_funcs_ug.sh
+rm -rf /tmp/fwupg-cur /tmp/fwupg-tmp /tmp/fwupg-cwd /tmp/install_funcs_ug.sh /tmp/fakebin_ug
 
 echo "== 首次安装：自定义凭据询问（yes 自定义 / no 随机） =="
 # FW_MENU=1 让 prompt_read 从 stdin 读；真实场景由 menu_can_read 决定 /dev/tty 或 stdin
@@ -621,6 +639,25 @@ case "$sum_file" in
 esac
 rm -f /tmp/fw_sum_probe.sh
 
+echo "== 菜单预览查询必须带 4 秒硬超时（网络黑洞时菜单不能被拖住）=="
+grep -q "run_with_timeout 4 curl" <(sed -n '/^menu_preview_tag() {/,/^}/p' "$SCRIPT") \
+    && ok "menu_preview_tag 用 run_with_timeout 4（不再是 12 秒 × 2 次）" || bad "预览查询缺少硬超时"
+grep -q "网络不通会自动跳过" "$SCRIPT" && ok "菜单先给出可见的查询提示（不是黑屏干等）" || bad "菜单没有查询提示"
+
+echo "== run_with_timeout：硬超时能杀掉卡死进程（网络黑洞场景）=="
+cat > /tmp/fwtest_hang.sh <<'HEOF'
+#!/bin/sh
+sleep 600
+HEOF
+chmod +x /tmp/fwtest_hang.sh
+t0=$(date +%s)
+rc=0; run_with_timeout 2 /tmp/fwtest_hang.sh || rc=$?   # 注意：脚本带着 set -e，失败必须显式接住
+t1=$(date +%s)
+[ "$rc" = "124" ] && [ $((t1 - t0)) -le 5 ] \
+    && ok "卡死命令被硬超时杀掉（rc=124，耗时 $((t1 - t0))s）" || bad "硬超时失效 rc=$rc 耗时 $((t1 - t0))s"
+rc=0; out=$(run_with_timeout 5 sh -c 'echo hi; exit 3') || rc=$?
+[ "$out" = "hi" ] && [ "$rc" = "3" ] && ok "正常命令透传输出与退出码" || bad "正常命令被影响 out=$out rc=$rc"
+
 echo "== 快捷命令 fwp：缓存脚本 + 生成包装器 =="
 rm -rf /tmp/fwtest; mkdir -p /tmp/fwtest/bin /tmp/fwtest/app
 # ① 实体脚本方式（$0 是文件）→ 缓存直接复制自身
@@ -629,6 +666,10 @@ env -i PATH=/usr/bin:/bin HOME=/tmp bash -c 'source "$0"; install_shortcut' "$TM
 grep -q "SCRIPT_VERSION=" /tmp/fwtest/app/install.sh && ok "缓存内容可识别（含 SCRIPT_VERSION）" || bad "缓存内容异常"
 [ -x /tmp/fwtest/bin/fwp ] && ok "包装器已生成且可执行: /tmp/fwtest/bin/fwp" || bad "包装器没生成/不可执行"
 sh -n /tmp/fwtest/bin/fwp 2>/dev/null && ok "包装器语法通过（POSIX sh）" || bad "包装器语法错误"
+# ⚠ 用户实测 bug 回归：包装器启动时的静默刷新，碰上网络被黑洞（DNS 卡死）就是一片空白 + 永久卡住
+if awk '/^if \[ ! -s "\$CACHE" \]/{g=1} /curl|wget/ && !g{print "EARLY:" $0; exit 1}' /tmp/fwtest/bin/fwp >/tmp/fwtest/early.out; then
+    ok "显示菜单前绝不联网（缓存缺失时才联网，且有硬超时）"
+else bad "包装器在显示菜单前就会联网（网络卡死时会永久卡住）：$(cat /tmp/fwtest/early.out)"; fi
 grep -q 'CACHE="/tmp/fwtest/app/install.sh"' /tmp/fwtest/bin/fwp && ok "包装器里缓存路径已正确展开（占位符已替换）" || bad "包装器缓存路径未展开"
 grep -q 'exec bash "$CACHE"' /tmp/fwtest/bin/fwp && ok "包装器转交脚本执行（保留参数）" || bad "包装器缺少 exec 逻辑"
 grep -q 'id -u' /tmp/fwtest/bin/fwp && ok "非 root 时自动 sudo 提权" || bad "包装器缺提权逻辑"
@@ -670,11 +711,39 @@ grep -q 'readonly WRAPPER_PATH="/usr/local/bin/fwp"' /tmp/fwtest/app/install.sh 
 out=$(env -i PATH=/tmp/fwtest/badbin:/usr/bin:/bin HOME=/tmp sh /tmp/fwtest/bin/fwp --help 2>&1)
 case "$out" in *用法*|*Usage*) ok "联网失败仍能用本地缓存打开脚本（fwp --help 正常）" ;; *) bad "包装器回退失败: $out" ;; esac
 
+# ③b do_update_script：成功替换缓存；垃圾内容一律拒绝
+cat > /tmp/fwtest/bin/newscript.sh <<'NEOF'
+#!/usr/bin/env bash
+readonly SCRIPT_VERSION="9.9.9"
+echo new
+NEOF
+chmod +x /tmp/fwtest/bin/newscript.sh
+cat > /tmp/fwtest/fakebin/curl <<'FEOF'
+#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+printf '%s\n' "$FAKE_BODY" > "$out"
+FEOF
+chmod +x /tmp/fwtest/fakebin/curl
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="$(cat /tmp/fwtest/bin/newscript.sh)" \
+    bash -c 'source "$1"; check_root() { :; }; do_update_script' bash "$TMPF" > /tmp/fwtest/upd.out 2>&1
+grep -q 'SCRIPT_VERSION="9.9.9"' /tmp/fwtest/app/install.sh && ok "do_update_script 会把新脚本写入缓存" || bad "缓存未更新"
+grep -q "脚本已更新" /tmp/fwtest/upd.out && ok "会提示版本变化（vX → vY）" || bad "没有版本变化提示: $(cat /tmp/fwtest/upd.out)"
+before=$(md5sum /tmp/fwtest/app/install.sh | awk '{print $1}')
+rc2=0
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="<html>404</html>" \
+    bash -c 'source "$1"; check_root() { :; }; do_update_script' bash "$TMPF" > /tmp/fwtest/upd2.out 2>&1 || rc2=$?
+[ "$rc2" != "0" ] && ok "校验失败时返回非 0（脚本能感知失败）" || bad "校验失败却返回 0"
+[ "$(md5sum /tmp/fwtest/app/install.sh | awk '{print $1}')" = "$before" ] \
+    && ok "错误内容不会覆盖缓存" || bad "错误内容把缓存覆盖了"
+grep -q "校验失败" /tmp/fwtest/upd2.out && ok "校验失败有明确提示" || bad "校验失败没提示"
+cp "$SCRIPT" /tmp/fwtest/app/install.sh
+
 # ④ 卸载时删除快捷命令
 env -i PATH=/usr/bin:/bin HOME=/tmp bash -c 'source "$1"; check_root() { :; }; systemctl() { return 1; }; do_uninstall' bash "$TMPF" >/dev/null 2>&1
 [ -e /tmp/fwtest/bin/fwp ] && bad "卸载后快捷命令仍在" || ok "卸载会删除快捷命令 fwp"
 [ -e /tmp/fwtest/app ] && bad "卸载后程序目录仍在" || ok "卸载会删除程序目录（缓存一并清掉）"
-rm -rf /tmp/fwtest /tmp/fakebin_fwp
+rm -rf /tmp/fwtest /tmp/fakebin_fwp /tmp/fwtest_hang.sh
 
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"

@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.22"
+readonly SCRIPT_VERSION="3.2.23"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -304,6 +304,7 @@ $SCRIPT_NAME（安装脚本 v$SCRIPT_VERSION）—— 简易VPS管理面板2.0�
   sudo bash $0 --version v1.24.42        指定版本安装/升级/回退（如回退到 v1.24.42）
   sudo bash $0 --change-password         重置面板密码（交互式）
   sudo bash $0 --uninstall               卸载（停服务 + 删文件）
+  sudo bash $0 --update-script            更新本地缓存的安装脚本（fwp 用的那份）
   fwp                                    已装面板后可用：直接打开上面的交互式菜单（脚本缓存于 $APP_DIR/$CACHED_SCRIPT_NAME）
 
 选项:
@@ -342,6 +343,7 @@ parse_args() {
             -y|--yes)      YES=1; shift ;;
             --check)       ACTION="check"; shift ;;
             --change-password) ACTION="change-password"; shift ;;
+            --update-script) ACTION="update-script"; shift ;;
             -u|--uninstall) ACTION="uninstall"; shift ;;
             --force)       FORCE=1; shift ;;
             -h|--help)     usage; exit 0 ;;
@@ -425,7 +427,8 @@ install_deps() {
 
 download_file() {
     local dest="$1" url="$2" expect_hex="${3:-}"
-    curl -fsSL --connect-timeout 10 --retry 2 -o "$dest" "$url" || return 1
+    # 硬超时：DNS/线路被黑洞时 curl 自己不会返回（--connect-timeout 覆盖不到 getaddrinfo 卡死）
+    run_with_timeout 90 curl -fsSL --connect-timeout 10 --retry 2 -o "$dest" "$url" || return 1
     [ -s "$dest" ] || return 1
     # 内容头校验（hex 前缀）：镜像返回 HTML 错误页时拒绝，防止覆盖真实文件
     if [ -n "$expect_hex" ]; then
@@ -503,14 +506,14 @@ resolve_src_tag() {
     fi
     local json tag
     if [ "$BETA" = "1" ]; then
-        json="$(curl -fsSL --connect-timeout 10 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=20" 2>/dev/null || true)"
+        json="$(run_with_timeout 20 curl -fsSL --connect-timeout 10 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=20" 2>/dev/null || true)"
         tag="$(printf '%s' "$json" | json_tag_prerelease)"
         if ! valid_tag "$tag"; then
             error "暂未找到更新的测试版(beta)；如需要请安装最新正式版"
         fi
         SRC_TAG="$tag"
     else
-        json="$(curl -fsSL --connect-timeout 10 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest" 2>/dev/null || true)"
+        json="$(run_with_timeout 20 curl -fsSL --connect-timeout 10 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest" 2>/dev/null || true)"
         tag="$(printf '%s' "$json" | json_tag_latest)"
         if valid_tag "$tag"; then
             SRC_TAG="$tag"
@@ -538,7 +541,7 @@ tag_release_channel() {
     local tag="$1" data pre
     [ -n "$tag" ] || return 0
     [ "$tag" = "main" ] && return 0
-    data="$(curl -fsSL --connect-timeout 8 --retry 1 \
+    data="$(run_with_timeout 15 curl -fsSL --connect-timeout 8 --retry 1 \
         "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/tags/$tag" 2>/dev/null || true)"
     [ -n "$data" ] || return 0
     pre="$(awk -F: '/"prerelease"[[:space:]]*:/ { gsub(/[^a-z]/, "", $2); print $2; exit }' <<< "$data" 2>/dev/null || true)"
@@ -658,6 +661,39 @@ installed_panel_version() {
 # ------------------------- 登录信息查看（不保存明文密码） -------------------------
 # 面板只保存 pbkdf2 哈希，明文密码无法反查 —— 所以这里只显示地址/用户名，密码只能“重设”。
 # v3.2.16/3.2.17 曾把明文写到 $ETC_DIR/credentials.json；本版本起不再保存，重跑脚本时清理遗留文件。
+do_update_script() {
+    # 显式更新本地缓存的安装脚本（fwp 用的那份）；菜单 9 / --update-script 触发
+    check_root
+    local cache="$APP_DIR/$CACHED_SCRIPT_NAME" tmp newv ok="0"
+    tmp="$(mktemp)"
+    log_info "正在获取最新安装脚本（最多 25 秒，失败不影响本地使用）..."
+    if command -v curl >/dev/null 2>&1; then
+        run_with_timeout 25 curl -fsSL -o "$tmp" "$RAW_INSTALL_URL" 2>/dev/null && ok="1"
+    fi
+    if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
+        run_with_timeout 25 wget -q -O "$tmp" "$RAW_INSTALL_URL" 2>/dev/null && ok="1"
+    fi
+    if [ "$ok" != "1" ] || [ ! -s "$tmp" ]; then
+        rm -f "$tmp"
+        log_error "获取失败（网络/GitHub 不可达）。本地缓存未改动，fwp 仍可正常使用。"
+        return 1
+    fi
+    if ! grep -q "SCRIPT_VERSION=" "$tmp" 2>/dev/null || ! bash -n "$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        log_error "下载内容校验失败（错误页面或半截文件），本地缓存未改动。"
+        return 1
+    fi
+    newv="$(grep -m1 -o 'SCRIPT_VERSION="[0-9.]*"' "$tmp" | tr -d '"' | cut -d= -f2)"
+    mkdir -p "$APP_DIR"
+    chmod 0755 "$tmp"
+    mv "$tmp" "$cache"
+    if [ "$newv" = "$SCRIPT_VERSION" ]; then
+        log_info "已是最新（脚本 v$SCRIPT_VERSION）"
+    else
+        log_info "脚本已更新：v$SCRIPT_VERSION → v$newv（下次运行 fwp 生效）"
+    fi
+}
+
 install_shortcut() {
     # 生成快捷命令 fwp：以后直接敲 fwp 就能进菜单，不用再翻一键安装命令
     local cache="$APP_DIR/$CACHED_SCRIPT_NAME" tmp ok="0"
@@ -672,10 +708,10 @@ install_shortcut() {
     # ② 管道方式运行（curl | sudo bash）：$0 是 "bash"，只能按官方地址抓一份
     if [ "$ok" != "1" ]; then
         if command -v curl >/dev/null 2>&1; then
-            curl -fsSL -m 20 "$RAW_INSTALL_URL" -o "$tmp" 2>/dev/null && ok="1"
+            run_with_timeout 25 curl -fsSL -o "$tmp" "$RAW_INSTALL_URL" 2>/dev/null && ok="1"
         fi
         if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
-            wget -q -O "$tmp" "$RAW_INSTALL_URL" 2>/dev/null && ok="1"
+            run_with_timeout 25 wget -q -O "$tmp" "$RAW_INSTALL_URL" 2>/dev/null && ok="1"
         fi
     fi
 
@@ -692,48 +728,49 @@ install_shortcut() {
         fi
     fi
 
-    # 快捷命令本体：优先用本地缓存；能联网时静默刷新缓存（保持菜单/修复最新），失败就用旧的
+    # 快捷命令本体：只用本地缓存秒开菜单；缓存缺失才联网（带硬超时），更新脚本走菜单 9
+    # ⚠ 包装器设计铁律：显示菜单前绝不联网。曾经在启动时静默刷新缓存，结果
+    #    网络（DNS/线路）被黑洞时 curl 卡死不返回 → 用户输入 fwp 后一片空白、只能 Ctrl+C。
     cat > "$WRAPPER_PATH" <<'WRAPPER_EOF'
 #!/bin/sh
 # fwp —— fwpanel2 安装/管理菜单快捷入口（由 install.sh 自动生成，卸载面板时一并删除）
+# 设计：本地有缓存就直接秒开菜单（离线可用）；只有缓存缺失时才联网，且带硬超时 + 明确提示。
 CACHE="__CACHE__"
 URL="__URL__"
 
-# 能联网就刷新缓存（校验通过才替换，半截下载/错误页一律不采用）
-# ⚠ 校验必须用 bash -n：install.sh 是 bash 脚本（含 bash 专有语法），Debian/Ubuntu 上 sh 是 dash，sh -n 必然失败
-if command -v curl >/dev/null 2>&1; then
+if [ ! -s "$CACHE" ]; then
+    echo "[fwp] 本地没有脚本缓存，正在获取（最多 10 秒）..." >&2
     tmp="$(mktemp)"
-    if curl -fsSL -m 8 "$URL" -o "$tmp" 2>/dev/null && [ -s "$tmp" ] \
-       && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null \
+    ok=0
+    if command -v curl >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then timeout 10 curl -fsSL -o "$tmp" "$URL" && ok=1
+        else curl -fsSL -m 10 -o "$tmp" "$URL" && ok=1; fi
+    fi
+    if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then timeout 10 wget -q -O "$tmp" "$URL" && ok=1
+        else wget -q -T 10 -O "$tmp" "$URL" && ok=1; fi
+    fi
+    if [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null \
        && { ! command -v bash >/dev/null 2>&1 || bash -n "$tmp" 2>/dev/null; }; then
         mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
-        mv "$tmp" "$CACHE" 2>/dev/null || rm -f "$tmp"
+        chmod 0755 "$tmp" 2>/dev/null || true
+        mv "$tmp" "$CACHE" || rm -f "$tmp"
     else
         rm -f "$tmp"
+        echo "[fwp] 获取脚本失败（网络不通或 GitHub 不可达）" >&2
+        echo "       请重新执行一键安装命令，或检查网络后重试" >&2
+        exit 1
     fi
-fi
-
-# 本地没有缓存又拿不到 → 明确报错，不要静默失败
-if [ ! -s "$CACHE" ]; then
-    if command -v curl >/dev/null 2>&1; then
-        tmp="$(mktemp)"
-        curl -fsSL -m 20 "$URL" -o "$tmp" 2>/dev/null || rm -f "$tmp"
-        [ -s "$tmp" ] && { mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true; mv "$tmp" "$CACHE"; }
-    fi
-fi
-if [ ! -s "$CACHE" ]; then
-    echo "[错误] 找不到脚本缓存 $CACHE，且联网获取失败" >&2
-    echo "       请重新执行一键安装命令，或检查网络后重试" >&2
-    exit 1
 fi
 
 if [ "$(id -u)" -eq 0 ]; then
     exec bash "$CACHE" "$@"
 fi
 if command -v sudo >/dev/null 2>&1; then
+    echo "[fwp] 需要 root 权限，正在通过 sudo 提权（可能会提示输入密码）" >&2
     exec sudo bash "$CACHE" "$@"
 fi
-echo "[错误] 需要 root 权限：请用 sudo fwp" >&2
+echo "[fwp] 需要 root 权限：请用 sudo fwp" >&2
 exit 1
 WRAPPER_EOF
     # 把占位符换成真实路径（避免 heredoc 里到处转义 $）
@@ -746,6 +783,21 @@ WRAPPER_EOF
         log_warn "快捷命令未完全就绪（可重跑一键安装命令重试）"
     fi
 }
+
+run_with_timeout() {   # $1=秒数，其余=要执行的命令；硬超时（能杀掉卡在 DNS/getaddrinfo 的进程）
+    local secs="$1"; shift
+    [ "$#" -gt 0 ] || return 1
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "$secs" "$@"
+        return $?
+    fi
+    # 极简系统没有 coreutils timeout（Debian/Ubuntu 默认都有）：退化为直接执行，
+    # 由各命令自身的超时参数兜底（curl 都带 --connect-timeout）。
+    # 不自己造一个假的定时器：早期版本用 sleep+kill 实现，碰上 sleep 缺失的环境会
+    # 变成「立刻杀」，反而把正常的下载掐断（实测踩过）。
+    "$@"
+}
+
 
 cleanup_plaintext_credentials() {
     if [ -f "$ETC_DIR/credentials.json" ]; then
@@ -846,12 +898,13 @@ menu_read() {   # $1 = 接收变量名
 }
 
 menu_preview_tag() {   # $1 = stable|beta → 该通道当前最新 tag（查不到输出空，不报错）
+    # 只用于菜单上的"最新版本"提示，必须快：硬超时 4 秒（网络被黑洞时不超过 4 秒就放弃）
     local json=""
     if [ "$1" = "beta" ]; then
-        json="$(curl -fsSL --connect-timeout 6 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=20" 2>/dev/null || true)"
+        json="$(run_with_timeout 4 curl -fsSL --connect-timeout 3 --retry 0 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=20" 2>/dev/null || true)"
         printf '%s' "$json" | json_tag_prerelease
     else
-        json="$(curl -fsSL --connect-timeout 6 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest" 2>/dev/null || true)"
+        json="$(run_with_timeout 4 curl -fsSL --connect-timeout 3 --retry 0 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest" 2>/dev/null || true)"
         printf '%s' "$json" | json_tag_latest
     fi
 }
@@ -873,8 +926,15 @@ interactive_channel_menu() {
     menu_can_read || return 0
 
     local stable beta_tag cur ans ver tries confirm
+    # 先打印一行可见反馈：网络不通时这里最多等 4 秒（失败就不再查第二个通道），
+    # 免得用户对着黑屏以为卡死了
+    log_info "正在查询最新版本…（网络不通会自动跳过）"
     stable="$(menu_preview_tag stable)"
-    beta_tag="$(menu_preview_tag beta)"
+    if [ -n "$stable" ]; then
+        beta_tag="$(menu_preview_tag beta)"
+    else
+        beta_tag=""      # 正式版都查不到 → 基本可以判定不通网，跳过第二次查询
+    fi
     cur="$(installed_panel_version)"
 
     # 头部（含当前版本）只打印一次；选项每轮重画，4/5/6/7 执行完回到这里继续选
@@ -882,8 +942,9 @@ interactive_channel_menu() {
     if [ -n "$cur" ]; then
         echo "  当前已装 : 面板 v$cur"
     fi
+    echo "  脚本版本 : v$SCRIPT_VERSION"
     if [ -x "$WRAPPER_PATH" ]; then
-        echo "  快捷入口 : 以后直接输入 fwp 就能回到本菜单"
+        echo "  快捷入口 : 以后直接输入 fwp 就能回到本菜单（9) 可更新脚本）"
     fi
     if [ -n "$cur" ] || [ -x "$WRAPPER_PATH" ]; then
         echo "  ------------------------------------------------------------"
@@ -901,9 +962,10 @@ interactive_channel_menu() {
         echo "    6) 卸载          停止服务并删除程序文件（保留 /etc/fwpanel 配置与规则）"
         echo "    7) 查看登录信息  显示面板登录地址和用户名（需 root；密码不保存，只能重设）"
         echo "    8) 退出脚本      不做任何改动直接退出"
+    echo "    9) 更新脚本      拉取最新安装脚本到本地缓存（fwp 用的那份，失败不影响使用）"
         echo ""
 
-        printf '  请输入 1 - 8 后回车（直接回车 = 1 安装正式版，8 = 退出）: '
+        printf '  请输入 1 - 9 后回车（直接回车 = 1 安装正式版，8 = 退出）: '
         ans=""
         menu_read ans || return 0
         case "$ans" in
@@ -959,8 +1021,11 @@ interactive_channel_menu() {
                    echo ""
                    log_info "已退出，未做任何改动"
                    exit 0 ;;
+            9)     echo ""
+                   do_update_script || true
+                   echo "" ;;
             *)     echo ""
-                   log_warn "输入无效：$ans（请填 1 - 8）" ;;
+                   log_warn "输入无效：$ans（请填 1 - 9）" ;;
         esac
     done
 }
@@ -1265,6 +1330,7 @@ main() {
         check)   do_check ;;
         uninstall) exec > >(tee -a "$LOG_FILE") 2>&1; do_uninstall ;;
         change-password) do_change_password ;;
+        update-script) do_update_script ;;
         *)       exec > >(tee -a "$LOG_FILE") 2>&1; do_install ;;
     esac
 }
