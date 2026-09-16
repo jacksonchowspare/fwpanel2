@@ -626,6 +626,32 @@ window.__SERVER_THEME_EXPLICIT__ = "__THEME_EXPLICIT__";   // 0=面板还没存�
   apply();
   document.addEventListener("DOMContentLoaded", apply);   // <head> 执行时 body 还没生成
 })();
+/* 全局兜底（v3.2.29）：主脚本任意位置抛错 → 把登录框露出来、撤掉看门狗文案、
+   并把**真实报错**显示给用户。以前这种情况只显示"页面加载受阻（面板可能正在重启…）"，
+   把真正原因（例如 TDZ）藏起来了，用户和我都在猜——教训换来的。
+   只在主脚本尚未接管（__FW_UI_READY__ 未置位）时显示，避免把已处理的业务错误刷上来。 */
+window.addEventListener("error", function (ev) {
+  try {
+    if (window.__FW_UI_READY__) return;
+    window.__FW_SCRIPT_ERROR__ = true;   // 让看门狗别再抢着显示含糊提示（真实报错更有用）
+    var lg = document.getElementById("login");
+    if (lg) lg.classList.remove("hidden");
+    var wd = document.getElementById("boot_watchdog");
+    if (wd && wd.parentNode) wd.parentNode.removeChild(wd);
+    var box = document.getElementById("boot_error");
+    if (!box) {
+      box = document.createElement("div");
+      box.id = "boot_error";
+      box.style.cssText = "margin-top:12px;padding:10px 12px;border:1px solid var(--danger);"
+        + "border-radius:10px;font-size:12px;line-height:1.7;color:var(--danger);"
+        + "text-align:left;word-break:break-all";
+      var host = (lg && (lg.querySelector(".panel") || lg)) || document.body;
+      host.appendChild(box);
+    }
+    box.textContent = "页面脚本执行出错（不是网络/缓存问题）：" + (ev.message || "未知错误")
+      + (ev.lineno ? " @行 " + ev.lineno : "") + "。请把这行截图反馈，便于定位。";
+  } catch (e) {}
+}, true);
 /* 看门狗（v3.2.8 重做）：若主脚本因任何资源卡住而没能执行，登录框也必须出现，
    否则用户看到的是"只有主题背景 + 标签一直转圈"，完全不知道能做什么（用户实测）。
    ⚠ 旧版只看"页面开始后 6 秒"这一个条件：网速慢（我们的首页 450KB / 字体 1MB）或浏览器把
@@ -670,6 +696,7 @@ window.__SERVER_THEME_EXPLICIT__ = "__THEME_EXPLICIT__";   // 0=面板还没存�
   function tick() {
     try {
       if (booted()) { clearBox(); return; }              // 主脚本已接管（迟到也算）→ 撤掉提示
+      if (window.__FW_SCRIPT_ERROR__) { clearBox(); return; }   // 已显示真实报错 → 不再显示含糊提示
       if (!alarmed &&
           (document.readyState === "complete" || Date.now() - T0 >= MAX_WAIT)) {
         // 文档还在加载（慢网 / 后台标签被节流）不算异常；加载完了却没有任何界面才是真异常
@@ -1731,8 +1758,16 @@ window.__SERVER_THEME_EXPLICIT__ = "__THEME_EXPLICIT__";   // 0=面板还没存�
 <script src="/static/vendor/xterm-addon-fit.js" defer></script>
 <script>
 let API = "";
-let token = localStorage.getItem("fw_token") || "";
+let token = "";
+try { token = localStorage.getItem("fw_token") || ""; } catch (e) { token = ""; }   // 浏览器禁用 localStorage 时不要让整段脚本挂掉
 let status = {};
+
+/* ⚠ upgradeInfo / lastUpgradeCheck 必须在这里（脚本靠前位置）声明：
+   它们在 refreshStatusCards()（登录/刷新时都会跑）里被读，如果声明写在脚本后部，
+   一旦主脚本中途抛错、后部没执行，读到它们就是 "Cannot access 'upgradeInfo' before
+   initialization"（TDZ，用户实测）；而且 typeof 守卫对 TDZ 无效，防不住。 */
+let upgradeInfo = null;
+let lastUpgradeCheck = 0;
 let fedNode = null;          // 当前远程管理节点 {id,name,url}
 let fedLoaded = false;       // 服务器 tab 是否已渲染
 
@@ -2259,7 +2294,7 @@ async function refreshStatusCards() {
     $("st_banned").textContent = status.banned_count || 0;
     $("st_ssh").textContent = status.ssh_port;
     $("st_srvip").textContent = status.server_ip || "未获取";
-  const _ui = (typeof upgradeInfo !== "undefined") ? upgradeInfo : null;
+  const _ui = upgradeInfo;   // 声明已在脚本前部，这里可以直接读（typeof 挡不住 TDZ）
   let _chan = "";
   if (_ui && _ui.current_channel === "beta") _chan = " 测试版";
   else if (_ui && _ui.current_channel === "stable") _chan = " 正式版";
@@ -2566,9 +2601,12 @@ window.addEventListener("resize", () => {
   _zt = setTimeout(() => { if ((localStorage.getItem("ui_zoom") || "auto") === "auto") applyZoomForce(); }, 250);
 });
 // 与 head 里的首帧逻辑保持一致：面板存过主题→以面板为准；没存过→先用本机原有的（启动后迁移到面板）
-setTheme((window.__SERVER_THEME_EXPLICIT__ === "1")
-  ? (window.__SERVER_THEME__ || "dark")
-  : (localStorage.getItem("fw_theme") || window.__SERVER_THEME__ || "dark"));
+// 加载期初始化：单点失败（例如浏览器禁用了 localStorage）不能把整个主脚本带崩
+try {
+  setTheme((window.__SERVER_THEME_EXPLICIT__ === "1")
+    ? (window.__SERVER_THEME__ || "dark")
+    : (localStorage.getItem("fw_theme") || window.__SERVER_THEME__ || "dark"));
+} catch (e) { console.error("主题初始化失败（已忽略）", e); }
 async function syncThemeFromServer() {
   try {
     const d = await api("GET", "/api/theme", null, 10000);
@@ -2582,7 +2620,7 @@ async function syncThemeFromServer() {
     if (document.body.dataset.theme !== d.theme) setTheme(d.theme);
   } catch (e) {}
 }
-applyZoomForce();
+try { applyZoomForce(); } catch (e) { console.error("缩放初始化失败（已忽略）", e); }
 
 /* ---------- 分组导航 tabs ---------- */
 /* ---------- 网站（站点管理，v3.0.0） ---------- */
@@ -4934,8 +4972,7 @@ async function setFw(on) {
 }
 
 /* ---------- 系统更新 ---------- */
-let upgradeInfo = null;
-let lastUpgradeCheck = 0;
+/* upgradeInfo / lastUpgradeCheck 的声明已提到脚本前部（避免 TDZ），这里不再重复声明 */
 function renderUpgradeUi(d) {
   const cur = d.current || "";
   // 当前版本通道标签(正式版/测试版)

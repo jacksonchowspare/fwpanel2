@@ -6374,6 +6374,31 @@ class TestFrontendWiring(unittest.TestCase):
         missing = sorted(h for h in handlers if h not in self._defined() and h not in kw)
         self.assertFalse(missing, "按钮绑了不存在的函数：" + ", ".join(missing))
 
+    def test_upgrade_info_declared_before_use(self):
+        """TDZ 防回归：upgradeInfo 的 let 声明必须在首次使用之前。
+
+        用户实测报错 "Cannot access 'upgradeInfo' before initialization"：声明原本在脚本后部，
+        只要主脚本中途抛错、后部没执行，登录后一读它就 TDZ。
+        """
+        self.assertLess(self.html.index("let upgradeInfo = null;"),
+                        self.html.index("const _ui = upgradeInfo;"),
+                        "upgradeInfo 必须在首次使用之前声明（脚本前部）")
+        self.assertNotIn("typeof upgradeInfo", self.html,
+                         "typeof 对处于 TDZ 的 let 同样抛错，不能当守卫用")
+
+    def test_boot_error_is_surfaced_not_hidden(self):
+        """主脚本抛错时要显示真实报错+行号，而不是含糊的"页面加载受阻"（用户实测困惑）"""
+        self.assertIn("页面脚本执行出错", self.html)
+        self.assertIn("__FW_SCRIPT_ERROR__", self.html)
+        self.assertIn("if (window.__FW_SCRIPT_ERROR__) { clearBox(); return; }", self.html,
+                      "看门狗要和真实报错框二选一，别两个都弹")
+
+    def test_early_localstorage_access_is_guarded(self):
+        """浏览器禁用 localStorage 时，早期状态读取不能把整段主脚本带崩"""
+        self.assertIn('try { token = localStorage.getItem("fw_token")', self.html)
+        self.assertIn("try {\n  setTheme(", self.html, "setTheme 的加载期调用要有 try/catch")
+        self.assertIn("try { applyZoomForce(); }", self.html, "applyZoomForce 的加载期调用要有 try/catch")
+
     def test_ipv6_and_bbr_keep_confirm_dialogs(self):
         """v3.2.0 丢过的详细确认弹窗要保留（系统级网络改动不能默默执行）"""
         for fn in ("sysIpv6", "sysBbrToggle"):
