@@ -121,6 +121,73 @@ check_os
     && ok "识别发行版: $DISTRO_ID (包管理器: $PKG_MGR, python包: $PY_PKG)" \
     || bad "发行版识别失败"
 
+echo "== resolve_src_tag 无 python3（全新最小机）不挂 + sed/awk 回退解析 =="
+# v3.2.8 真机回归：标签解析发生在 install_deps 之前，最小系统没有 python3 时
+# 直接调 python3 会以 127 挂掉整个安装（横幅之后只有一行「退出码 127」）
+mkdir -p /tmp/fakebin_nopy
+for _c in sed head awk grep cat; do ln -sf "$(command -v "$_c")" "/tmp/fakebin_nopy/$_c"; done
+cat > /tmp/fakebin_nopy/curl <<'EOF'
+#!/bin/bash
+# 模拟 GitHub API 返回（美化多行 JSON，与真实 API 一致）
+for a in "$@"; do
+    case "$a" in
+        */releases/latest)
+            printf '%s\n' '{' '  "tag_name": "v9.9.9",' '  "prerelease": false' '}'; exit 0 ;;
+        */releases\?*)
+            printf '%s\n' '[' '  {' '    "assets": [ {"name": "a.tar.gz", "size": 1} ],' '    "tag_name": "v9.9.9",' '    "prerelease": false' '  },' '  {' '    "assets": [ {"name": "b.tar.gz", "size": 2} ],' '    "tag_name": "v9.9.10-beta",' '    "prerelease": true' '  }' ']'; exit 0 ;;
+    esac
+done
+exit 1
+EOF
+chmod +x /tmp/fakebin_nopy/curl
+
+bash -c 'source '"$TMPF"'; PATH=/tmp/fakebin_nopy
+command -v python3 >/dev/null 2>&1 && { echo "  ✗ 测试环境隔离失败（仍能看见 python3）"; exit 1; }
+BETA=0; VERSION_TAG=""; SRC_TAG=""
+rc=0; resolve_src_tag 2>/dev/null || rc=$?
+[ "$rc" -eq 0 ] && [ "$SRC_TAG" = "v9.9.9" ] \
+    && echo "  ✓ 无 python3：正式版解析回退 sed 成功（$SRC_TAG，退出码 $rc）" \
+    || { echo "  ✗ 无 python3 解析失败 rc=$rc tag=[$SRC_TAG]"; exit 1; }
+BETA=1; VERSION_TAG=""; SRC_TAG=""
+rc=0; resolve_src_tag 2>/dev/null || rc=$?
+[ "$rc" -eq 0 ] && [ "$SRC_TAG" = "v9.9.10-beta" ] \
+    && echo "  ✓ 无 python3：测试版解析回退 awk 成功（$SRC_TAG，跳过正式版）" \
+    || { echo "  ✗ 无 python3 beta 解析失败 rc=$rc tag=[$SRC_TAG]"; exit 1; }
+# 压缩成单行的 JSON 也必须能解析（代理/镜像改写过的响应）
+one_line=$(printf '%s' "[ {\"tag_name\": \"v8.1.0\", \"prerelease\": false }, {\"tag_name\": \"v8.1.1-beta\", \"prerelease\": true } ]" | json_tag_prerelease)
+[ "$one_line" = "v8.1.1-beta" ] \
+    && echo "  ✓ 单行压缩 JSON 也能解析（$one_line）" \
+    || { echo "  ✗ 单行 JSON 解析失败: [$one_line]"; exit 1; }'
+
+echo "== 无 python3 + 无网络：回退 main 且不挂 =="
+rm -rf /tmp/fakebin_failcurl && mkdir -p /tmp/fakebin_failcurl
+for _c in sed head awk grep cat; do ln -sf "$(command -v "$_c")" "/tmp/fakebin_failcurl/$_c"; done
+printf '#!/bin/bash\nexit 1\n' > /tmp/fakebin_failcurl/curl && chmod +x /tmp/fakebin_failcurl/curl
+bash -c 'source '"$TMPF"'; PATH=/tmp/fakebin_failcurl
+BETA=0; VERSION_TAG=""; SRC_TAG=""
+rc=0; resolve_src_tag >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 0 ] && [ "$SRC_TAG" = "main" ] \
+    && echo "  ✓ 网络失败时回退 main 且不挂（退出码 $rc）" \
+    || { echo "  ✗ 网络失败路径异常 rc=$rc tag=[$SRC_TAG]"; exit 1; }'
+rm -rf /tmp/fakebin_failcurl
+
+echo "== valid_tag 只接受版本号形状（防解析残渣当版本） =="
+bash -c 'source '"$TMPF"'
+valid_tag "v3.2.8" && valid_tag "3.2.8" && ! valid_tag "" && ! valid_tag "{\"a\":1}" \
+    && echo "  ✓ valid_tag 正常/空/垃圾值判定正确" || { echo "  ✗ valid_tag 判定错误"; exit 1; }'
+
+echo "== err_trap 只报一次 + 指名失败命令（127 提示） =="
+out=$(bash -c 'source '"$TMPF"'; defintely_no_such_command_127' 2>&1 || true)
+n=$(printf '%s' "$out" | grep -c '退出码 127' || true)
+case "$out" in
+    *defintely_no_such_command_127*) cmd_ok=1 ;;
+    *) cmd_ok=0 ;;
+esac
+[ "$n" -eq 1 ] && [ "$cmd_ok" -eq 1 ] \
+    && ok "单次提示且报出失败命令（127）" \
+    || bad "err_trap 输出异常（次数=$n 含命令=$cmd_ok）: $out"
+rm -rf /tmp/fakebin_nopy
+
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
 rm -f "$TMPF" /tmp/install_funcs_fw.sh

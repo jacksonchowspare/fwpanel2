@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.8"
+readonly SCRIPT_VERSION="3.2.9"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -62,9 +62,21 @@ log_error() { printf '%s[ERROR]%s %s\n' "$C_RED" "$C_RESET" "$1" >&2; }
 
 error() { log_error "$1"; exit 1; }
 
+_ERR_TRAP_SHOWN=0
 err_trap() {
-    local rc=$?
-    log_error "脚本异常退出（退出码 $rc），请查看日志: $LOG_FILE"
+    local rc=$? cmd="${BASH_COMMAND:-unknown}"
+    cmd="${cmd%%$'\n'*}"                                   # 多行命令只显示第一行
+    [ "${#cmd}" -le 120 ] || cmd="${cmd:0:117}..."
+    # set -E 下同一个失败命令会触发两次（内层命令 + 函数返回），只报一次
+    if [ "$_ERR_TRAP_SHOWN" = "0" ]; then
+        _ERR_TRAP_SHOWN=1
+        case "$rc" in
+            127) log_error "脚本异常退出（退出码 127）：找不到命令 —— $cmd" ;;
+            126) log_error "脚本异常退出（退出码 126）：命令不可执行 —— $cmd" ;;
+            *)   log_error "脚本异常退出（退出码 $rc）—— 失败命令: $cmd" ;;
+        esac
+        log_error "请查看日志: $LOG_FILE"
+    fi
 }
 trap err_trap ERR
 
@@ -408,6 +420,51 @@ download_file() {
 }
 
 # 下载源 tag：--version 指定 > --beta(最新测试版) > 最新正式版(Latest release)；API 失败回退 main
+# ------------------------- GitHub JSON 解析（不依赖 python3） -------------------------
+# ⚠ 全新最小系统（Debian netinst / 容器 / 精简云镜像）常常没有 python3，而标签解析发生在
+#   install_deps 之前——直接调 python3 会以 127 挂掉整个安装（v3.2.8 真机踩坑：横幅之后
+#   只有一行「异常退出（退出码 127）」，退出码还被 2>/dev/null 吞掉看不到原因）。
+#   这里一律「有 python3 用它，没有就用 sed/awk」，且永远返回 0，让安装能继续走到装依赖那步。
+json_tag_latest() {
+    # stdin: releases/latest 的 JSON  →  输出最新正式版 tag_name（失败输出空）
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import sys,json
+try: print(json.load(sys.stdin).get("tag_name") or "")
+except Exception: pass' 2>/dev/null || true
+        return 0
+    fi
+    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 || true
+}
+
+json_tag_prerelease() {
+    # stdin: releases?per_page=N 的 JSON 列表  →  输出第一个 prerelease=true 的 tag_name
+    if command -v python3 >/dev/null 2>&1; then
+        python3 -c 'import sys,json
+try:
+    for r in json.load(sys.stdin):
+        if r.get("prerelease") and r.get("tag_name"):
+            print(r["tag_name"]); break
+except Exception: pass' 2>/dev/null || true
+        return 0
+    fi
+    command -v awk >/dev/null 2>&1 || return 0
+    # 无 python3：按 '}' 切记录滑动扫描——记住最近一个 tag_name，遇到第一个 "prerelease": true 就输出。
+    # 这样对 GitHub 的多行美化 JSON 和压缩成单行的 JSON 都成立（assets 内嵌套对象也不含 tag_name）。
+    awk -v RS='}' '
+        match($0, /"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+            t = substr($0, RSTART, RLENGTH); gsub(/^[^:]*:[[:space:]]*"/, "", t); gsub(/".*$/, "", t)
+        }
+        /"prerelease"[[:space:]]*:[[:space:]]*true/ { if (t != "") { print t; exit } }
+    ' 2>/dev/null || true
+}
+
+valid_tag() {
+    # tag 必须是 v1.2.3 / 1.2.3 这类，防解析残渣当版本号用
+    [ -n "${1:-}" ] || return 1
+    case "$1" in *[!A-Za-z0-9._-]*) return 1 ;; esac
+    return 0
+}
+
 resolve_src_tag() {
     [ -n "$SRC_TAG" ] && return 0    # 父 shell 已解析(幂等);命令替换子 shell 里 SRC_TAG 永远为空,不做缓存判断
     if [ -n "$VERSION_TAG" ]; then
@@ -417,28 +474,21 @@ resolve_src_tag() {
     local json tag
     if [ "$BETA" = "1" ]; then
         json="$(curl -fsSL --connect-timeout 10 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=20" 2>/dev/null || true)"
-        tag="$(printf '%s' "$json" | python3 -c 'import sys,json
-try:
-    for r in json.load(sys.stdin):
-        if r.get("prerelease") and r.get("tag_name"):
-            print(r["tag_name"]); break
-except Exception: pass' 2>/dev/null)"
-        if [ -z "$tag" ]; then
+        tag="$(printf '%s' "$json" | json_tag_prerelease)"
+        if ! valid_tag "$tag"; then
             error "暂未找到更新的测试版(beta)；如需要请安装最新正式版"
         fi
         SRC_TAG="$tag"
         log_info "目标: 最新测试版 $SRC_TAG"
     else
         json="$(curl -fsSL --connect-timeout 10 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest" 2>/dev/null || true)"
-        tag="$(printf '%s' "$json" | python3 -c 'import sys,json
-try: print(json.load(sys.stdin).get("tag_name") or "")
-except Exception: pass' 2>/dev/null)"
-        if [ -n "$tag" ]; then
+        tag="$(printf '%s' "$json" | json_tag_latest)"
+        if valid_tag "$tag"; then
             SRC_TAG="$tag"
             log_info "目标: 最新正式版 $SRC_TAG"
         else
             SRC_TAG="main"
-            log_warn "解析最新正式版失败（网络/限流），回退主线 main（可能包含未转正改动）"
+            log_warn "解析最新正式版失败（网络/限流/解析器缺失），回退主线 main（可能包含未转正改动）"
         fi
     fi
 }
