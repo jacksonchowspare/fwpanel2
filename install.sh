@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.11"
+readonly SCRIPT_VERSION="3.2.12"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -46,6 +46,7 @@ PANEL_PASS=""
 OPEN_PORTS=""
 VERSION_TAG=""   # 指定安装/升级版本（如 v1.24.42；留空 = 解析最新正式版）
 BETA=0           # --beta:安装/升级最新测试版(prerelease)
+YES=0            # --yes:跳过交互菜单(无人值守/脚本里用)
 SRC_TAG=""       # 解析后的下载源 tag(懒解析)
 
 # ------------------------------ 颜色 ------------------------------
@@ -285,7 +286,8 @@ usage() {
 $SCRIPT_NAME（安装脚本 v$SCRIPT_VERSION）—— 简易VPS管理面板2.0（Debian 13 · nftables）
 
 用法:
-  sudo bash $0                           一键安装/升级【最新正式版】（随机端口/用户名/密码一并打印）
+  sudo bash $0                           交互式：弹出菜单选【正式版/测试版/指定版本】
+  sudo bash $0 -y                        无人值守：跳过菜单，直接装/升【最新正式版】
   sudo bash $0 --beta                    安装/升级【最新测试版】（尝鲜通道）
   sudo bash $0 -p 17890                  指定面板端口
   sudo bash $0 --bind 127.0.0.1          仅本机访问（默认 0.0.0.0 开放远程）
@@ -302,6 +304,7 @@ $SCRIPT_NAME（安装脚本 v$SCRIPT_VERSION）—— 简易VPS管理面板2.0�
       --password PASS 登录密码，≥8 位（默认随机 16 位强密码）
       --open-port P   安装后立即开放端口给公网（逗号分隔，如 80,443 或 53/udp）
       --beta          安装/升级最新测试版(prerelease)；默认安装最新正式版(Latest)
+  -y, --yes           跳过交互菜单（脚本/无人值守用）：直接装最新正式版
       --version V     指定安装/升级到某版本（如 v1.24.42，自动补 v；可回退）
       --force         跳过系统检测
   -h, --help          帮助
@@ -327,6 +330,7 @@ parse_args() {
             --open-port)   OPEN_PORTS="$2"; shift 2 ;;
             --version)     VERSION_TAG="$2"; shift 2 ;;
             --beta)        BETA=1; shift ;;
+            -y|--yes)      YES=1; shift ;;
             --check)       ACTION="check"; shift ;;
             --change-password) ACTION="change-password"; shift ;;
             -u|--uninstall) ACTION="uninstall"; shift ;;
@@ -566,6 +570,112 @@ installed_panel_version() {
     sed -n 's/^CURRENT_VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$p" 2>/dev/null | head -n 1 || true
 }
 
+# ------------------------- 交互式版本选择菜单 -------------------------
+# 只在这三种条件同时成立时出现：无 --beta / --version 参数 + 有可用终端 + 没加 --yes。
+# 让用户直接选通道，不用记 --beta / --version。
+# ⚠⚠ 管道模式（curl | sudo bash）下 stdin 就是脚本自身，**绝不能 read stdin**——必须走 /dev/tty，
+#   否则会把脚本剩余内容当输入吃掉。systemd / cron / CI 里没有控制终端 → 自动跳过菜单，
+#   保持原默认行为（装最新正式版），永远不会卡在等输入上。
+MENU_SRC=""
+
+menu_can_read() {
+    MENU_SRC=""
+    if [ -n "${FW_MENU:-}" ]; then MENU_SRC="stdin"; return 0; fi   # 测试/自动化喂输入用
+    if { : < /dev/tty; } 2>/dev/null; then MENU_SRC="tty"; return 0; fi
+    if [ -f "$0" ] && [ -t 0 ]; then MENU_SRC="stdin"; return 0; fi
+    return 1
+}
+
+menu_read() {   # $1 = 接收变量名
+    local __v=""
+    case "$MENU_SRC" in
+        tty)   IFS= read -r __v < /dev/tty || true ;;
+        stdin) IFS= read -r __v || true ;;
+        *)     return 1 ;;
+    esac
+    printf -v "$1" '%s' "$__v"
+}
+
+menu_preview_tag() {   # $1 = stable|beta → 该通道当前最新 tag（查不到输出空，不报错）
+    local json=""
+    if [ "$1" = "beta" ]; then
+        json="$(curl -fsSL --connect-timeout 6 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases?per_page=20" 2>/dev/null || true)"
+        printf '%s' "$json" | json_tag_prerelease
+    else
+        json="$(curl -fsSL --connect-timeout 6 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest" 2>/dev/null || true)"
+        printf '%s' "$json" | json_tag_latest
+    fi
+}
+
+version_input_ok() {
+    case "$1" in
+        "")            return 1 ;;
+        *[!0-9.]*)     return 1 ;;   # 只允许数字和点
+        *.*)           return 0 ;;   # 形如 3.1.1
+        *)             return 1 ;;
+    esac
+}
+
+interactive_channel_menu() {
+    [ "$ACTION" = "install" ] || return 0
+    [ -z "$VERSION_TAG" ] || return 0
+    [ "$BETA" = "1" ] && return 0
+    [ "$YES" = "1" ] && return 0
+    menu_can_read || return 0
+
+    local stable beta_tag cur ans ver tries
+    stable="$(menu_preview_tag stable)"
+    beta_tag="$(menu_preview_tag beta)"
+    cur="$(installed_panel_version)"
+
+    echo ""
+    if [ -n "$cur" ]; then
+        echo "  当前已装 : 面板 v$cur"
+        echo "  ------------------------------------------------------------"
+    fi
+    echo "  请选择要安装 / 升级的版本："
+    echo ""
+    echo "    1) 安装正式版    最新正式版：${stable:-（查询失败，安装时会重试）}"
+    echo "    2) 安装测试版    最新测试版：${beta_tag:-（查询失败，安装时会重试）}"
+    echo "    3) 指定版本      手动输入版本号（不用带 v，例如 3.1.1）"
+    echo ""
+
+    ans=""; tries=0
+    while :; do
+        printf '  请输入 1 / 2 / 3 后回车（直接回车 = 1 正式版）: '
+        menu_read ans || return 0
+        case "$ans" in
+            ""|1)  log_info "已选择：安装正式版"; return 0 ;;
+            2)     BETA=1; log_info "已选择：安装测试版"; return 0 ;;
+            3)     break ;;
+            *)     tries=$((tries + 1))
+                   if [ "$tries" -ge 3 ]; then
+                       log_warn "输入无效，按默认处理：安装正式版"
+                       return 0
+                   fi
+                   log_warn "输入无效：$ans（请填 1 / 2 / 3）" ;;
+        esac
+    done
+
+    tries=0
+    while :; do
+        printf '  请输入版本号（不用带 v，例如 3.1.1）: '
+        menu_read ver || return 0
+        ver="${ver#v}"; ver="${ver#V}"
+        if version_input_ok "$ver"; then
+            VERSION_TAG="$ver"
+            log_info "已选择：安装指定版本 v$ver"
+            return 0
+        fi
+        tries=$((tries + 1))
+        if [ "$tries" -ge 3 ]; then
+            error "版本号格式不对（应形如 3.1.1，不用带 v）"
+        fi
+        log_warn "版本号格式不对：$ver（应形如 3.1.1，不用带 v）"
+    done
+}
+
+
 fetch_source() {
     # 三级源自动回退：GitHub raw → jsDelivr CDN → ghproxy 镜像（国内友好）+ 内容头校验
     local dest="$1" path="$2" tag expect_hex=""
@@ -780,7 +890,8 @@ print_summary() {
 }
 
 do_install() {
-    resolve_src_tag          # 先解析目标版本(正式版/测试版/指定版本)，横幅才能显示目标面板版本
+    interactive_channel_menu # 有终端且没指定通道时弹菜单(正式版/测试版/指定版本)
+    resolve_src_tag          # 先解析目标版本，横幅才能显示目标面板版本
     print_banner
     check_os; check_root; check_arch; check_tools; check_existing
     resolve_params

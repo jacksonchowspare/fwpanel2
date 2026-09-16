@@ -15,19 +15,44 @@
 
 ## 一键安装 / 升级
 
-**安装 / 升级【最新正式版】(稳定通道,推荐):**
+**交互式安装(推荐,不用记参数)：**
 
 ```bash
 curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash
 ```
 
-**安装 / 升级【最新测试版】(尝鲜通道,功能未充分验证):**
+跑起来会列出菜单，直接选就行：
 
-```bash
-curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --beta
+```
+  当前已装 : 面板 v2.1.33                          # 仅已安装时显示
+  ------------------------------------------------------------
+  请选择要安装 / 升级的版本：
+
+    1) 安装正式版    最新正式版：v2.1.33
+    2) 安装测试版    最新测试版：v3.2.11
+    3) 指定版本      手动输入版本号（不用带 v，例如 3.1.1）
+
+  请输入 1 / 2 / 3 后回车（直接回车 = 1 正式版）:
 ```
 
-> 默认安装**最新正式版**(GitHub Latest release);`--beta` 安装最新测试版(prerelease);`--version vX.Y.Z` 指定版本。
+选 3 时再提示输入版本号（直接输数字即可，例如 `3.1.1`，会自动补 `v`）。
+
+**带参数直接执行(脚本 / 无人值守用)：**
+
+```bash
+# 最新正式版
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- -y
+
+# 最新测试版(尝鲜通道,功能未充分验证)
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --beta
+
+# 指定版本(可回退)
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --version v3.1.1
+```
+
+> 无参数时若检测到终端会弹菜单；带 `--beta` / `--version` / `-y` 时直接执行、不弹菜单。
+> 没有可用终端的环境(systemd / cron / CI / 脚本里)会**自动跳过菜单**并按最新正式版执行，不会卡在等输入。
+> 默认安装**最新正式版**(GitHub Latest release);`--beta` 安装最新测试版(prerelease);`--version vX.Y.Z` 指定版本(自动补 v)。
 > 安装横幅分两行写清楚：**安装脚本**是脚本自身版本(脚本永远从 main 分支取,所以 bug 修复对所有通道立即生效),
 > **目标版本**才是这次即将安装的面板版本。
 > root 用户可直接去掉 `sudo`;普通用户有 sudo 时脚本自动提权。**已安装时重跑 = 自动升级**(备份旧版 → 覆盖 → 校验 → 重启,配置/规则/代理全部保留),且带**防降级保护**:服务器当前版本 ≥ 目标版本时自动跳过,绝不降级(已装测试版时跑默认命令会提示改用 `--beta`)。
@@ -49,6 +74,7 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
 | `--password PASS` | 指定密码，≥8 位（默认随机 16 位强密码） |
 | `--open-port P` | 安装后立即放行端口（逗号分隔，如 `80,443` 或 `53/udp`） |
 | `--beta` | 安装/升级**最新测试版**(prerelease);默认最新正式版 | 
+| `-y`, `--yes` | 跳过交互菜单(脚本/无人值守用):直接安装最新正式版 | 
 | `--version V` | **指定安装/升级到某版本**（如 `v1.24.42`，自动补 v 前缀；显式指定允许降级，用于回退） |
 | `--check` | 仅体检环境 |
 | `--change-password` | 重置面板密码（交互式） |

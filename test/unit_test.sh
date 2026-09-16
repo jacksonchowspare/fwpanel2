@@ -279,6 +279,102 @@ lbl=$(target_channel_label 2>/dev/null)
     || { echo "  ✗ 无网络: label=[$lbl] tag=[$SRC_TAG]"; exit 1; }'
 rm -rf /tmp/fakebin_chan
 
+echo "== 交互菜单：三选项 / 版本号输入（自动补 v、格式校验、非法输入重问） =="
+rm -rf /tmp/fakebin_menu && mkdir -p /tmp/fakebin_menu
+for _c in bash sh sed head awk grep cat id uname dirname mktemp tee tail sort tr; do ln -sf "$(command -v "$_c")" "/tmp/fakebin_menu/$_c"; done
+cat > /tmp/fakebin_menu/curl <<'EOF'
+#!/bin/bash
+for a in "$@"; do
+    case "$a" in
+        */releases/latest) printf '%s\n' '{' '  "tag_name": "v9.9.9",' '  "prerelease": false' '}'; exit 0 ;;
+        */releases\?*)     printf '%s\n' '[' '  { "tag_name": "v9.9.10-beta", "prerelease": true }' ']'; exit 0 ;;
+    esac
+done
+exit 1   # releases/tags/<tag> 一律当查不到
+EOF
+chmod +x /tmp/fakebin_menu/curl
+# FW_MENU=1 让菜单从 stdin 读（真实管道模式走 /dev/tty，测试里用 stdin 喂输入）
+menu_run() {
+    printf '%s\n' "$1" | env -i PATH=/tmp/fakebin_menu FW_MENU=1 HOME=/tmp bash -c '
+        source '"$TMPF"'
+        ACTION=install; VERSION_TAG=""; BETA=0; YES=0
+        interactive_channel_menu >/dev/null 2>&1
+        printf "BETA=%s VERSION_TAG=%s" "$BETA" "$VERSION_TAG"'
+}
+chk_menu() { # $1=输入 $2=期望
+    local got; got="$(menu_run "$1")"
+    if [ "$got" = "$2" ]; then echo "  ✓ 输入[$(printf '%s' "$1" | tr '\n' '/')] → $got"
+    else echo "  ✗ 输入[$(printf '%s' "$1" | tr '\n' '/')] 得到 [$got] 期望 [$2]"; FAIL=$((FAIL+1)); return 1; fi
+}
+chk_menu "1"               "BETA=0 VERSION_TAG="
+chk_menu ""                "BETA=0 VERSION_TAG="        # 直接回车 = 正式版
+chk_menu "2"               "BETA=1 VERSION_TAG="
+chk_menu "3
+3.1.1"                     "BETA=0 VERSION_TAG=3.1.1"   # 不用带 v
+chk_menu "3
+v3.1.1"                    "BETA=0 VERSION_TAG=3.1.1"   # 带了 v 也接受
+chk_menu "3
+abc
+3.1.1"                     "BETA=0 VERSION_TAG=3.1.1"   # 格式错 → 重问
+chk_menu "9
+x
+y"                        "BETA=0 VERSION_TAG="        # 乱填 3 次 → 按默认正式版
+# 参数/开关给定时不得弹菜单（管道里喂的输入必须原封不动）
+menu_skip() { # $1=已设变量赋值 $2=输入（注意 bash -c 的第一个位置参数是 $0，所以用环境变量传）
+    printf '%s\n' "$2" | env -i PATH=/tmp/fakebin_menu FW_MENU=1 HOME=/tmp FW_SKIP_SETUP="$1" bash -c '
+        source '"$TMPF"'
+        ACTION=install; VERSION_TAG=""; BETA=0; YES=0
+        eval "$FW_SKIP_SETUP"
+        interactive_channel_menu >/dev/null 2>&1
+        printf "BETA=%s VERSION_TAG=%s" "$BETA" "$VERSION_TAG"'
+}
+[ "$(menu_skip 'BETA=1' '3
+9.9.9')" = "BETA=1 VERSION_TAG=" ] && ok "--beta 时跳过菜单（不吃 stdin）" || bad "--beta 时菜单没跳过"
+[ "$(menu_skip 'VERSION_TAG=v1.2.3' '2')" = "BETA=0 VERSION_TAG=v1.2.3" ] && ok "--version 时跳过菜单" || bad "--version 时菜单没跳过"
+[ "$(menu_skip 'YES=1' '2')" = "BETA=0 VERSION_TAG=" ] && ok "--yes 时跳过菜单" || bad "--yes 时菜单没跳过"
+# 无控制终端（systemd/cron/CI）→ 不弹菜单、保持正式版默认，绝不阻塞
+if command -v setsid >/dev/null 2>&1; then
+    rc=0; setsid bash -c 'source '"$TMPF"'; unset FW_MENU; menu_can_read' >/dev/null 2>&1 || rc=$?
+    [ "$rc" -ne 0 ] && ok "无终端时 menu_can_read 返回失败（→ 跳过菜单）" || bad "无终端时仍认为可读"
+else
+    echo "  （无 setsid，跳过无终端用例）"
+fi
+# 指定版本输错 3 次要明确报错退出（不静默继续）
+rc=0; out=$(printf '3\nabc\nabc\nabc\n' | env -i PATH=/tmp/fakebin_menu FW_MENU=1 HOME=/tmp bash -c '
+    source '"$TMPF"'; ACTION=install; VERSION_TAG=""; BETA=0; YES=0
+    interactive_channel_menu' 2>&1) || rc=$?
+[ "$rc" -ne 0 ] && case "$out" in *"版本号格式不对"*) ok "版本号错 3 次 → 报错退出（退出码 $rc）" ;; *) bad "报错文案缺失: $out" ;; esac \
+    || bad "版本号错 3 次竟然退出码 0"
+# 端到端：真脚本 + FW_MENU=1 + 选项 2 → 横幅必须是「目标版本 : 面板 v9.9.10-beta（最新测试版）」
+out=$(printf '2\n' | env -i PATH=/tmp/fakebin_menu FW_MENU=1 HOME=/root TERM=dumb bash "$SCRIPT" 2>&1 || true)
+case "$out" in
+    *"目标版本 : 面板 v9.9.10-beta（最新测试版）"*) ok "菜单选 2 端到端 → 目标版本 v9.9.10-beta（最新测试版）" ;;
+    *) bad "端到端菜单失败: $(printf '%s' "$out" | head -8)" ;;
+esac
+rm -rf /tmp/fakebin_menu
+# 管道模式（curl | sudo bash）下 stdin 是脚本自身，菜单必须改走 /dev/tty —— 用 script 造 pty 模拟真实场景
+if command -v script >/dev/null 2>&1; then
+    probe="$(mktemp)"
+    {
+        echo "source $TMPF"
+        echo 'ACTION=install; VERSION_TAG=""; BETA=0; YES=0'
+        echo 'menu_can_read && echo "MENU_SRC=$MENU_SRC"'
+        echo 'interactive_channel_menu >/dev/null 2>&1'
+        echo 'echo "BETA=$BETA VERSION_TAG=$VERSION_TAG"'
+    } > "$probe"
+    out=$(printf '2\n' | env -i PATH=/tmp/fakebin_menu:/usr/bin HOME=/root TERM=dumb script -qec "cat $probe | bash" /dev/null 2>&1 || true)
+    case "$out" in
+        *MENU_SRC=tty*) case "$out" in
+                            *"BETA=1"*) ok "管道模式：菜单走 /dev/tty 读到输入（pty 模拟，非 stdin）" ;;
+                            *) bad "管道模式读到了 tty 但选项未生效: $out" ;;
+                        esac ;;
+        *) bad "管道模式菜单没走 /dev/tty: $out" ;;
+    esac
+    rm -f "$probe"
+else
+    echo "  （无 script 命令，跳过 pty 用例）"
+fi
+
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
 rm -f "$TMPF" /tmp/install_funcs_fw.sh
