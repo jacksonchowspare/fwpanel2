@@ -22,7 +22,10 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.20"
+readonly SCRIPT_VERSION="3.2.21"
+readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
+readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
+readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -301,6 +304,7 @@ $SCRIPT_NAME（安装脚本 v$SCRIPT_VERSION）—— 简易VPS管理面板2.0�
   sudo bash $0 --version v1.24.42        指定版本安装/升级/回退（如回退到 v1.24.42）
   sudo bash $0 --change-password         重置面板密码（交互式）
   sudo bash $0 --uninstall               卸载（停服务 + 删文件）
+  fwp                                    已装面板后可用：直接打开上面的交互式菜单（脚本缓存于 $APP_DIR/$CACHED_SCRIPT_NAME）
 
 选项:
   -p, --port PORT     面板端口（默认随机 17000-19999）
@@ -654,6 +658,93 @@ installed_panel_version() {
 # ------------------------- 登录信息查看（不保存明文密码） -------------------------
 # 面板只保存 pbkdf2 哈希，明文密码无法反查 —— 所以这里只显示地址/用户名，密码只能“重设”。
 # v3.2.16/3.2.17 曾把明文写到 $ETC_DIR/credentials.json；本版本起不再保存，重跑脚本时清理遗留文件。
+install_shortcut() {
+    # 生成快捷命令 fwp：以后直接敲 fwp 就能进菜单，不用再翻一键安装命令
+    local cache="$APP_DIR/$CACHED_SCRIPT_NAME" tmp ok="0"
+
+    mkdir -p "$APP_DIR" /usr/local/bin 2>/dev/null || true
+    tmp="$(mktemp)"
+
+    # ① 实体脚本方式运行（sudo bash install.sh）：直接把自己复制成缓存
+    if [ -f "$0" ] && [ "$0" != "$cache" ]; then
+        cp "$0" "$tmp" 2>/dev/null && ok="1"
+    fi
+    # ② 管道方式运行（curl | sudo bash）：$0 是 "bash"，只能按官方地址抓一份
+    if [ "$ok" != "1" ]; then
+        if command -v curl >/dev/null 2>&1; then
+            curl -fsSL -m 20 "$RAW_INSTALL_URL" -o "$tmp" 2>/dev/null && ok="1"
+        fi
+        if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
+            wget -q -O "$tmp" "$RAW_INSTALL_URL" 2>/dev/null && ok="1"
+        fi
+    fi
+
+    # 校验后才入库（半截下载/错误页不能覆盖缓存）
+    if [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q "SCRIPT_VERSION=" "$tmp" 2>/dev/null && bash -n "$tmp" 2>/dev/null; then
+        chmod 0755 "$tmp"
+        mv "$tmp" "$cache"
+        ok="1"
+    else
+        rm -f "$tmp"
+        ok="0"
+        if [ ! -s "$cache" ]; then
+            log_warn "未能准备脚本缓存（$cache），fwp 首次运行会尝试联网获取"
+        fi
+    fi
+
+    # 快捷命令本体：优先用本地缓存；能联网时静默刷新缓存（保持菜单/修复最新），失败就用旧的
+    cat > "$WRAPPER_PATH" <<'WRAPPER_EOF'
+#!/bin/sh
+# fwp —— fwpanel2 安装/管理菜单快捷入口（由 install.sh 自动生成，卸载面板时一并删除）
+CACHE="__CACHE__"
+URL="__URL__"
+
+# 能联网就刷新缓存（校验通过才替换，半截下载/错误页一律不采用）
+if command -v curl >/dev/null 2>&1; then
+    tmp="$(mktemp)"
+    if curl -fsSL -m 8 "$URL" -o "$tmp" 2>/dev/null && [ -s "$tmp" ] \
+       && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null && sh -n "$tmp" 2>/dev/null; then
+        mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
+        mv "$tmp" "$CACHE" 2>/dev/null || rm -f "$tmp"
+    else
+        rm -f "$tmp"
+    fi
+fi
+
+# 本地没有缓存又拿不到 → 明确报错，不要静默失败
+if [ ! -s "$CACHE" ]; then
+    if command -v curl >/dev/null 2>&1; then
+        tmp="$(mktemp)"
+        curl -fsSL -m 20 "$URL" -o "$tmp" 2>/dev/null || rm -f "$tmp"
+        [ -s "$tmp" ] && { mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true; mv "$tmp" "$CACHE"; }
+    fi
+fi
+if [ ! -s "$CACHE" ]; then
+    echo "[错误] 找不到脚本缓存 $CACHE，且联网获取失败" >&2
+    echo "       请重新执行一键安装命令，或检查网络后重试" >&2
+    exit 1
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+    exec bash "$CACHE" "$@"
+fi
+if command -v sudo >/dev/null 2>&1; then
+    exec sudo bash "$CACHE" "$@"
+fi
+echo "[错误] 需要 root 权限：请用 sudo fwp" >&2
+exit 1
+WRAPPER_EOF
+    # 把占位符换成真实路径（避免 heredoc 里到处转义 $）
+    sed -i -e "s|__CACHE__|$APP_DIR/$CACHED_SCRIPT_NAME|g" -e "s|__URL__|$RAW_INSTALL_URL|g" "$WRAPPER_PATH" 2>/dev/null || true
+    chmod 0755 "$WRAPPER_PATH" 2>/dev/null || true
+
+    if [ -s "$cache" ] && [ -x "$WRAPPER_PATH" ]; then
+        log_info "快捷命令已就绪：以后直接输入 ${C_BOLD}fwp${C_RESET} 即可打开本菜单"
+    else
+        log_warn "快捷命令未完全就绪（可重跑一键安装命令重试）"
+    fi
+}
+
 cleanup_plaintext_credentials() {
     if [ -f "$ETC_DIR/credentials.json" ]; then
         rm -f "$ETC_DIR/credentials.json" "$ETC_DIR/credentials.json.tmp" 2>/dev/null || true
@@ -788,6 +879,11 @@ interactive_channel_menu() {
     echo ""
     if [ -n "$cur" ]; then
         echo "  当前已装 : 面板 v$cur"
+    fi
+    if [ -x "$WRAPPER_PATH" ]; then
+        echo "  快捷入口 : 以后直接输入 fwp 就能回到本菜单"
+    fi
+    if [ -n "$cur" ] || [ -x "$WRAPPER_PATH" ]; then
         echo "  ------------------------------------------------------------"
     fi
 
@@ -1074,6 +1170,9 @@ print_summary() {
     echo "  登录密码 : ${PANEL_PASS}"
     echo "------------------------------------------------------------------"
     echo "  ${C_RED}⚠ 凭据仅显示这一次，不会写入任何文件，请立即记下！${C_RESET}"
+    if [ -x "$WRAPPER_PATH" ]; then
+        echo "  快捷入口 : 以后直接输入 ${C_BOLD}fwp${C_RESET} 打开管理菜单（改凭据 / 升级 / 体检 / 查看信息）"
+    fi
     if [ -f "$0" ]; then
         echo "  改用户名/密码: sudo bash $0 --change-password"
         echo "  升级 / 换通道: sudo bash $0（加 --beta 装测试版，--version vX.Y.Z 指定版本）"
@@ -1094,6 +1193,7 @@ do_install() {
     print_banner
     check_os; check_root; check_arch; check_tools
     cleanup_plaintext_credentials   # 清理 v3.2.16/17 留下的明文凭据文件（安装与升级都走这里）
+    install_shortcut                # 生成 fwp 快捷命令（升级路径也会执行，因为它在 check_existing 之前）
     check_existing
     ask_custom_credentials   # 首次安装才问（升级不走这里）；无终端/-y 静默随机
     resolve_params
@@ -1119,6 +1219,10 @@ do_uninstall() {
     fi
     log_info "删除程序文件 $APP_DIR ..."
     rm -rf "$APP_DIR"
+    if [ -e "$WRAPPER_PATH" ]; then
+        rm -f "$WRAPPER_PATH"
+        log_info "已删除快捷命令 $WRAPPER_PATH"
+    fi
     echo "------------------------------------------------------------------"
     log_warn "配置与规则位于 $ETC_DIR，删除即丢失面板账号和防火墙规则:"
     echo "  rm -rf $ETC_DIR"

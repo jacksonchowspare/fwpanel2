@@ -3,7 +3,10 @@
 set -u
 SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/install.sh"
 TMPF=$(mktemp)
-head -n -1 "$SCRIPT" > "$TMPF"      # 去掉最后一行 main "$@"
+head -n -1 "$SCRIPT" \
+    | sed -e 's|^readonly WRAPPER_PATH="/usr/local/bin/fwp"|readonly WRAPPER_PATH="/tmp/fwtest/bin/fwp"|' \
+          -e 's|^readonly APP_DIR="/usr/local/lib/fwpanel"|readonly APP_DIR="/tmp/fwtest/app"|' \
+    > "$TMPF"      # 去掉最后一行 main "$@"；并把会落盘的真实路径换成临时路径
 # shellcheck disable=SC1090
 source "$TMPF"
 PASS=0; FAIL=0
@@ -617,6 +620,52 @@ case "$sum_file" in
     *) bad "实体脚本模式摘要异常: $(printf '%s' "$sum_file" | tail -6)" ;;
 esac
 rm -f /tmp/fw_sum_probe.sh
+
+echo "== 快捷命令 fwp：缓存脚本 + 生成包装器 =="
+rm -rf /tmp/fwtest; mkdir -p /tmp/fwtest/bin /tmp/fwtest/app
+# ① 实体脚本方式（$0 是文件）→ 缓存直接复制自身
+env -i PATH=/usr/bin:/bin HOME=/tmp bash -c 'source "$0"; install_shortcut' "$TMPF" >/dev/null 2>&1
+[ -s /tmp/fwtest/app/install.sh ] && ok "缓存脚本已生成: /tmp/fwtest/app/install.sh" || bad "缓存脚本没生成"
+grep -q "SCRIPT_VERSION=" /tmp/fwtest/app/install.sh && ok "缓存内容可识别（含 SCRIPT_VERSION）" || bad "缓存内容异常"
+[ -x /tmp/fwtest/bin/fwp ] && ok "包装器已生成且可执行: /tmp/fwtest/bin/fwp" || bad "包装器没生成/不可执行"
+sh -n /tmp/fwtest/bin/fwp 2>/dev/null && ok "包装器语法通过（POSIX sh）" || bad "包装器语法错误"
+grep -q 'CACHE="/tmp/fwtest/app/install.sh"' /tmp/fwtest/bin/fwp && ok "包装器里缓存路径已正确展开（占位符已替换）" || bad "包装器缓存路径未展开"
+grep -q 'exec bash "$CACHE"' /tmp/fwtest/bin/fwp && ok "包装器转交脚本执行（保留参数）" || bad "包装器缺少 exec 逻辑"
+grep -q 'id -u' /tmp/fwtest/bin/fwp && ok "非 root 时自动 sudo 提权" || bad "包装器缺提权逻辑"
+
+# ② 管道模式：$0 是 "bash" → 按官方地址抓；抓到垃圾内容不得覆盖已有缓存
+mkdir -p /tmp/fwtest/fakebin /tmp/fwtest/badbin
+cat > /tmp/fwtest/fakebin/curl <<'FEOF'
+#!/bin/sh
+out=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+printf '%s' "$FAKE_BODY" > "$out"
+FEOF
+cat > /tmp/fwtest/badbin/curl <<'FEOF'
+#!/bin/sh
+exit 1
+FEOF
+chmod +x /tmp/fwtest/fakebin/curl /tmp/fwtest/badbin/curl
+before=$(md5sum /tmp/fwtest/app/install.sh | awk '{print $1}')
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="<html>404 Not Found</html>" \
+  bash -c 'source "$1"; install_shortcut' bash "$TMPF" >/dev/null 2>&1
+[ "$(md5sum /tmp/fwtest/app/install.sh | awk '{print $1}')" = "$before" ] \
+    && ok "错误内容（404 页面）不会覆盖已有缓存" || bad "错误内容把缓存覆盖了"
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="$(cat "$SCRIPT")" \
+  bash -c 'source "$1"; install_shortcut' bash "$TMPF" >/dev/null 2>&1
+# 缓存应变成"线上原件"（带生产路径），而不再是刚才那份测试副本
+grep -q 'readonly WRAPPER_PATH="/usr/local/bin/fwp"' /tmp/fwtest/app/install.sh \
+    && ok "管道模式下按官方地址抓到完整脚本并入库" || bad "管道模式抓取入库异常"
+
+# ③ 包装器实跑：联网失败时回退本地缓存并正常进入脚本（--help 只打印用法，不会安装）
+out=$(env -i PATH=/tmp/fwtest/badbin:/usr/bin:/bin HOME=/tmp sh /tmp/fwtest/bin/fwp --help 2>&1)
+case "$out" in *用法*|*Usage*) ok "联网失败仍能用本地缓存打开脚本（fwp --help 正常）" ;; *) bad "包装器回退失败: $out" ;; esac
+
+# ④ 卸载时删除快捷命令
+env -i PATH=/usr/bin:/bin HOME=/tmp bash -c 'source "$1"; check_root() { :; }; systemctl() { return 1; }; do_uninstall' bash "$TMPF" >/dev/null 2>&1
+[ -e /tmp/fwtest/bin/fwp ] && bad "卸载后快捷命令仍在" || ok "卸载会删除快捷命令 fwp"
+[ -e /tmp/fwtest/app ] && bad "卸载后程序目录仍在" || ok "卸载会删除程序目录（缓存一并清掉）"
+rm -rf /tmp/fwtest
 
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
