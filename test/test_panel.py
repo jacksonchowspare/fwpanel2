@@ -9,6 +9,7 @@ import sys
 import tempfile
 import threading
 import types
+import re
 import unittest
 import unittest.mock
 import urllib.request
@@ -5767,6 +5768,29 @@ class TestApps(unittest.TestCase):
         self.assertEqual(code, 200, d)
         self.assertFalse(os.path.exists(d2), "purge=1 必须连数据一起删")
 
+    def test_purge_failure_is_reported_not_swallowed(self):
+        """v3.2.26：purge 删目录失败不能再静默报成功（实测出现过目录仍在却说已删除）"""
+        _port = panel.next_free_port(18090)      # 同类里别的测试占了 18083/18084/18085，动态取空闲端口
+        code, d = self._req("POST", "/api/apps",
+                            {"template": "typecho", "name": "keepme", "port": _port, "domain": ""})
+        self.assertEqual(code, 200, d)
+        aid = d["app"]["id"]
+        ddir = panel.AppStore().get(aid)["data_dir"]
+        os.makedirs(os.path.join(ddir, "html"), exist_ok=True)
+        real_rmtree = __import__("shutil").rmtree
+
+        def fake_rmtree(path, *a, **kw):
+            if os.path.abspath(path) == os.path.abspath(ddir):
+                raise OSError("EBUSY: 模拟删除失败")
+            return real_rmtree(path, *a, **kw)
+
+        with unittest.mock.patch("shutil.rmtree", side_effect=fake_rmtree):
+            code, d = self._req("DELETE", "/api/apps/%s?purge=1" % aid)
+        self.assertEqual(code, 200, d)
+        self.assertIn("数据删除失败", d.get("msg", ""), "删除失败必须如实报告，不能静默")
+        self.assertTrue(os.path.isdir(ddir), "模拟失败时目录本就该还在")
+        real_rmtree(ddir, ignore_errors=True)
+
     def test_stale_store_cannot_resurrect_deleted_app(self):
         """删除后，持有旧快照的部署任务 update() 不能把记录写回来（读-改-写）"""
         a = panel.AppStore().add({"template": "typecho", "name": "race", "folder": "race-1",
@@ -6210,11 +6234,21 @@ class TestFrontendPanelPortRedirect(unittest.TestCase):
         self.assertIn("function afterPanelPortChange(", self.html,
                       "缺少统一的改端口后跳转助手")
 
-    def test_both_entrypoints_call_helper(self):
+    def test_entrypoint_calls_helper(self):
         self.assertIn("afterPanelPortChange(p)", self.html,
                       "系统页「修改面板端口」按钮没有走跳转逻辑")
-        self.assertIn("afterPanelPortChange(port)", self.html,
-                      "面板设置弹窗没有走跳转逻辑")
+
+    def test_only_helper_builds_port_target(self):
+        """只有统一助手允许拼 "主机:端口" 跳转目标（别处自己拼 = 又会分叉）"""
+        self.assertEqual(self.html.count("${location.hostname}:"), 1,
+                         "有多处在拼 host:port 跳转目标，行为会再次分叉")
+        self.assertIn("${location.hostname}:", _js_fn_body(self.html, "afterPanelPortChange"))
+
+    def test_no_superseded_dead_functions(self):
+        """被新入口取代的旧函数必须删掉（留成死代码最容易让人误判功能还在）"""
+        for old_fn in ("setPanelPort", "setIpv6", "toggleBbr"):
+            self.assertNotIn("function " + old_fn + "(", self.html,
+                             old_fn + " 已被 sys* 取代，应删除而不是留着当死代码")
 
     def test_system_button_no_longer_uses_plain_sysrun(self):
         # sysRun 只弹提示、末尾 loadSystem()，改完端口不会跳
@@ -6272,6 +6306,78 @@ class TestFrontendPanelPortRedirect(unittest.TestCase):
                                  f"第 {i+1} 个内联 script 块语法错误：{r.stderr.strip()[:300]}")
             finally:
                 os.unlink(path)
+
+
+def _js_fn_body(html, name):
+    """按花括号配平从 index.html 里抽出某个函数完整体（前端测试共用）"""
+    m = re.search(r"function\s+" + re.escape(name) + r"\s*\([^)]*\)\s*\{", html)
+    if not m:
+        raise AssertionError(name + " 不存在")
+    i = m.end() - 1
+    depth, j = 0, i
+    while j < len(html):
+        if html[j] == "{":
+            depth += 1
+        elif html[j] == "}":
+            depth -= 1
+            if depth == 0:
+                break
+        j += 1
+    return html[m.start():j]
+
+
+class TestFrontendWiring(unittest.TestCase):
+    """前端"断线"防回归（v3.2.26）。
+
+    背景：v3.2.0 把「面板端口」入口从 setPanelPort() 换成 sysPanelPortSave() 时，
+    跳转逻辑没跟着搬过去，旧函数成了没人引用的死代码 —— 功能静默丢了 5 天。
+    同批还有 IPv6/BBR 的详细确认弹窗被简化掉了。这里加两道检查，防止再发生。
+    """
+
+    ALLOWED_ORPHANS = {"$", "initSec"}
+
+    @classmethod
+    def setUpClass(cls):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "static", "index.html"), encoding="utf-8") as f:
+            cls.html = f.read()
+        cls.js = "\n".join(re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", cls.html, re.S))
+
+    def _defined(self):
+        names = set(re.findall(r"\bfunction\s+([A-Za-z_$][\w$]*)\s*\(", self.js))
+        names |= set(re.findall(
+            r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:async\s*)?(?:function|\()", self.js))
+        return names
+
+    def _orphans(self):
+        out = []
+        for n in self._defined():
+            # 在整份 HTML 里数引用（按钮是通过 onclick="fn(" 引用的，不能只搜 JS 块）
+            refs = len(re.findall(r"\b" + re.escape(n) + r"\b", self.html))
+            iife = re.search(r"\(\s*function\s+" + re.escape(n) + r"\s*\(", self.html)
+            if refs <= 1 and not iife:
+                out.append(n)
+        return sorted(out)
+
+    def test_no_orphan_functions(self):
+        """不允许出现"定义了但全文件没人引用"的函数（改成死代码 = 功能可能已丢）"""
+        orphans = set(self._orphans()) - self.ALLOWED_ORPHANS
+        self.assertFalse(orphans,
+                         "这些函数没人引用了（功能接线可能丢了，确认后要么接线要么删除，"
+                         "确实要保留则加进 ALLOWED_ORPHANS）：" + ", ".join(sorted(orphans)))
+
+    def test_all_inline_handlers_defined(self):
+        """按钮上绑的函数必须真的存在（否则按钮点了报 undefined）"""
+        kw = {"if", "for", "while", "return", "void", "typeof", "this", "window", "document",
+              "event", "confirm", "alert", "location", "setTimeout"}
+        handlers = set(re.findall(r'\bon[a-z]+="([A-Za-z_$][\w$]*)\s*\(', self.html))
+        missing = sorted(h for h in handlers if h not in self._defined() and h not in kw)
+        self.assertFalse(missing, "按钮绑了不存在的函数：" + ", ".join(missing))
+
+    def test_ipv6_and_bbr_keep_confirm_dialogs(self):
+        """v3.2.0 丢过的详细确认弹窗要保留（系统级网络改动不能默默执行）"""
+        for fn in ("sysIpv6", "sysBbrToggle"):
+            self.assertIn("confirmPanel(", _js_fn_body(self.html, fn), fn + " 丢了确认弹窗")
 
 
 if __name__ == "__main__":

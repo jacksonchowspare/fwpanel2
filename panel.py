@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.25"
+CURRENT_VERSION = "3.2.26"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 # 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
 THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
@@ -2739,11 +2739,24 @@ def app_remove(app, purge=False):
     ok, msg = app_compose_cmd(app["folder"], "down", "--remove-orphans", timeout=300)
     logs = ["容器已停止并移除" if ok else "容器停止失败：" + msg[:160]]
     if purge:
+        # 不要用 ignore_errors=True 了事：删失败会被静默吞掉，界面照样宣称"数据目录已删除"，
+        # 实测出现过目录仍在却报成功（测试偶发红）。现在失败会重试一次，仍失败就在日志里说实话。
+        ddir = app["data_dir"]
+        err = ""
         try:
-            shutil.rmtree(app["data_dir"], ignore_errors=True)
-            logs.append("数据目录已删除")
+            shutil.rmtree(ddir)
         except Exception as e:
-            logs.append("数据删除失败：" + str(e)[:120])
+            err = str(e)[:120]
+            try:
+                shutil.rmtree(ddir, ignore_errors=True)
+            except Exception:
+                pass
+        if os.path.exists(ddir):
+            logs.append("数据删除失败（目录仍存在，请手动删除 %s）：%s" % (ddir, err or "未知原因"))
+        elif err:
+            logs.append("数据目录已删除（首次失败已重试）")
+        else:
+            logs.append("数据目录已删除")
     else:
         logs.append("数据已保留（%s）" % app["data_dir"])
     # 反代条目联动清理（证书文件保留，避免影响其它引用）
