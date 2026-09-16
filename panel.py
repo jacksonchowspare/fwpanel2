@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.33"
+CURRENT_VERSION = "3.2.34"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 # 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
 THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
@@ -6494,7 +6494,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         elif path == "/api/system":
             self._api_system()
         elif path == "/api/system/timezones":
-            self._send(200, {"zones": timezone_list(),
+            self._send(200, {"zones": timezone_list(), "common": COMMON_TIMEZONES,
                              "current": time_status().get("timezone", "")})
         elif path == "/api/system/dns/test":
             self._api_system_dns_test()

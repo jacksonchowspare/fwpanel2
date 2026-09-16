@@ -6581,6 +6581,7 @@ class TestTimezonesAndSysControls(unittest.TestCase):
     def test_timezones_endpoint_registered(self):
         self.assertIn('"/api/system/timezones"', self.panel)
         self.assertIn("timezone_list()", self.panel)
+        self.assertIn('"common": COMMON_TIMEZONES', self.panel, "接口要单独给常用分组，前端才好分组显示")
 
     def test_fallback_when_zoneinfo_missing(self):
         # zone.tab 不存在时也要给出可用列表（不能返回空）
@@ -6590,10 +6591,32 @@ class TestTimezonesAndSysControls(unittest.TestCase):
         self.assertEqual(z, panel.COMMON_TIMEZONES)
 
     def test_tz_input_supports_dropdown(self):
+        """v3.2.34：原生 datalist 在框里有内容时点不开、样式也跟不上主题，改为自绘下拉。"""
         self.assertIn('id="sys_tz"', self.html)
-        self.assertIn('list="sys_tz_list"', self.html)
-        self.assertIn('id="sys_tz_list"', self.html)
-        self.assertIn("<datalist", self.html)
+        self.assertIn('id="tz_wrap"', self.html)
+        self.assertIn('id="tz_pop"', self.html)
+        self.assertIn('id="tz_list"', self.html)
+        # 真正的判据：不再有 datalist 元素、输入框也不再引用它（注释里提到 datalist 没关系）
+        self.assertNotIn("<datalist id=", self.html, "不要再用原生 datalist（框里有值时点不开）")
+        self.assertNotIn('list="sys_tz_list"', self.html)
+        for fn in ("tzOpen", "tzClose", "tzToggle", "tzInput", "tzKey", "tzRender"):
+            self.assertIn("function %s(" % fn, self.html)
+        # 输入框/箭头都要能展开
+        self.assertIn('onclick="tzOpen()"', self.html)
+        self.assertIn('onclick="tzToggle(event)"', self.html)
+
+    def test_tz_open_shows_full_list(self):
+        """展开时必须给完整列表：拿框里的值当筛选的话，框里有值就只列它自己 = 看着还是打不开。"""
+        idx = self.html.index("function tzOpen(")
+        seg = self.html[idx:idx + 900]
+        self.assertIn('tzRender("")', seg)
+        self.assertNotIn('tzRender((($("sys_tz")', seg)
+
+    def test_tz_popup_styled_with_theme_vars(self):
+        """下拉样式必须走面板主题变量（含像素主题的 --bdw 描边），否则跟主题不搭。"""
+        for token in (".tz-wrap { position: relative", ".tz-pop { position: absolute", ".tz-item:hover",
+                      "var(--card)", "var(--bdw)", "var(--shadow-modal)", "var(--hover-bg2)"):
+            self.assertIn(token, self.html, token)
 
     def test_tz_save_validates_locally(self):
         self.assertIn("loadTimezones", self.html)

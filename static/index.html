@@ -593,6 +593,25 @@ tr:hover td { background: var(--panel-solid); }
     padding: 7px 9px; border-radius: 6px; cursor: pointer; text-align: left; white-space: nowrap; }
   .twin-ctx .tc-btn:hover { background: var(--hover-bg2); }
   .twin-ctx .tc-sep { height: 1px; background: var(--border); margin: 2px 4px; }
+  /* 时区选择器（v3.2.34）：原生 datalist 的毛病是"框里有内容时点不开"、样式也跟不上主题，
+     所以自绘下拉：点输入框/箭头展开，输入即筛选，点条目即选中，Esc 或点别处收起 */
+  .tz-wrap { position: relative; display: inline-block; width: 250px; }
+  .tz-wrap input { width: 100%; padding-right: 30px; }
+  .tz-btn { position: absolute; right: 2px; top: 2px; bottom: 2px; width: 26px; border: 0;
+    background: transparent; color: var(--muted); font-size: 11px; line-height: 1; cursor: pointer;
+    border-radius: calc(var(--r-input, 6px) - 2px); }
+  .tz-btn:hover { background: var(--hover-bg2); color: var(--text); }
+  .tz-pop { position: absolute; z-index: 88; left: 0; right: 0; top: calc(100% + 4px); display: none;
+    max-height: 264px; overflow: auto; padding: 4px; background: var(--card);
+    border: var(--bdw) solid var(--border); border-radius: var(--r-panel, 10px);
+    box-shadow: var(--shadow-modal); }
+  .tz-pop.show { display: block; }
+  .tz-grp { padding: 6px 8px 3px; font-size: 11px; color: var(--muted); }
+  .tz-item { padding: 6px 9px; font-size: 12.5px; color: var(--text); border-radius: 6px;
+    cursor: pointer; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .tz-item:hover { background: var(--hover-bg2); }
+  .tz-item.on { color: var(--accent); font-weight: 600; }
+  .tz-empty { padding: 8px 9px; font-size: 12.5px; color: var(--muted); }
 </style>
 <script>
 /* 界面缩放:4K/高分屏按视口宽度自动放大(html zoom,首帧前生效防闪烁);可在主题面板手动调 */
@@ -1415,8 +1434,12 @@ window.addEventListener("error", function (ev) {
           <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg> 时间与主机名</h2>
           <div id="sys_time" style="font-size:13px;margin-bottom:10px">检测中...</div>
           <div class="form-row">
-            <input id="sys_tz" list="sys_tz_list" autocomplete="off" placeholder="时区（输入关键字筛选，如 shanghai）" style="width:230px">
-            <datalist id="sys_tz_list"></datalist>
+            <div class="tz-wrap" id="tz_wrap">
+              <input id="sys_tz" autocomplete="off" placeholder="点时区框选择，或输入筛选"
+                     onclick="tzOpen()" onfocus="tzOpen()" oninput="tzInput()" onkeydown="tzKey(event)">
+              <button type="button" class="tz-btn" id="tz_btn" onclick="tzToggle(event)" title="展开时区列表">▼</button>
+              <div class="tz-pop" id="tz_pop"><div id="tz_list"></div></div>
+            </div>
             <button class="btn ghost" onclick="sysTimeSave()">设置时区</button>
             <button class="btn ghost" id="btn_ntp_on" onclick="sysNtpToggle(true)">开启 NTP</button>
             <button class="btn ghost" id="btn_ntp_off" onclick="sysNtpToggle(false)">关闭 NTP</button>
@@ -3414,22 +3437,98 @@ function renderSysDnsTest(list) {
     + esc(t.domain) + " " + esc(t.ok ? (t.addrs || []).join("/") + "　" + t.ms + "ms" : (t.error || "")) + "</span>").join("　");
 }
 
-/* 时区列表（v3.2.33）：后端读本机 /usr/share/zoneinfo/zone.tab，列出来的都是真能用的。
-   以前只有个纯输入框，得手打 Asia/Shanghai 这种名字，用户反馈太麻烦。 */
-let tzList = [], tzLoading = false;
+/* 时区选择器（v3.2.33 起，v3.2.34 改为自绘下拉）。
+   后端读本机 /usr/share/zoneinfo/zone.tab，列出来的都是这台机器真能用的。
+   原生的 <input list>+<datalist> 有两个毛病：框里已有内容时点框不弹（用户实测"打不开"）、
+   样式也跟不上面板主题 —— 所以自己画一个：点框/箭头展开，输入即筛选，点条目即选中。 */
+let tzList = [], tzCommon = [], tzLoading = false, tzBound = false;
+
 async function loadTimezones() {
   if (tzList.length || tzLoading) return tzList;
   tzLoading = true;
+  tzRender("");                      // 先把"正在读取…"显示出来
   try {
     const d = await api("GET", "/api/system/timezones");
     tzList = (d && d.zones) || [];
-    const dl = $("sys_tz_list");
-    if (dl && tzList.length) dl.innerHTML = tzList.map(z => '<option value="' + esc(z) + '"></option>').join("");
+    tzCommon = (d && d.common) || [];
   } catch (e) {
-    tzList = [];            // 拉不到列表不影响手输，只是没有下拉可选
+    tzList = []; tzCommon = [];      // 拉不到不影响手输，只是没有下拉可选
   }
   tzLoading = false;
+  tzRender("");                     // 展开时给完整列表（当前项高亮），不拿框里的值当筛选
   return tzList;
+}
+
+function tzItemHtml(z, cur) {
+  return '<div class="tz-item' + (z === cur ? " on" : "") + '" data-tz="' + esc(z) + '">'
+    + (z === cur ? "✓ " : "") + esc(z) + "</div>";
+}
+
+function tzRender(kw) {
+  const box = $("tz_list");
+  if (!box) return;
+  const cur = (($("sys_tz") || {}).value || "").trim();
+  const k = (kw || "").trim().toLowerCase();
+  if (!tzList.length) {
+    box.innerHTML = '<div class="tz-empty">' + (tzLoading ? "正在读取时区列表…"
+      : "时区列表读取失败，可直接输入，如 Asia/Shanghai") + "</div>";
+    return;
+  }
+  const hits = tzList.filter(z => !k || z.toLowerCase().indexOf(k) >= 0);
+  if (!hits.length) { box.innerHTML = '<div class="tz-empty">没有匹配的时区：' + esc(kw) + "</div>"; return; }
+  if (k) { box.innerHTML = hits.map(z => tzItemHtml(z, cur)).join(""); return; }
+  const common = tzCommon.filter(z => tzList.indexOf(z) >= 0);
+  box.innerHTML = (common.length ? '<div class="tz-grp">常用</div>' + common.map(z => tzItemHtml(z, cur)).join("") : "")
+    + '<div class="tz-grp">全部时区（' + tzList.length + "）</div>"
+    + tzList.filter(z => common.indexOf(z) < 0).map(z => tzItemHtml(z, cur)).join("");
+}
+
+function tzOpen() {
+  const pop = $("tz_pop");
+  if (!pop) return;
+  pop.classList.add("show");
+  // 关键：展开时渲染**完整列表**，不拿框里已有的值去过滤。
+  // 否则框里是 Asia/Shanghai 时就只列它自己，看着还是"打不开"（原生 datalist 的老毛病）。
+  tzRender("");
+  loadTimezones();
+  if (!tzBound) {                                 // 全局监听只注册一次
+    tzBound = true;
+    document.addEventListener("click", function (e) {
+      const w = $("tz_wrap");
+      if (w && e.target && !w.contains(e.target)) tzClose();
+    });
+    const box = $("tz_list");
+    if (box) box.addEventListener("mousedown", function (e) {
+      const it = e.target && e.target.closest ? e.target.closest(".tz-item") : null;
+      if (!it) return;
+      e.preventDefault();                         // 别让输入框先失焦
+      const inp = $("sys_tz");
+      if (inp) inp.value = it.getAttribute("data-tz");
+      tzClose();
+    });
+  }
+}
+
+function tzClose() { const p = $("tz_pop"); if (p) p.classList.remove("show"); }
+
+function tzToggle(e) {
+  if (e && e.stopPropagation) e.stopPropagation();
+  const p = $("tz_pop");
+  if (p && p.classList.contains("show")) tzClose(); else tzOpen();
+}
+
+function tzInput() { tzOpen(); tzRender((($("sys_tz") || {}).value || "")); }
+
+function tzKey(e) {
+  if (!e) return;
+  if (e.key === "Escape") { tzClose(); e.preventDefault(); return; }
+  if (e.key === "Enter") {
+    const k = (e.target.value || "").trim().toLowerCase();
+    const hits = tzList.filter(z => !k || z.toLowerCase().indexOf(k) >= 0);
+    if (hits.length) { e.target.value = hits[0]; tzRender(hits[0]); }
+    tzClose();
+    e.preventDefault();
+  }
 }
 
 function renderSysTime(d) {
