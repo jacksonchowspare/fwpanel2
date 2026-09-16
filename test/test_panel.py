@@ -6386,6 +6386,41 @@ class TestFrontendWiring(unittest.TestCase):
         self.assertNotIn("typeof upgradeInfo", self.html,
                          "typeof 对处于 TDZ 的 let 同样抛错，不能当守卫用")
 
+    def test_early_iife_does_not_touch_late_state(self):
+        """TDZ 防回归（用户实测 @行 3308）：中段顶层 IIFE 调 switchTab()，而它读的
+        sysLoaded / appsLoaded / appList / sitesLoaded 都在后面才声明 —— 只要用户
+        上次停在「系统」或「应用」页且已登录，加载即 TDZ、整段脚本挂掉。
+
+        这里解析 switchTab 用到的顶层状态，断言它们的声明都早于 initSec IIFE。
+        """
+        lines = self.html.splitlines()
+        iife = next((i for i, l in enumerate(lines) if l.startswith("(function initSec()")), None)
+        self.assertIsNotNone(iife, "找不到 initSec IIFE")
+
+        m = re.search(r"function switchTab\(sec\)\s*\{", self.html)
+        self.assertIsNotNone(m, "找不到 switchTab")
+        body_start = m.end() - 1
+        depth, j = 0, body_start
+        while j < len(self.html):
+            if self.html[j] == "{":
+                depth += 1
+            elif self.html[j] == "}":
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        body = self.html[body_start:j]
+
+        decls = {}
+        for i, l in enumerate(lines):
+            mm = re.match(r"^(?:let|const|var)\s+(.+)$", l)
+            if mm:
+                for n in re.findall(r"([A-Za-z_$][\w$]*)\s*(?==|,|;|$)", mm.group(1)):
+                    decls.setdefault(n, i)
+        used = set(re.findall(r"\b([A-Za-z_$][\w$]*)\b", body)) & set(decls)
+        late = sorted(n for n in used if decls[n] > iife)
+        self.assertFalse(late, "switchTab 读到的这些状态声明在 initSec IIFE 之后（会 TDZ）：" + ", ".join(late))
+
     def test_boot_error_is_surfaced_not_hidden(self):
         """主脚本抛错时要显示真实报错+行号，而不是含糊的"页面加载受阻"（用户实测困惑）"""
         self.assertIn("页面脚本执行出错", self.html)

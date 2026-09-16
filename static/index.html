@@ -3316,10 +3316,12 @@ function switchTab(sec) {
     else refreshFedStatus();   // 已渲染过:静默重新探测各节点状态,不重建卡片
   }
 }
-(function initSec() {
-  const saved = localStorage.getItem("fw_sec");
-  switchTab(saved && ["overview", "fw", "site", "app", "sys", "ssh", "px", "dk", "fed"].indexOf(saved) >= 0 ? saved : "overview");
-})();
+/* ⚠ 这里原本有个顶层 IIFE 直接调 switchTab(保存的 tab)：它在脚本中段执行，而
+   switchTab 读的 sysLoaded / appsLoaded / appList / sitesLoaded 要到后面才声明 →
+   只要用户上次停在「系统」或「应用」页，加载时就是 TDZ：
+   "Cannot access 'sysLoaded' before initialization"（用户实测 @行 3308），
+   主脚本直接挂掉 → 登录页弹"页面加载受阻"。
+   已挪到脚本末尾（所有声明之后），见文件底部 initSec。 */
 
 /* ---------- 系统页（v3.2.0，本机设置统一入口） ---------- */
 let sysData = {}, sysLoaded = false;
@@ -6241,6 +6243,11 @@ window.addEventListener("resize", () => {
 });
 
 /* ---------- 初始化 ---------- */
+/* 恢复上次停留的 tab：必须放在所有顶层 let/const 声明之后（见文件开头那段注释） */
+(function initSec() {
+  const saved = localStorage.getItem("fw_sec");
+  switchTab(saved && ["overview", "fw", "site", "app", "sys", "ssh", "px", "dk", "fed"].indexOf(saved) >= 0 ? saved : "overview");
+})();
 document.addEventListener("keydown", e => { if (e.key === "Enter" && !$("main").classList.contains("hidden") === false) login(); });
 (async () => {
   if (token) { try { showMain(); await refreshAll(); } catch (e) { showLogin(); } }
