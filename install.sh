@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.19"
+readonly SCRIPT_VERSION="3.2.20"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -779,81 +779,91 @@ interactive_channel_menu() {
     [ "$YES" = "1" ] && return 0
     menu_can_read || return 0
 
-    local stable beta_tag cur ans ver tries
+    local stable beta_tag cur ans ver tries confirm
     stable="$(menu_preview_tag stable)"
     beta_tag="$(menu_preview_tag beta)"
     cur="$(installed_panel_version)"
 
+    # 头部（含当前版本）只打印一次；选项每轮重画，4/5/6/7 执行完回到这里继续选
     echo ""
     if [ -n "$cur" ]; then
         echo "  当前已装 : 面板 v$cur"
         echo "  ------------------------------------------------------------"
     fi
-    echo "  请选择要执行的操作："
-    echo ""
-    echo "    1) 安装正式版    最新正式版：${stable:-（查询失败，安装时会重试）}"
-    echo "    2) 安装测试版    最新测试版：${beta_tag:-（查询失败，安装时会重试）}"
-    echo "    3) 安装指定版本  手动输入版本号（不用带 v，例如 3.1.1）"
-    echo "    ------------------------------------------------------------"
-    echo "    4) 环境体检      只检查系统环境与依赖，不改动任何东西"
-    echo "    5) 改用户名密码  交互式修改面板登录用户名和/或密码（回车 = 该项不改）"
-    echo "    6) 卸载          停止服务并删除程序文件（保留 /etc/fwpanel 配置与规则）"
-    echo "    7) 查看登录信息  显示面板登录地址和用户名（需 root；密码不保存，只能重设）"
-    echo ""
 
-    ans=""; tries=0
     while :; do
-        printf '  请输入 1 - 7 后回车（直接回车 = 1 安装正式版）: '
+        echo "  请选择要执行的操作："
+        echo ""
+        echo "    1) 安装正式版    最新正式版：${stable:-（查询失败，安装时会重试）}"
+        echo "    2) 安装测试版    最新测试版：${beta_tag:-（查询失败，安装时会重试）}"
+        echo "    3) 安装指定版本  手动输入版本号（不用带 v，例如 3.1.1）"
+        echo "    ------------------------------------------------------------"
+        echo "    4) 环境体检      只检查系统环境与依赖，不改动任何东西"
+        echo "    5) 改用户名密码  交互式修改面板登录用户名和/或密码（回车 = 该项不改）"
+        echo "    6) 卸载          停止服务并删除程序文件（保留 /etc/fwpanel 配置与规则）"
+        echo "    7) 查看登录信息  显示面板登录地址和用户名（需 root；密码不保存，只能重设）"
+        echo "    8) 退出脚本      不做任何改动直接退出"
+        echo ""
+
+        printf '  请输入 1 - 8 后回车（直接回车 = 1 安装正式版，8 = 退出）: '
+        ans=""
         menu_read ans || return 0
         case "$ans" in
-            ""|1)  log_info "已选择：安装正式版"; return 0 ;;
-            2)     BETA=1; log_info "已选择：安装测试版"; return 0 ;;
-            3)     break ;;
+            ""|1)  echo ""
+                   log_info "已选择：安装正式版"
+                   return 0 ;;
+            2)     echo ""
+                   BETA=1
+                   log_info "已选择：安装测试版"
+                   return 0 ;;
+            3)     echo ""
+                   tries=0
+                   while :; do
+                       printf '  请输入版本号（不用带 v，例如 3.1.1，回车返回菜单）: '
+                       ver=""
+                       menu_read ver || return 0
+                       if [ -z "$ver" ]; then
+                           break            # 回车 = 返回主菜单
+                       fi
+                       ver="${ver#v}"; ver="${ver#V}"
+                       if version_input_ok "$ver"; then
+                           VERSION_TAG="$ver"
+                           log_info "已选择：安装指定版本 v$ver"
+                           return 0
+                       fi
+                       tries=$((tries + 1))
+                       if [ "$tries" -ge 3 ]; then
+                           error "版本号格式不对（应形如 3.1.1，不用带 v）"
+                       fi
+                       log_warn "版本号格式不对：$ver（应形如 3.1.1，不用带 v）"
+                   done
+                   echo "" ;;
             4)     echo ""
                    do_check
-                   echo ""
                    log_info "体检完成（未做任何改动）"
-                   exit 0 ;;
+                   echo "" ;;
             5)     echo ""
                    do_change_password
-                   echo ""
                    log_info "凭据修改流程结束"
-                   exit 0 ;;
+                   echo "" ;;
             6)     echo ""
                    printf '  确认卸载 fwpanel？输入 yes 确认，其他内容取消: '
-                   local confirm=""
+                   confirm=""
                    menu_read confirm || confirm=""
                    case "$confirm" in
-                       y|Y|yes|YES|Yes) do_uninstall; echo ""; log_info "卸载流程结束" ;;
+                       y|Y|yes|YES|Yes) do_uninstall; log_info "卸载流程结束" ;;
                        *) log_warn "已取消卸载（未做任何改动）" ;;
                    esac
+                   echo "" ;;
+            7)     echo ""
+                   do_show_login_info ;;
+            8|q|Q|quit|exit)
+                   echo ""
+                   log_info "已退出，未做任何改动"
                    exit 0 ;;
-            7)     do_show_login_info
-                   exit 0 ;;
-            *)     tries=$((tries + 1))
-                   if [ "$tries" -ge 3 ]; then
-                       log_warn "输入无效，按默认处理：安装正式版"
-                       return 0
-                   fi
-                   log_warn "输入无效：$ans（请填 1 - 7）" ;;
+            *)     echo ""
+                   log_warn "输入无效：$ans（请填 1 - 8）" ;;
         esac
-    done
-
-    tries=0
-    while :; do
-        printf '  请输入版本号（不用带 v，例如 3.1.1）: '
-        menu_read ver || return 0
-        ver="${ver#v}"; ver="${ver#V}"
-        if version_input_ok "$ver"; then
-            VERSION_TAG="$ver"
-            log_info "已选择：安装指定版本 v$ver"
-            return 0
-        fi
-        tries=$((tries + 1))
-        if [ "$tries" -ge 3 ]; then
-            error "版本号格式不对（应形如 3.1.1，不用带 v）"
-        fi
-        log_warn "版本号格式不对：$ver（应形如 3.1.1，不用带 v）"
     done
 }
 

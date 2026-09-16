@@ -351,29 +351,65 @@ case "$out" in
     *"目标版本 : 面板 v9.9.10-beta（最新测试版）"*) ok "菜单选 2 端到端 → 目标版本 v9.9.10-beta（最新测试版）" ;;
     *) bad "端到端菜单失败: $(printf '%s' "$out" | head -8)" ;;
 esac
-# 4) 环境体检 / 5) 改密码 / 6) 卸载：用 stub 替换真实动作，只验证菜单分发与确认弹窗
-menu_action() {  # $1=输入
+# 4/5/6/7 执行完要回到主菜单；8) 退出；1/2/3 进入安装流程
+menu_case() {  # $1=输入 → 输出原文（含 stub 调用标记）
     printf '%s\n' "$1" | env -i PATH=/tmp/fakebin_menu FW_MENU=1 HOME=/tmp bash -c '
         source '"$TMPF"'
-        ACTION=install; VERSION_TAG=""; BETA=0; YES=0
+        ACTION=install; VERSION_TAG=""; BETA=0; YES=0; MENU_SRC=""
         do_check() { echo "DO_CHECK_CALLED"; }
         do_change_password() { echo "DO_CHANGE_PW_CALLED"; }
         do_uninstall() { echo "DO_UNINSTALL_CALLED"; }
         do_show_login_info() { echo "DO_SHOW_INFO_CALLED"; }
         interactive_channel_menu
-        echo "MENU_RETURNED BETA=$BETA VERSION_TAG=$VERSION_TAG"' 2>/dev/null
+        echo "MENU_RETURNED BETA=$BETA VERSION_TAG=$VERSION_TAG"' 2>&1
 }
-t4="$(menu_action 4)";  case "$t4" in *DO_CHECK_CALLED*) case "$t4" in *MENU_RETURNED*) bad "选 4 不该继续走安装" ;; *) ok "菜单 4) 环境体检 → 执行体检并退出（不走安装）" ;; esac ;; *) bad "选 4 未触发体检: $t4" ;; esac
-t5="$(menu_action 5)";  case "$t5" in *DO_CHANGE_PW_CALLED*) case "$t5" in *MENU_RETURNED*) bad "选 5 不该继续走安装" ;; *) ok "菜单 5) 改密码 → 执行改密并退出" ;; esac ;; *) bad "选 5 未触发改密: $t5" ;; esac
-t6y="$(menu_action '6
-yes')"; case "$t6y" in *DO_UNINSTALL_CALLED*) case "$t6y" in *MENU_RETURNED*) bad "选 6 确认后不该继续走安装" ;; *) ok "菜单 6) 卸载 → 确认 yes 后执行卸载" ;; esac ;; *) bad "选 6+yes 未触发卸载: $t6y" ;; esac
-t6n="$(menu_action '6
-no')"; case "$t6n" in *DO_UNINSTALL_CALLED*) bad "选 6 输入 no 竟然还卸载了" ;; *) case "$t6n" in *MENU_RETURNED*) bad "取消卸载后不该继续安装" ;; *) ok "菜单 6) 卸载 → 未确认则取消，不做任何改动" ;; esac ;; esac
-t7info="$(menu_action 7)"; case "$t7info" in *DO_SHOW_INFO_CALLED*) case "$t7info" in *MENU_RETURNED*) bad "选 7 不该继续走安装" ;; *) ok "菜单 7) 查看登录信息 → 展示并退出（不走安装）" ;; esac ;; *) bad "选 7 未触发登录信息展示: $t7info" ;; esac
-t1="$(menu_action 1)"; case "$t1" in *MENU_RETURNED*) ok "菜单 1) 仍正常进入安装流程" ;; *) bad "选 1 未回到安装流程: $t1" ;; esac
-t9="$(menu_action '9
+menu_draws() { printf '%s' "$1" | grep -c "请选择要执行的操作" || true; }
+menu_has()  { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
+
+out="$(menu_case '4
+8')"
+menu_has DO_CHECK_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
+    && ok "4) 体检执行后返回主菜单（菜单重画 2 次）" || bad "4) 未返回菜单: $(printf '%s' "$out" | head -5)"
+menu_has MENU_RETURNED "$out" && bad "选 8 退出后不该继续安装" || ok "8) 退出脚本（不再安装）"
+
+out="$(menu_case '5
+8')"
+menu_has DO_CHANGE_PW_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
+    && ok "5) 改凭据后返回主菜单" || bad "5) 未返回菜单"
+out="$(menu_case '7
+8')"
+menu_has DO_SHOW_INFO_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
+    && ok "7) 查看信息后返回主菜单" || bad "7) 未返回菜单"
+
+out="$(menu_case '6
+yes
+8')"
+menu_has DO_UNINSTALL_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
+    && ok "6) 确认 yes 后卸载并返回主菜单" || bad "6)+yes 异常"
+out="$(menu_case '6
+no
+8')"
+menu_has DO_UNINSTALL_CALLED "$out" && bad "6) 输入 no 竟然还卸载" \
+    || { [ "$(menu_draws "$out")" -eq 2 ] && ok "6) 输入 no 取消卸载并返回主菜单" || bad "6) 取消后未返回菜单"; }
+
+out="$(menu_case '1')"
+menu_has "MENU_RETURNED BETA=0 VERSION_TAG=" "$out" && ok "1) 进入安装流程（正式版）" || bad "1) 异常: $out"
+out="$(menu_case '2')"
+menu_has "MENU_RETURNED BETA=1" "$out" && ok "2) 进入安装流程（测试版）" || bad "2) 异常: $out"
+out="$(menu_case '')"
+menu_has "MENU_RETURNED BETA=0" "$out" && ok "直接回车 = 1 安装正式版" || bad "回车默认异常"
+out="$(menu_case '3
+3.1.1')"
+menu_has "MENU_RETURNED BETA=0 VERSION_TAG=3.1.1" "$out" && ok "3) 指定版本进入安装流程" || bad "3) 异常: $out"
+out="$(menu_case '3
+
+1')"
+menu_has "MENU_RETURNED BETA=0 VERSION_TAG=" "$out" && ok "3) 版本号直接回车 → 返回主菜单（不再卡死）" || bad "3) 回车返回异常"
+out="$(menu_case '9
 9
-9')"; case "$t9" in *MENU_RETURNED*) ok "乱填 3 次 → 按默认正式版继续安装" ;; *) bad "乱填后未回到安装流程: $t9" ;; esac
+1')"
+menu_has "MENU_RETURNED BETA=0" "$out" && [ "$(menu_draws "$out")" -ge 3 ] \
+    && ok "乱填只提示重问，不会强制按默认安装（连问 3 次后仍等输入）" || bad "乱填处理异常"
 
 # 管道模式（curl | sudo bash）下 stdin 是脚本自身，菜单必须改走 /dev/tty —— 用 script 造 pty 模拟真实场景
 if command -v script >/dev/null 2>&1; then
