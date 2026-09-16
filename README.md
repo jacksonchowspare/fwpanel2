@@ -63,6 +63,13 @@ fwp
 - 非 root 用户运行会**自动 sudo 提权**（会提示你可能要输密码）
 - 参数照常透传，例如 `sudo fwp --beta`、`sudo fwp --check`
 - 卸载面板时 `fwp` 与缓存脚本一并删除
+
+**已经装好面板、只想更新脚本和 `fwp` 本身**（不重装、不重启面板）：
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh -o /tmp/fwinst.sh
+sudo bash /tmp/fwinst.sh --update-script
+```
 - 5) 用户名和密码都可以改，**直接回车 = 该项不改**（用户名 3-32 位字母/数字/下划线，密码 ≥8 位，都输两遍确认）
 - 7) 需要 root；显示面板地址（含反代域名，若已配）和用户名，并可**一键进入重设流程**（按 `r`，等同菜单 5）
 

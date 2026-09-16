@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.23"
+readonly SCRIPT_VERSION="3.2.24"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -687,11 +687,64 @@ do_update_script() {
     mkdir -p "$APP_DIR"
     chmod 0755 "$tmp"
     mv "$tmp" "$cache"
+    # 顺手刷新快捷命令本体：老版本机器不必重装面板（不重启服务）就能拿到修好的 fwp
+    write_shortcut_wrapper
     if [ "$newv" = "$SCRIPT_VERSION" ]; then
         log_info "已是最新（脚本 v$SCRIPT_VERSION）"
     else
         log_info "脚本已更新：v$SCRIPT_VERSION → v$newv（下次运行 fwp 生效）"
     fi
+}
+
+write_shortcut_wrapper() {   # 生成/刷新 $WRAPPER_PATH（缓存路径与地址用占位符展开，避免 heredoc 里转义 $）
+# 快捷命令本体：只用本地缓存秒开菜单；缓存缺失才联网（带硬超时），更新脚本走菜单 9
+# ⚠ 包装器设计铁律：显示菜单前绝不联网。曾经在启动时静默刷新缓存，结果
+#    网络（DNS/线路）被黑洞时 curl 卡死不返回 → 用户输入 fwp 后一片空白、只能 Ctrl+C。
+cat > "$WRAPPER_PATH" <<'WRAPPER_EOF'
+#!/bin/sh
+# fwp —— fwpanel2 安装/管理菜单快捷入口（由 install.sh 自动生成，卸载面板时一并删除）
+# 设计：本地有缓存就直接秒开菜单（离线可用）；只有缓存缺失时才联网，且带硬超时 + 明确提示。
+CACHE="__CACHE__"
+URL="__URL__"
+
+if [ ! -s "$CACHE" ]; then
+echo "[fwp] 本地没有脚本缓存，正在获取（最多 10 秒）..." >&2
+tmp="$(mktemp)"
+ok=0
+if command -v curl >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then timeout 10 curl -fsSL -o "$tmp" "$URL" && ok=1
+    else curl -fsSL -m 10 -o "$tmp" "$URL" && ok=1; fi
+fi
+if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
+    if command -v timeout >/dev/null 2>&1; then timeout 10 wget -q -O "$tmp" "$URL" && ok=1
+    else wget -q -T 10 -O "$tmp" "$URL" && ok=1; fi
+fi
+if [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null \
+   && { ! command -v bash >/dev/null 2>&1 || bash -n "$tmp" 2>/dev/null; }; then
+    mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
+    chmod 0755 "$tmp" 2>/dev/null || true
+    mv "$tmp" "$CACHE" || rm -f "$tmp"
+else
+    rm -f "$tmp"
+    echo "[fwp] 获取脚本失败（网络不通或 GitHub 不可达）" >&2
+    echo "       请重新执行一键安装命令，或检查网络后重试" >&2
+    exit 1
+fi
+fi
+
+if [ "$(id -u)" -eq 0 ]; then
+exec bash "$CACHE" "$@"
+fi
+if command -v sudo >/dev/null 2>&1; then
+echo "[fwp] 需要 root 权限，正在通过 sudo 提权（可能会提示输入密码）" >&2
+exec sudo bash "$CACHE" "$@"
+fi
+echo "[fwp] 需要 root 权限：请用 sudo fwp" >&2
+exit 1
+WRAPPER_EOF
+# 把占位符换成真实路径（避免 heredoc 里到处转义 $）
+sed -i -e "s|__CACHE__|$APP_DIR/$CACHED_SCRIPT_NAME|g" -e "s|__URL__|$RAW_INSTALL_URL|g" "$WRAPPER_PATH" 2>/dev/null || true
+chmod 0755 "$WRAPPER_PATH" 2>/dev/null || true
 }
 
 install_shortcut() {
@@ -728,54 +781,7 @@ install_shortcut() {
         fi
     fi
 
-    # 快捷命令本体：只用本地缓存秒开菜单；缓存缺失才联网（带硬超时），更新脚本走菜单 9
-    # ⚠ 包装器设计铁律：显示菜单前绝不联网。曾经在启动时静默刷新缓存，结果
-    #    网络（DNS/线路）被黑洞时 curl 卡死不返回 → 用户输入 fwp 后一片空白、只能 Ctrl+C。
-    cat > "$WRAPPER_PATH" <<'WRAPPER_EOF'
-#!/bin/sh
-# fwp —— fwpanel2 安装/管理菜单快捷入口（由 install.sh 自动生成，卸载面板时一并删除）
-# 设计：本地有缓存就直接秒开菜单（离线可用）；只有缓存缺失时才联网，且带硬超时 + 明确提示。
-CACHE="__CACHE__"
-URL="__URL__"
-
-if [ ! -s "$CACHE" ]; then
-    echo "[fwp] 本地没有脚本缓存，正在获取（最多 10 秒）..." >&2
-    tmp="$(mktemp)"
-    ok=0
-    if command -v curl >/dev/null 2>&1; then
-        if command -v timeout >/dev/null 2>&1; then timeout 10 curl -fsSL -o "$tmp" "$URL" && ok=1
-        else curl -fsSL -m 10 -o "$tmp" "$URL" && ok=1; fi
-    fi
-    if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
-        if command -v timeout >/dev/null 2>&1; then timeout 10 wget -q -O "$tmp" "$URL" && ok=1
-        else wget -q -T 10 -O "$tmp" "$URL" && ok=1; fi
-    fi
-    if [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null \
-       && { ! command -v bash >/dev/null 2>&1 || bash -n "$tmp" 2>/dev/null; }; then
-        mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
-        chmod 0755 "$tmp" 2>/dev/null || true
-        mv "$tmp" "$CACHE" || rm -f "$tmp"
-    else
-        rm -f "$tmp"
-        echo "[fwp] 获取脚本失败（网络不通或 GitHub 不可达）" >&2
-        echo "       请重新执行一键安装命令，或检查网络后重试" >&2
-        exit 1
-    fi
-fi
-
-if [ "$(id -u)" -eq 0 ]; then
-    exec bash "$CACHE" "$@"
-fi
-if command -v sudo >/dev/null 2>&1; then
-    echo "[fwp] 需要 root 权限，正在通过 sudo 提权（可能会提示输入密码）" >&2
-    exec sudo bash "$CACHE" "$@"
-fi
-echo "[fwp] 需要 root 权限：请用 sudo fwp" >&2
-exit 1
-WRAPPER_EOF
-    # 把占位符换成真实路径（避免 heredoc 里到处转义 $）
-    sed -i -e "s|__CACHE__|$APP_DIR/$CACHED_SCRIPT_NAME|g" -e "s|__URL__|$RAW_INSTALL_URL|g" "$WRAPPER_PATH" 2>/dev/null || true
-    chmod 0755 "$WRAPPER_PATH" 2>/dev/null || true
+    write_shortcut_wrapper
 
     if [ -s "$cache" ] && [ -x "$WRAPPER_PATH" ]; then
         log_info "快捷命令已就绪：以后直接输入 ${C_BOLD}fwp${C_RESET} 即可打开本菜单"

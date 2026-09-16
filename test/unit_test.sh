@@ -737,6 +737,12 @@ env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="<html>404</ht
 [ "$(md5sum /tmp/fwtest/app/install.sh | awk '{print $1}')" = "$before" ] \
     && ok "错误内容不会覆盖缓存" || bad "错误内容把缓存覆盖了"
 grep -q "校验失败" /tmp/fwtest/upd2.out && ok "校验失败有明确提示" || bad "校验失败没提示"
+# 老版本机器不用重装面板：--update-script 也要顺手把包装器刷新成新版本
+rm -f /tmp/fwtest/bin/fwp
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="$(cat "$SCRIPT")" \
+    bash -c 'source "$1"; check_root() { :; }; do_update_script' bash "$TMPF" >/tmp/fwtest/upd3.out 2>&1 || true
+[ -x /tmp/fwtest/bin/fwp ] && ok "--update-script 会重新生成 fwp 包装器（不必重装面板）" || bad "包装器没被刷新"
+grep -qF 'exec sudo bash "$CACHE"' /tmp/fwtest/bin/fwp && ok "刷新出来的包装器是内容正确的新版" || bad "刷新出来的包装器内容不对"
 cp "$SCRIPT" /tmp/fwtest/app/install.sh
 
 # ④ 卸载时删除快捷命令
