@@ -6741,5 +6741,72 @@ class TestSystemNtp(unittest.TestCase):
         cls.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
+class TestSystemTimezoneDisplay(unittest.TestCase):
+    """v3.2.39：面板显示的时间必须跟系统时区走。
+
+    用户实测（sg1/sg2）：在面板里把时区改成 Asia/Shanghai 后，页面时间仍差 8 小时（UTC）。
+    根因：glibc 缓存时区 —— 面板进程启动时是 Etc/UTC，改时区后进程不重读，直到服务重启。
+    证据：`journalctl -u fwpanel` 收件时间 23:49:21+0800，面板自己打的却是 15:49:21。
+    """
+
+    def test_system_local_time_ignores_TZ_env(self):
+        seen = {}
+        real = panel.time.strftime
+
+        def spy(fmt="%Y-%m-%d %H:%M:%S"):
+            seen["tz"] = os.environ.get("TZ")
+            return real(fmt)
+
+        with unittest.mock.patch.dict(os.environ, {"TZ": "UTC"}), \
+             unittest.mock.patch("time.strftime", side_effect=spy):
+            panel.system_local_time()
+        self.assertIsNone(seen["tz"], "格式化时必须先丢掉 TZ，否则带 TZ=UTC 的面板会显示 UTC")
+        self.assertNotIn("TZ", [seen["tz"]], "调用后环境也要还原/清理干净")
+
+    def test_system_local_time_restores_TZ(self):
+        with unittest.mock.patch.dict(os.environ, {"TZ": "Europe/London"}):
+            panel.system_local_time()
+            self.assertEqual(os.environ.get("TZ"), "Europe/London", "格式化完要把 TZ 还原回去")
+
+    def test_set_timezone_refreshes_process_tz(self):
+        calls = {"tzset": 0, "td": []}
+
+        def fake_run(cmd, **kw):
+            calls["td"].append(list(cmd))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with unittest.mock.patch("subprocess.run", side_effect=fake_run), \
+             unittest.mock.patch.object(panel.time, "tzset", side_effect=lambda: calls.__setitem__("tzset", calls["tzset"] + 1)), \
+             unittest.mock.patch.object(panel, "time_status", return_value={"timezone": "Asia/Shanghai", "time": "x"}):
+            ok, msg = panel.set_timezone("Asia/Shanghai")
+        self.assertTrue(ok)
+        self.assertGreaterEqual(calls["tzset"], 1, "改完时区必须 tzset()，否则面板还显示旧时区的时间")
+        self.assertTrue(any(c[:2] == ["timedatectl", "set-timezone"] for c in calls["td"]))
+
+    def test_log_uses_system_local_time(self):
+        import io
+        import contextlib
+        buf = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, {"TZ": "UTC"}), contextlib.redirect_stdout(buf):
+            panel.log("测试行")
+        line = buf.getvalue().strip()
+        self.assertIn("测试行", line)
+        # 时间戳必须是系统时区的那份（= system_local_time()），不能是 UTC
+        self.assertIn(panel.system_local_time("%Y-%m-%d %H:%M"), line)
+
+    def test_startup_pops_TZ_and_tzset(self):
+        with open(os.path.join(self.__class__.root, "panel.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('os.environ.pop("TZ", None)', src, "启动时就要丢掉 TZ")
+        self.assertIn("def system_local_time(", src)
+        # 启动块必须在模块级执行（不是定义在函数里没人调）
+        idx = src.index("PANEL_START_TS = time.time()")
+        self.assertIn("time.tzset()", src[idx:idx + 800])
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

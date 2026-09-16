@@ -54,8 +54,31 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.38"
+CURRENT_VERSION = "3.2.39"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
+
+# 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
+# 两个坑（用户实测 sg1/sg2：面板里"时区写着 Asia/Shanghai、时间却是 UTC，差 8 小时"）：
+#   1) 进程可能带着 TZ=UTC 的环境启动（镜像/kernel cmdline/systemd 环境里带的）；
+#   2) glibc 会缓存时区，运行中改了 /etc/localtime（例如在面板里改时区）不会自动重读。
+# 所以启动先丢掉 TZ 再 tzset()，改时区时（set_timezone）再补一次。
+os.environ.pop("TZ", None)
+try:
+    time.tzset()
+except Exception:
+    pass
+
+
+def system_local_time(fmt="%Y-%m-%d %H:%M:%S"):
+    """按**系统时区**格式化当前时间：临时丢掉 TZ 再 tzset()，保证不受进程环境变量影响。"""
+    old = os.environ.pop("TZ", None)
+    try:
+        time.tzset()
+        return time.strftime(fmt)
+    finally:
+        if old is not None:
+            os.environ["TZ"] = old
+            time.tzset()
 # 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
 THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
              "vibes-light", "vibes-dark", "pixel-light", "pixel-dark")
@@ -276,7 +299,7 @@ PANEL_PORT_COMMENT = "面板端口-严格模式"
 # ------------------------------- 基础工具 -------------------------------
 
 def log(msg):
-    print(f"[fwpanel] {time.strftime('%F %T')} {msg}", flush=True)
+    print(f"[fwpanel] {system_local_time()} {msg}", flush=True)
 
 
 def sha256_hex(s):
@@ -5605,7 +5628,7 @@ def timezone_list():
 def time_status():
     st = {"timezone": "", "time": "", "ntp": None, "ntp_synced": None, "rtc": ""}
     try:
-        st["time"] = time.strftime("%Y-%m-%d %H:%M:%S")
+        st["time"] = system_local_time()
     except Exception:
         pass
     try:
@@ -5654,6 +5677,13 @@ def set_timezone(tz):
                     f.write(tz + "\n")
             except Exception as e:
                 return False, f"设置时区失败：{(r.stderr or '').strip()[:120]} / {e}"
+        # 改完时区让本进程立刻跟上：glibc 缓存时区，不 tzset() 的话面板还会显示旧时区的时间
+        #（用户实测：在面板里把时区改成 Shanghai 后时间仍差 8 小时，重启服务才正常）
+        os.environ.pop("TZ", None)
+        try:
+            time.tzset()
+        except Exception:
+            pass
         now = time_status().get("timezone", "")
         return True, f"时区已设为 {now}（当前时间 {time_status().get('time')}）"
     except Exception as e:
