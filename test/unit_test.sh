@@ -242,6 +242,43 @@ v=$(installed_panel_version /tmp/fw_pv/nope.py)
 [ -z "$v" ] && echo "  ✓ 文件不存在时返回空（不报错）" || { echo "  ✗ 应为空: [$v]"; exit 1; }'
 rm -rf /tmp/fw_pv
 
+echo "== 指定版本按真实通道标注（测试版/正式版/查不到则指定版本） =="
+# 用户预期：--version v3.1.1 应显示「测试版」而不是笼统的「指定版本」
+rm -rf /tmp/fakebin_chan && mkdir -p /tmp/fakebin_chan
+for _c in sed head awk grep cat; do ln -sf "$(command -v "$_c")" "/tmp/fakebin_chan/$_c"; done
+cat > /tmp/fakebin_chan/curl <<'EOF'
+#!/bin/bash
+for a in "$@"; do
+    case "$a" in
+        */releases/tags/v3.1.1)  printf '%s\n' '{' '  "tag_name": "v3.1.1",' '  "prerelease": true,' '  "name": "v3.1.1 测试版 (beta)"' '}'; exit 0 ;;
+        */releases/tags/v2.1.33) printf '%s\n' '{' '  "tag_name": "v2.1.33",' '  "prerelease": false,' '  "name": "v2.1.33 正式版"' '}'; exit 0 ;;
+        */releases/tags/v9.9.9)  printf '%s\n' '{' '  "tag_name": "v9.9.9"' '}'; exit 0 ;;   # 没有 prerelease 字段
+    esac
+done
+exit 1   # 其余一律当 404（无 release 的 tag / 网络失败）
+EOF
+chmod +x /tmp/fakebin_chan/curl
+bash -c 'source '"$TMPF"'; PATH=/tmp/fakebin_chan
+BETA=0
+VERSION_TAG="v3.1.1";  SRC_TAG="";  resolve_src_tag
+[ "$(target_channel_label)" = "测试版" ] && echo "  ✓ v3.1.1 → 测试版" || { echo "  ✗ v3.1.1 标注=[$(target_channel_label)]"; exit 1; }
+out=$(print_banner); case "$out" in *"面板 v3.1.1（测试版）"*) echo "  ✓ 横幅: 面板 v3.1.1（测试版）" ;; *) echo "  ✗ 横幅不对: $out"; exit 1 ;; esac
+VERSION_TAG="v2.1.33"; SRC_TAG="";  resolve_src_tag
+[ "$(target_channel_label)" = "正式版" ] && echo "  ✓ v2.1.33 → 正式版" || { echo "  ✗ v2.1.33 标注=[$(target_channel_label)]"; exit 1; }
+VERSION_TAG="v1.24.42"; SRC_TAG=""; resolve_src_tag
+[ "$(target_channel_label)" = "指定版本" ] && echo "  ✓ 查不到 release 的 tag → 指定版本（回退）" || { echo "  ✗ 回退标注=[$(target_channel_label)]"; exit 1; }
+VERSION_TAG="v9.9.9"; SRC_TAG="";   resolve_src_tag
+[ "$(target_channel_label)" = "指定版本" ] && echo "  ✓ 响应里没有 prerelease 字段 → 指定版本（不猜）" || { echo "  ✗ =[$(target_channel_label)]"; exit 1; }
+# 无网络时不得挂、不得影响安装（SRC_TAG 已由 --version 定死）
+PATH=/nonexistent
+VERSION_TAG="v3.1.1"; SRC_TAG=""; rc=0; resolve_src_tag >/dev/null 2>&1 || rc=$?
+[ "$rc" -eq 0 ] && [ "$SRC_TAG" = "v3.1.1" ] || { echo "  ✗ 无网络时解析失败 rc=$rc tag=[$SRC_TAG]"; exit 1; }
+lbl=$(target_channel_label 2>/dev/null)
+[ "$lbl" = "指定版本" ] && [ -n "$SRC_TAG" ] \
+    && echo "  ✓ 无网络：标注回退「指定版本」，目标版本不受影响" \
+    || { echo "  ✗ 无网络: label=[$lbl] tag=[$SRC_TAG]"; exit 1; }'
+rm -rf /tmp/fakebin_chan
+
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
 rm -f "$TMPF" /tmp/install_funcs_fw.sh

@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.10"
+readonly SCRIPT_VERSION="3.2.11"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -518,9 +518,27 @@ target_version() {
     printf '%s' "${SRC_TAG:-main}"
 }
 
+tag_release_channel() {
+    # $1 = tag  →  正式版 / 测试版 / 空（该 tag 没有 release 或查询失败）
+    # 指定版本安装时，用户需要知道这个版本本身是正式版还是测试版（而不是笼统的「指定版本」）。
+    # 只查这一个 tag，查不到就由调用方回退成「指定版本」——绝不因为这次查询失败影响安装。
+    local tag="$1" data pre
+    [ -n "$tag" ] || return 0
+    [ "$tag" = "main" ] && return 0
+    data="$(curl -fsSL --connect-timeout 8 --retry 1 \
+        "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/tags/$tag" 2>/dev/null || true)"
+    [ -n "$data" ] || return 0
+    pre="$(awk -F: '/"prerelease"[[:space:]]*:/ { gsub(/[^a-z]/, "", $2); print $2; exit }' <<< "$data" 2>/dev/null || true)"
+    case "$pre" in
+        true)  printf '测试版' ;;
+        false) printf '正式版' ;;
+    esac
+}
+
 target_channel_label() {
     if [ -n "$VERSION_TAG" ]; then
-        printf '指定版本'
+        local ch; ch="$(tag_release_channel "$(target_version)")"
+        if [ -n "$ch" ]; then printf '%s' "$ch"; else printf '指定版本'; fi
     elif [ "$BETA" = "1" ]; then
         printf '最新测试版'
     else
