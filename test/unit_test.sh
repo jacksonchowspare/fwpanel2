@@ -395,7 +395,61 @@ menu_has DO_SHOW_INFO_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
 out="$(menu_case '9
 8')"
 menu_has DO_UPDATE_SCRIPT_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
-    && ok "9) 更新脚本执行后返回主菜单" || bad "9) 未返回菜单"
+    && ok "9) 升级脚本执行后返回主菜单（版本没变时不重启菜单）" || bad "9) 未返回菜单"
+
+# 2.34：9 升级脚本 → 缓存拿到新版本时要立刻用新脚本重开菜单（不用再手动敲 fwp）
+mkdir -p /tmp/fwtest/app
+cat > /tmp/fwtest/fake_new_script.sh <<'EOF_NEW'
+#!/usr/bin/env bash
+readonly SCRIPT_VERSION="9.9.9"
+echo "NEW_SCRIPT_RAN args=[$*]"
+EOF_NEW
+chmod 0755 /tmp/fwtest/fake_new_script.sh
+menu_case_script() {  # do_update_script 会真的把"新脚本"写进缓存
+    printf '%s\n' "$1" | env -i PATH=/tmp/fakebin_menu FW_MENU=1 HOME=/tmp bash -c '
+        source '"$TMPF"'
+        ACTION=install; VERSION_TAG=""; BETA=0; YES=0; MENU_SRC=""
+        do_update_script() { cat /tmp/fwtest/fake_new_script.sh > "$APP_DIR/$CACHED_SCRIPT_NAME" && return 0; }
+        interactive_channel_menu
+        echo "MENU_RETURNED"' 2>&1
+}
+out="$(menu_case_script '9')"
+menu_has "NEW_SCRIPT_RAN" "$out" && menu_has "MENU_RETURNED" "$out" && bad "9) 更新后竟然没换脚本" \
+    || { menu_has "NEW_SCRIPT_RAN" "$out" && ok "9) 脚本更新后立刻用新脚本重开（无需再敲 fwp）" || bad "9) 没重开新脚本: $(printf '%s' "$out" | tail -3)"; }
+
+out="$(menu_case_script '10
+2')"
+menu_has "NEW_SCRIPT_RAN args=[--beta]" "$out" && ok "10) 升级脚本+面板：先更新脚本，再以 --beta 跑最新脚本" \
+    || bad "10) 未按预期执行: $(printf '%s' "$out" | tail -3)"
+out="$(menu_case_script '10
+1')"
+menu_has "NEW_SCRIPT_RAN args=[]" "$out" && ok "10) 选 1 正式版：不带 --beta 跑最新脚本" \
+    || bad "10) 正式版分支异常: $(printf '%s' "$out" | tail -3)"
+
+out="$(menu_case '10
+8' 2>/dev/null || true)"
+menu_has "请输入 1 - 10" "$out" && ok "菜单提示为「请输入 1 - 10」" || bad "菜单提示未更新"
+menu_has "10) 升级脚本+面板" "$out" && ok "菜单里有 10) 升级脚本+面板" || bad "菜单缺少第 10 项"
+menu_has "9) 升级脚本" "$out" && ok "第 9 项已改名「升级脚本」" || bad "第 9 项文案未更新"
+# 线上最新版比本地脚本新 → 头部直接提示（省得用户自己去想"要不要更新脚本"）
+menu_has "脚本有新版" "$out" && ok "脚本落后时菜单直接提示「脚本有新版」" || bad "缺少脚本版本提示"
+# 本地脚本已是最新时不该乱提示
+out="$(printf '8\n' | env -i PATH=/tmp/fakebin_menu FW_MENU=1 HOME=/tmp bash -c '
+    source '"$TMPF"'
+    SCRIPT_VERSION="99.0.0"
+    ACTION=install; VERSION_TAG=""; BETA=0; YES=0; MENU_SRC=""
+    do_show_login_info() { :; }
+    interactive_channel_menu' 2>&1 || true)"
+menu_has "脚本有新版" "$out" && bad "脚本已最新却仍提示有新版" || ok "脚本已最新时不提示"
+
+echo "== version_gt：脚本版本比较 =="
+vg() { ( source "$TMPF"; version_gt "$1" "$2" ) && echo 1 || echo 0; }
+[ "$(vg 3.2.34 3.2.33)" = "1" ] && ok "3.2.34 > 3.2.33" || bad "版本比较错(1)"
+[ "$(vg 3.2.33 3.2.34)" = "0" ] && ok "3.2.33 不大于 3.2.34" || bad "版本比较错(2)"
+[ "$(vg 2.1.33 2.1.9)" = "1" ] && ok "2.1.33 > 2.1.9（不会按字符串比错）" || bad "版本比较错(3)"
+[ "$(vg 3.2.34 3.2.34)" = "0" ] && ok "相等不算更新" || bad "版本比较错(4)"
+rm -f /tmp/fwtest/fake_new_script.sh
+rm -f /tmp/fwtest/app/install.sh    # 别把假缓存留给后面的用例（会造成 9) 意外 exec 新脚本）
 out="$(menu_case '6
 yes
 8')"

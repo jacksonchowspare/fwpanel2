@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.34"
+readonly SCRIPT_VERSION="3.2.35"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -308,7 +308,7 @@ $SCRIPT_NAME（安装脚本 v$SCRIPT_VERSION）—— 简易VPS管理面板2.0�
   sudo bash $0 --version v1.24.42        指定版本安装/升级/回退（如回退到 v1.24.42）
   sudo bash $0 --change-password         重置面板密码（交互式）
   sudo bash $0 --uninstall               卸载（停服务 + 删文件）
-  sudo bash $0 --update-script            更新本地缓存的安装脚本（fwp 用的那份）
+  sudo bash $0 --update-script            升级本地缓存的安装脚本（fwp 用的那份；菜单 9 同效）
   fwp                                    已装面板后可用：直接打开上面的交互式菜单（脚本缓存于 $APP_DIR/$CACHED_SCRIPT_NAME）
 
 选项:
@@ -696,7 +696,7 @@ do_update_script() {
     if [ "$newv" = "$SCRIPT_VERSION" ]; then
         log_info "已是最新（脚本 v$SCRIPT_VERSION）"
     else
-        log_info "脚本已更新：v$SCRIPT_VERSION → v$newv（下次运行 fwp 生效）"
+        log_info "脚本已更新：v$SCRIPT_VERSION → v$newv（菜单里选 9 时会立刻用新版重开）"
     fi
 }
 
@@ -982,6 +982,13 @@ menu_read() {   # $1 = 接收变量名
     printf -v "$1" '%s' "$__v"
 }
 
+version_gt() {   # $1 是否比 $2 新（形如 3.2.34；用 sort -V 比较，缺参数按 0 处理）
+    [ -n "$1" ] || return 1
+    [ -n "$2" ] || return 0
+    [ "$1" = "$2" ] && return 1
+    [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]
+}
+
 menu_preview_tag() {   # $1 = stable|beta → 该通道当前最新 tag（查不到输出空，不报错）
     # 只用于菜单上的"最新版本"提示，必须快：硬超时 4 秒（网络被黑洞时不超过 4 秒就放弃）
     local json=""
@@ -1010,7 +1017,7 @@ interactive_channel_menu() {
     [ "$YES" = "1" ] && return 0
     menu_can_read || return 0
 
-    local stable beta_tag cur ans ver tries confirm
+    local stable beta_tag cur ans ver tries confirm newv2 tchan
     # 先打印一行可见反馈：网络不通时这里最多等 4 秒（失败就不再查第二个通道），
     # 免得用户对着黑屏以为卡死了
     log_info "正在查询最新版本…（网络不通会自动跳过）"
@@ -1028,6 +1035,16 @@ interactive_channel_menu() {
         echo "  当前已装 : 面板 v$cur"
     fi
     echo "  脚本版本 : v$SCRIPT_VERSION"
+    # 线上最新版本比本地脚本新 → 直接提示，省得用户每次还要自己敲命令更新脚本
+    local newest="" v
+    for v in "$stable" "$beta_tag"; do
+        [ -z "$v" ] && continue
+        v="${v#v}"
+        if [ -z "$newest" ] || version_gt "$v" "$newest"; then newest="$v"; fi
+    done
+    if [ -n "$newest" ] && version_gt "$newest" "$SCRIPT_VERSION"; then
+        echo -e "  ${C_YELLOW:-}脚本有新版 : v$newest（按 9 升级脚本，或按 10 连面板一起升）${C_RESET:-}"
+    fi
     if [ -x "$WRAPPER_PATH" ]; then
         echo "  快捷入口 : 以后直接输入 fwp 就能回到本菜单（9) 可更新脚本）"
     fi
@@ -1047,10 +1064,11 @@ interactive_channel_menu() {
         echo "    6) 卸载          停止服务并删除程序文件（保留 /etc/fwpanel 配置与规则）"
         echo "    7) 查看登录信息  显示面板登录地址和用户名（需 root；密码不保存，只能重设）"
         echo "    8) 退出脚本      不做任何改动直接退出"
-    echo "    9) 更新脚本      拉取最新安装脚本到本地缓存（fwp 用的那份，失败不影响使用）"
+        echo "    9) 升级脚本      把 fwp 用的那份脚本更新到最新（更新完立刻用新脚本重开菜单）"
+        echo "   10) 升级脚本+面板 先更新脚本，再用最新脚本把面板升到最新（不用敲命令）"
         echo ""
 
-        printf '  请输入 1 - 9 后回车（直接回车 = 1 安装正式版，8 = 退出）: '
+        printf '  请输入 1 - 10 后回车（直接回车 = 1 安装正式版，8 = 退出）: '
         ans=""
         menu_read ans || return 0
         case "$ans" in
@@ -1107,10 +1125,32 @@ interactive_channel_menu() {
                    log_info "已退出，未做任何改动"
                    exit 0 ;;
             9)     echo ""
-                   do_update_script || true
+                   if do_update_script; then
+                       # 读缓存里的版本：文件可能不存在/读不了，一律当空（失败也不能触发 err_trap）
+                       newv2="$(sed -n 's/^readonly SCRIPT_VERSION="\([0-9.]*\)".*/\1/p' \
+                           "$APP_DIR/$CACHED_SCRIPT_NAME" 2>/dev/null | head -1 || true)"
+                       if [ -n "$newv2" ] && [ "$newv2" != "$SCRIPT_VERSION" ]; then
+                           log_info "正在用新脚本 v$newv2 重开菜单…"
+                           exec bash "$APP_DIR/$CACHED_SCRIPT_NAME"
+                       fi
+                   fi
                    echo "" ;;
+            10)    echo ""
+                   if ! do_update_script; then
+                       log_warn "脚本更新失败（网络/GitHub 不可达）。可稍后重试，或继续用当前脚本升级面板。"
+                   fi
+                   printf '  升级到哪个通道？1) 正式版  2) 测试版（回车 = 2 测试版）: '
+                   tchan=""
+                   menu_read tchan || tchan=""
+                   echo ""
+                   if [ "$tchan" = "1" ]; then
+                       log_info "正在用最新脚本升级面板（正式版）…"
+                       exec bash "$APP_DIR/$CACHED_SCRIPT_NAME"
+                   fi
+                   log_info "正在用最新脚本升级面板（测试版）…"
+                   exec bash "$APP_DIR/$CACHED_SCRIPT_NAME" --beta ;;
             *)     echo ""
-                   log_warn "输入无效：$ans（请填 1 - 9）" ;;
+                   log_warn "输入无效：$ans（请填 1 - 10）" ;;
         esac
     done
 }
