@@ -126,15 +126,30 @@ echo "== resolve_src_tag 无 python3（全新最小机）不挂 + sed/awk 回退
 # 直接调 python3 会以 127 挂掉整个安装（横幅之后只有一行「退出码 127」）
 mkdir -p /tmp/fakebin_nopy
 for _c in sed head awk grep cat; do ln -sf "$(command -v "$_c")" "/tmp/fakebin_nopy/$_c"; done
+# 大 JSON（>64KB，模拟 GitHub 真实响应）：解析器提前退出时上游 printf 会 SIGPIPE(141)
+# —— 用几百字节的假数据测不出这个坑（v3.2.10 真机 --beta 踩坑），所以必须放大
+python3 - <<'PYGEN'
+import json, random
+rels = [{'assets': [{'name': f'fwpanel2-v{i}.{j}-linux-amd64-asset-with-a-long-name.tar.gz',
+                     'size': random.randint(1000, 99999999), 'download_count': i,
+                     'content_type': 'application/octet-stream', 'state': 'uploaded',
+                     'url': 'https://api.github.com/repos/x/y/releases/assets/' + '9' * 12 + str(j)}
+                    for j in range(60)]} for i in range(20)]
+rels[0].update({'tag_name': 'v9.9.10-beta', 'prerelease': True})
+for i, r in enumerate(rels[1:], 1):
+    r.update({'tag_name': f'v9.9.{10 - i}', 'prerelease': False})
+open('/tmp/fakebin_nopy/big_rel.json', 'w').write(json.dumps(rels, indent=2))
+PYGEN
+echo "  （测试用大 JSON: $(wc -c < /tmp/fakebin_nopy/big_rel.json) 字节，须 >65536 才能复现 SIGPIPE）"
 cat > /tmp/fakebin_nopy/curl <<'EOF'
 #!/bin/bash
-# 模拟 GitHub API 返回（美化多行 JSON，与真实 API 一致）
+# 模拟 GitHub API 返回：/releases/latest 用美化多行 JSON，列表用 >64KB 的大 JSON
 for a in "$@"; do
     case "$a" in
         */releases/latest)
             printf '%s\n' '{' '  "tag_name": "v9.9.9",' '  "prerelease": false' '}'; exit 0 ;;
         */releases\?*)
-            printf '%s\n' '[' '  {' '    "assets": [ {"name": "a.tar.gz", "size": 1} ],' '    "tag_name": "v9.9.9",' '    "prerelease": false' '  },' '  {' '    "assets": [ {"name": "b.tar.gz", "size": 2} ],' '    "tag_name": "v9.9.10-beta",' '    "prerelease": true' '  }' ']'; exit 0 ;;
+            cat /tmp/fakebin_nopy/big_rel.json; exit 0 ;;
     esac
 done
 exit 1
@@ -153,6 +168,14 @@ rc=0; resolve_src_tag 2>/dev/null || rc=$?
 [ "$rc" -eq 0 ] && [ "$SRC_TAG" = "v9.9.10-beta" ] \
     && echo "  ✓ 无 python3：测试版解析回退 awk 成功（$SRC_TAG，跳过正式版）" \
     || { echo "  ✗ 无 python3 beta 解析失败 rc=$rc tag=[$SRC_TAG]"; exit 1; }
+# 直接测管道本身：>64KB 输入 + 解析器提前退出，不得让上游 printf 吃 SIGPIPE（退出码 141）
+big=$(cat /tmp/fakebin_nopy/big_rel.json)
+for fn in json_tag_prerelease json_tag_latest; do
+    rc=0; got=$(printf '%s' "$big" | $fn 2>/dev/null) || rc=$?
+    [ "$rc" -eq 0 ] && [ -n "$got" ] \
+        && echo "  ✓ 大 JSON(>64KB) 管道经 $fn 不触发 SIGPIPE（退出码 $rc，得到 $got）" \
+        || { echo "  ✗ $fn 管道失败 rc=$rc out=[$got]"; exit 1; }
+done
 # 压缩成单行的 JSON 也必须能解析（代理/镜像改写过的响应）
 one_line=$(printf '%s' "[ {\"tag_name\": \"v8.1.0\", \"prerelease\": false }, {\"tag_name\": \"v8.1.1-beta\", \"prerelease\": true } ]" | json_tag_prerelease)
 [ "$one_line" = "v8.1.1-beta" ] \
@@ -187,6 +210,37 @@ esac
     && ok "单次提示且报出失败命令（127）" \
     || bad "err_trap 输出异常（次数=$n 含命令=$cmd_ok）: $out"
 rm -rf /tmp/fakebin_nopy
+
+echo "== print_banner：横幅显示的是【目标面板版本】，不是脚本版本 =="
+# 用户实测反馈：横幅原来印 SCRIPT_VERSION，让人以为正式版安装会装 3.x 脚本的版本
+bash -c 'source '"$TMPF"'
+chk() { # chk <期望片段> <说明>
+    case "$1" in *"$2"*) return 0 ;; *) echo "  ✗ $3：$1"; return 1 ;; esac
+}
+BETA=0; VERSION_TAG=""; SRC_TAG="v2.1.33"
+out=$(print_banner)
+chk "$out" "目标版本 : 面板 v2.1.33（最新正式版）" "正式版横幅" || exit 1
+BETA=1; VERSION_TAG=""; SRC_TAG="v3.2.10"
+out=$(print_banner)
+chk "$out" "目标版本 : 面板 v3.2.10（最新测试版）" "测试版横幅" || exit 1
+BETA=0; VERSION_TAG="v1.24.42"; SRC_TAG="v1.24.42"
+out=$(print_banner)
+chk "$out" "目标版本 : 面板 v1.24.42（指定版本）" "指定版本横幅" || exit 1
+VERSION_TAG=""; BETA=0; SRC_TAG="main"
+out=$(print_banner)
+chk "$out" "目标版本 : 面板 main（主线" "主线回退横幅" || exit 1
+# 脚本版本必须仍可见（排查要用），但必须标注为「非面板版本」
+chk "$out" "安装脚本 : v" "脚本版本行" || exit 1
+echo "  ✓ 四种模式（正式版/测试版/指定版本/主线回退）横幅都显示目标面板版本"'
+
+echo "== installed_panel_version：从磁盘 panel.py 读真实版本 =="
+mkdir -p /tmp/fw_pv && printf 'CURRENT_VERSION = "2.1.33"\nother = 1\n' > /tmp/fw_pv/panel.py
+bash -c 'source '"$TMPF"'
+v=$(installed_panel_version /tmp/fw_pv/panel.py)
+[ "$v" = "2.1.33" ] && echo "  ✓ 读出 v$v" || { echo "  ✗ 读到 [$v]"; exit 1; }
+v=$(installed_panel_version /tmp/fw_pv/nope.py)
+[ -z "$v" ] && echo "  ✓ 文件不存在时返回空（不报错）" || { echo "  ✗ 应为空: [$v]"; exit 1; }'
+rm -rf /tmp/fw_pv
 
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"

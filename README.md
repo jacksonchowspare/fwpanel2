@@ -27,7 +27,10 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
 curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --beta
 ```
 
-> 默认安装**最新正式版**(GitHub Latest release);`--beta` 安装最新测试版(prerelease)。root 用户可直接去掉 `sudo`;普通用户有 sudo 时脚本自动提权。**已安装时重跑 = 自动升级**(备份旧版 → 覆盖 → 校验 → 重启,配置/规则/代理全部保留),且带**防降级保护**:服务器当前版本 ≥ 目标版本时自动跳过,绝不降级(已装测试版时跑默认命令会提示改用 `--beta`)。
+> 默认安装**最新正式版**(GitHub Latest release);`--beta` 安装最新测试版(prerelease);`--version vX.Y.Z` 指定版本。
+> 安装横幅分两行写清楚：**安装脚本**是脚本自身版本(脚本永远从 main 分支取,所以 bug 修复对所有通道立即生效),
+> **目标版本**才是这次即将安装的面板版本。
+> root 用户可直接去掉 `sudo`;普通用户有 sudo 时脚本自动提权。**已安装时重跑 = 自动升级**(备份旧版 → 覆盖 → 校验 → 重启,配置/规则/代理全部保留),且带**防降级保护**:服务器当前版本 ≥ 目标版本时自动跳过,绝不降级(已装测试版时跑默认命令会提示改用 `--beta`)。
 
 安装过程全自动：
 - 自动识别发行版并安装依赖：python3 / nftables / curl / wget / sudo，缺什么装什么

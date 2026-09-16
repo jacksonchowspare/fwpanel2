@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.9"
+readonly SCRIPT_VERSION="3.2.10"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -267,7 +267,12 @@ do_upgrade() {
 }
 
 do_check() {
-    echo "================== $SCRIPT_NAME v$SCRIPT_VERSION 环境体检 =================="
+    local pv; pv="$(installed_panel_version)"
+    echo "================== $SCRIPT_NAME 环境体检 =================="
+    echo "  安装脚本 : v$SCRIPT_VERSION"
+    if [ -n "$pv" ]; then
+        echo "  已装面板 : v$pv"
+    fi
     check_os; check_root; check_arch; check_tools; check_existing check
     echo "==========================================================================="
     echo "体检通过，可执行: sudo bash $0"
@@ -277,7 +282,7 @@ do_check() {
 
 usage() {
     cat <<EOF
-$SCRIPT_NAME v$SCRIPT_VERSION —— 简易VPS管理面板2.0（Debian 13 · nftables）
+$SCRIPT_NAME（安装脚本 v$SCRIPT_VERSION）—— 简易VPS管理面板2.0（Debian 13 · nftables）
 
 用法:
   sudo bash $0                           一键安装/升级【最新正式版】（随机端口/用户名/密码一并打印）
@@ -425,26 +430,38 @@ download_file() {
 #   install_deps 之前——直接调 python3 会以 127 挂掉整个安装（v3.2.8 真机踩坑：横幅之后
 #   只有一行「异常退出（退出码 127）」，退出码还被 2>/dev/null 吞掉看不到原因）。
 #   这里一律「有 python3 用它，没有就用 sed/awk」，且永远返回 0，让安装能继续走到装依赖那步。
+# ⚠⚠ 另一个坑（v3.2.10 真机 --beta 踩坑）：**必须先把 stdin 读完（drain）再解析**。
+#   解析器一旦提前退出（awk 的 exit / head -1），上一条命令（`printf | 解析器` 里的 printf）
+#   会被 SIGPIPE 杀掉 → 退出码 141 → set -o pipefail + set -e 直接判整个安装失败；
+#   GitHub 的真实响应（20 个 release 带 assets）远大于 64KB 管道缓冲，几乎必现，
+#   而几百字节的假数据测不出来。解析统一改成「cat 读完 → here-string 喂给解析器」。
 json_tag_latest() {
-    # stdin: releases/latest 的 JSON  →  输出最新正式版 tag_name（失败输出空）
+    # stdin: releases/latest 的 JSON  →  输出 tag_name（失败输出空）
+    local data; data="$(cat 2>/dev/null || true)"
     if command -v python3 >/dev/null 2>&1; then
         python3 -c 'import sys,json
 try: print(json.load(sys.stdin).get("tag_name") or "")
-except Exception: pass' 2>/dev/null || true
+except Exception: pass' <<< "$data" 2>/dev/null || true
         return 0
     fi
-    sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1 || true
+    command -v awk >/dev/null 2>&1 || return 0
+    awk -v RS='}' '
+        match($0, /"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"/) {
+            t = substr($0, RSTART, RLENGTH); gsub(/^[^:]*:[[:space:]]*"/, "", t); gsub(/".*$/, "", t); print t; exit
+        }
+    ' <<< "$data" 2>/dev/null || true
 }
 
 json_tag_prerelease() {
     # stdin: releases?per_page=N 的 JSON 列表  →  输出第一个 prerelease=true 的 tag_name
+    local data; data="$(cat 2>/dev/null || true)"
     if command -v python3 >/dev/null 2>&1; then
         python3 -c 'import sys,json
 try:
     for r in json.load(sys.stdin):
         if r.get("prerelease") and r.get("tag_name"):
             print(r["tag_name"]); break
-except Exception: pass' 2>/dev/null || true
+except Exception: pass' <<< "$data" 2>/dev/null || true
         return 0
     fi
     command -v awk >/dev/null 2>&1 || return 0
@@ -455,7 +472,7 @@ except Exception: pass' 2>/dev/null || true
             t = substr($0, RSTART, RLENGTH); gsub(/^[^:]*:[[:space:]]*"/, "", t); gsub(/".*$/, "", t)
         }
         /"prerelease"[[:space:]]*:[[:space:]]*true/ { if (t != "") { print t; exit } }
-    ' 2>/dev/null || true
+    ' <<< "$data" 2>/dev/null || true
 }
 
 valid_tag() {
@@ -479,13 +496,11 @@ resolve_src_tag() {
             error "暂未找到更新的测试版(beta)；如需要请安装最新正式版"
         fi
         SRC_TAG="$tag"
-        log_info "目标: 最新测试版 $SRC_TAG"
     else
         json="$(curl -fsSL --connect-timeout 10 --retry 1 "https://api.github.com/repos/jacksonchowspare/fwpanel2/releases/latest" 2>/dev/null || true)"
         tag="$(printf '%s' "$json" | json_tag_latest)"
         if valid_tag "$tag"; then
             SRC_TAG="$tag"
-            log_info "目标: 最新正式版 $SRC_TAG"
         else
             SRC_TAG="main"
             log_warn "解析最新正式版失败（网络/限流/解析器缺失），回退主线 main（可能包含未转正改动）"
@@ -494,6 +509,43 @@ resolve_src_tag() {
 }
 src_tag() {
     printf '%s' "${SRC_TAG:-main}"
+}
+
+# ------------------- 版本显示：始终以「面板版本」为主语 -------------------
+# 安装脚本永远从 main 分支取（修 bug 立即对所有通道生效），所以 SCRIPT_VERSION 是**脚本**的版本，
+# 不是即将安装的**面板**版本。横幅必须把两者分开写清楚，否则用户会把脚本版本当成面板版本。
+target_version() {
+    printf '%s' "${SRC_TAG:-main}"
+}
+
+target_channel_label() {
+    if [ -n "$VERSION_TAG" ]; then
+        printf '指定版本'
+    elif [ "$BETA" = "1" ]; then
+        printf '最新测试版'
+    else
+        printf '最新正式版'
+    fi
+}
+
+print_banner() {
+    local ver label; ver="$(target_version)"
+    case "$ver" in
+        main)   label="主线 · API 解析失败回退，未转正代码" ;;
+        [0-9]*) ver="v$ver"; label="$(target_channel_label)" ;;
+        *)      label="$(target_channel_label)" ;;
+    esac
+    echo "================== $SCRIPT_NAME =================="
+    echo "  安装脚本 : v$SCRIPT_VERSION（本脚本自身版本，非面板版本）"
+    echo "  目标版本 : 面板 $ver（$label）"
+    echo "=================================================="
+}
+
+installed_panel_version() {
+    # 已装面板的真实版本（权威来源是磁盘上的 panel.py，不是脚本常量）
+    local p="${1:-$APP_DIR/panel.py}"
+    [ -f "$p" ] || return 0
+    sed -n 's/^CURRENT_VERSION[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$p" 2>/dev/null | head -n 1 || true
 }
 
 fetch_source() {
@@ -678,7 +730,7 @@ EOF
 }
 
 print_summary() {
-    local ip
+    local ip pv
     ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)"
     [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
     [ -n "$ip" ] || ip="<服务器IP>"
@@ -694,6 +746,10 @@ print_summary() {
         echo "  远程访问 : 在本机执行 ssh -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${ip}"
         echo "             然后浏览器打开 http://127.0.0.1:${PANEL_PORT}"
     fi
+    pv="$(installed_panel_version)"
+    if [ -n "$pv" ]; then
+        echo "  面板版本 : v$pv"
+    fi
     echo "  登录用户 : ${PANEL_USER}"
     echo "  登录密码 : ${PANEL_PASS}"
     echo "------------------------------------------------------------------"
@@ -706,8 +762,8 @@ print_summary() {
 }
 
 do_install() {
-    echo "================== $SCRIPT_NAME v$SCRIPT_VERSION =================="
-    resolve_src_tag          # 父 shell 解析一次(正式版/测试版/指定版本)
+    resolve_src_tag          # 先解析目标版本(正式版/测试版/指定版本)，横幅才能显示目标面板版本
+    print_banner
     check_os; check_root; check_arch; check_tools; check_existing
     resolve_params
     install_deps
