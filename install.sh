@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.35"
+readonly SCRIPT_VERSION="3.2.36"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -666,38 +666,80 @@ installed_panel_version() {
 # 面板只保存 pbkdf2 哈希，明文密码无法反查 —— 所以这里只显示地址/用户名，密码只能“重设”。
 # v3.2.16/3.2.17 曾把明文写到 $ETC_DIR/credentials.json；本版本起不再保存，重跑脚本时清理遗留文件。
 do_update_script() {
-    # 显式更新本地缓存的安装脚本（fwp 用的那份）；菜单 9 / --update-script 触发
+    # 显式升级本地缓存的安装脚本（fwp 用的那份）；菜单 9 / 菜单 10 / --update-script 触发
+    # $1 = 已知的线上最新版本（可选；菜单里已经查过就传进来，省一次联网）
     check_root
-    local cache="$APP_DIR/$CACHED_SCRIPT_NAME" tmp newv ok="0"
+    local cache="$APP_DIR/$CACHED_SCRIPT_NAME" tmp newv ok="0" src="" known="${1:-}" got="0" v
     tmp="$(mktemp)"
     log_info "正在获取最新安装脚本（最多 25 秒，失败不影响本地使用）..."
-    if command -v curl >/dev/null 2>&1; then
-        run_with_timeout 25 curl -fsSL -o "$tmp" "$RAW_INSTALL_URL" 2>/dev/null && ok="1"
-    fi
-    if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
-        run_with_timeout 25 wget -q -O "$tmp" "$RAW_INSTALL_URL" 2>/dev/null && ok="1"
-    fi
-    if [ "$ok" != "1" ] || [ ! -s "$tmp" ]; then
+    # 多源回退：GitHub 直连 → jsDelivr → ghproxy。
+    # 只用 raw 一条路时，国内线路拿不到、或刚发版 CDN 还没同步，都会让"升级脚本"看起来没反应
+    # （用户实测：按 9 之后重开还是旧脚本）。
+    for v in "$RAW_INSTALL_URL" \
+             "https://cdn.jsdelivr.net/gh/jacksonchowspare/fwpanel2@main/$CACHED_SCRIPT_NAME" \
+             "https://ghproxy.net/$RAW_INSTALL_URL"; do
+        ok="0"
+        if command -v curl >/dev/null 2>&1; then
+            run_with_timeout 25 curl -fsSL -o "$tmp" "$v" 2>/dev/null && ok="1"
+        fi
+        if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
+            run_with_timeout 25 wget -q -O "$tmp" "$v" 2>/dev/null && ok="1"
+        fi
+        [ "$ok" = "1" ] && got="1"
+        if [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q "SCRIPT_VERSION=" "$tmp" 2>/dev/null \
+           && bash -n "$tmp" 2>/dev/null; then
+            src="$v"
+            break
+        fi
+        ok="0"
+    done
+    if [ "$ok" != "1" ] || [ -z "$src" ]; then
         rm -f "$tmp"
-        log_error "获取失败（网络/GitHub 不可达）。本地缓存未改动，fwp 仍可正常使用。"
+        if [ "$got" = "1" ]; then
+            # 源连得上但内容不是脚本（404 页面/半截文件）—— 提示要和"完全连不上"区分开
+            log_error "下载内容校验失败（错误页面或半截文件），本地缓存未改动。"
+        else
+            log_error "获取失败（GitHub 直连 / jsDelivr / ghproxy 都没拿到）。本地缓存未改动，fwp 仍可正常使用。"
+        fi
         return 1
     fi
-    if ! grep -q "SCRIPT_VERSION=" "$tmp" 2>/dev/null || ! bash -n "$tmp" 2>/dev/null; then
-        rm -f "$tmp"
-        log_error "下载内容校验失败（错误页面或半截文件），本地缓存未改动。"
-        return 1
+    if [ "$src" != "$RAW_INSTALL_URL" ]; then
+        log_info "GitHub 直连不通，已改用备用源获取。"
     fi
     newv="$(grep -m1 -o 'SCRIPT_VERSION="[0-9.]*"' "$tmp" | tr -d '"' | cut -d= -f2)"
+
+    # 线上最新版本：菜单里查过就用它，命令行调用时自己查一次（各 4 秒上限，失败不挡事）
+    if [ -z "$known" ]; then
+        known="$(menu_preview_tag stable)"; known="${known#v}"
+        v="$(menu_preview_tag beta)"; v="${v#v}"
+        if [ -n "$v" ] && { [ -z "$known" ] || version_gt "$v" "$known"; }; then known="$v"; fi
+    fi
+
+    # 绝不降级：备用源/镜像可能还在发旧内容，别把本地好好的脚本换成旧的
+    if version_gt "$SCRIPT_VERSION" "$newv"; then
+        rm -f "$tmp"
+        log_warn "下载到的是较旧版本 v$newv（本地 v$SCRIPT_VERSION），已保留本地脚本。"
+        return 1
+    fi
+
     mkdir -p "$APP_DIR"
     chmod 0755 "$tmp"
     mv -f "$tmp" "$cache"
     # 顺手刷新快捷命令本体：老版本机器不必重装面板（不重启服务）就能拿到修好的 fwp
     write_shortcut_wrapper
-    if [ "$newv" = "$SCRIPT_VERSION" ]; then
-        log_info "已是最新（脚本 v$SCRIPT_VERSION）"
-    else
+    if [ "$newv" != "$SCRIPT_VERSION" ]; then
         log_info "脚本已更新：v$SCRIPT_VERSION → v$newv（菜单里选 9 时会立刻用新版重开）"
+        return 0
     fi
+    # 下载到的版本和本地一样：若线上其实已发布更新的版本，那就是下载源还没同步 —— 说清楚，
+    # 别只说一句"已是最新"让用户以为升级失败（用户实测的困惑点）
+    if [ -n "$known" ] && version_gt "$known" "$newv"; then
+        log_warn "线上已发布 v$known，但各下载源目前给出的还是 v$newv（CDN 同步有延迟）"
+        log_warn "→ 等 1-2 分钟再按一次 9；着急的话直接升级面板（菜单 2 / 10）也会顺带刷新脚本"
+    else
+        log_info "已是最新（脚本 v$SCRIPT_VERSION）"
+    fi
+    return 0
 }
 
 write_shortcut_wrapper() {   # 生成/刷新 $WRAPPER_PATH（缓存路径与地址用占位符展开，避免 heredoc 里转义 $）
@@ -712,17 +754,23 @@ CACHE="__CACHE__"
 URL="__URL__"
 
 if [ ! -s "$CACHE" ]; then
-echo "[fwp] 本地没有脚本缓存，正在获取（最多 10 秒）..." >&2
+echo "[fwp] 本地没有脚本缓存，正在获取（最多 10 秒/源，会自动换源）..." >&2
 tmp="$(mktemp)"
 ok=0
-if command -v curl >/dev/null 2>&1; then
-    if command -v timeout >/dev/null 2>&1; then timeout 10 curl -fsSL -o "$tmp" "$URL" && ok=1
-    else curl -fsSL -m 10 -o "$tmp" "$URL" && ok=1; fi
-fi
-if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
-    if command -v timeout >/dev/null 2>&1; then timeout 10 wget -q -O "$tmp" "$URL" && ok=1
-    else wget -q -T 10 -O "$tmp" "$URL" && ok=1; fi
-fi
+# 多源回退：raw → jsDelivr → ghproxy（国内线路只走 raw 常常拿不到）
+for U in "$URL" "https://cdn.jsdelivr.net/gh/jacksonchowspare/fwpanel2@main/install.sh" "https://ghproxy.net/$URL"; do
+    ok=0
+    if command -v curl >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then timeout 10 curl -fsSL -o "$tmp" "$U" && ok=1
+        else curl -fsSL -m 10 -o "$tmp" "$U" && ok=1; fi
+    fi
+    if [ "$ok" != "1" ] && command -v wget >/dev/null 2>&1; then
+        if command -v timeout >/dev/null 2>&1; then timeout 10 wget -q -O "$tmp" "$U" && ok=1
+        else wget -q -T 10 -O "$tmp" "$U" && ok=1; fi
+    fi
+    [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null && break
+    ok=0
+done
 if [ "$ok" = "1" ] && [ -s "$tmp" ] && grep -q 'SCRIPT_VERSION=' "$tmp" 2>/dev/null \
    && { ! command -v bash >/dev/null 2>&1 || bash -n "$tmp" 2>/dev/null; }; then
     mkdir -p "$(dirname "$CACHE")" 2>/dev/null || true
@@ -1017,7 +1065,7 @@ interactive_channel_menu() {
     [ "$YES" = "1" ] && return 0
     menu_can_read || return 0
 
-    local stable beta_tag cur ans ver tries confirm newv2 tchan
+    local stable beta_tag cur ans ver tries confirm newv2 tchan newest newest_known=""
     # 先打印一行可见反馈：网络不通时这里最多等 4 秒（失败就不再查第二个通道），
     # 免得用户对着黑屏以为卡死了
     log_info "正在查询最新版本…（网络不通会自动跳过）"
@@ -1042,6 +1090,7 @@ interactive_channel_menu() {
         v="${v#v}"
         if [ -z "$newest" ] || version_gt "$v" "$newest"; then newest="$v"; fi
     done
+    newest_known="$newest"
     if [ -n "$newest" ] && version_gt "$newest" "$SCRIPT_VERSION"; then
         echo -e "  ${C_YELLOW:-}脚本有新版 : v$newest（按 9 升级脚本，或按 10 连面板一起升）${C_RESET:-}"
     fi
@@ -1125,7 +1174,7 @@ interactive_channel_menu() {
                    log_info "已退出，未做任何改动"
                    exit 0 ;;
             9)     echo ""
-                   if do_update_script; then
+                   if do_update_script "$newest_known"; then
                        # 读缓存里的版本：文件可能不存在/读不了，一律当空（失败也不能触发 err_trap）
                        newv2="$(sed -n 's/^readonly SCRIPT_VERSION="\([0-9.]*\)".*/\1/p' \
                            "$APP_DIR/$CACHED_SCRIPT_NAME" 2>/dev/null | head -1 || true)"
@@ -1136,7 +1185,7 @@ interactive_channel_menu() {
                    fi
                    echo "" ;;
             10)    echo ""
-                   if ! do_update_script; then
+                   if ! do_update_script "$newest_known"; then
                        log_warn "脚本更新失败（网络/GitHub 不可达）。可稍后重试，或继续用当前脚本升级面板。"
                    fi
                    printf '  升级到哪个通道？1) 正式版  2) 测试版（回车 = 2 测试版）: '

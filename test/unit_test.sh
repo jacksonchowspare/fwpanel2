@@ -880,8 +880,18 @@ NEOF
 chmod +x /tmp/fwtest/bin/newscript.sh
 cat > /tmp/fwtest/fakebin/curl <<'FEOF'
 #!/bin/sh
-out=""
-while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2 ;; *) shift ;; esac; done
+out=""; url=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -o) out="$2"; shift 2 ;;
+        http*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+# FAKE_FAIL_RAW=1 时模拟"GitHub 直连不通"，用来验证多源回退
+if [ -n "${FAKE_FAIL_RAW:-}" ]; then
+    case "$url" in *raw.githubusercontent.com*) exit 22 ;; esac
+fi
 printf '%s\n' "$FAKE_BODY" > "$out"
 FEOF
 chmod +x /tmp/fwtest/fakebin/curl
@@ -897,6 +907,57 @@ env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="<html>404</ht
 [ "$(md5sum /tmp/fwtest/app/install.sh | awk '{print $1}')" = "$before" ] \
     && ok "错误内容不会覆盖缓存" || bad "错误内容把缓存覆盖了"
 grep -q "校验失败" /tmp/fwtest/upd2.out && ok "校验失败有明确提示" || bad "校验失败没提示"
+
+# 假 wget：与假 curl 同逻辑（同样只挡 raw）。否则 raw 一失败，真实 wget 会把真脚本下下来，
+# "多源回退"用例测到的其实是 wget 同源重试，而不是换源
+cat > /tmp/fwtest/fakebin/wget <<'WEOF'
+#!/bin/sh
+out=""; url=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -O) out="$2"; shift 2 ;;
+        http*) url="$1"; shift ;;
+        *) shift ;;
+    esac
+done
+if [ -n "${FAKE_FAIL_RAW:-}" ]; then
+    case "$url" in *raw.githubusercontent.com*) exit 8 ;; esac
+fi
+printf '%s\n' "$FAKE_BODY" > "$out"
+WEOF
+chmod +x /tmp/fwtest/fakebin/wget
+
+# ③c 多源回退：raw 不通时自动换 jsDelivr/ghproxy（国内线路只走 raw 常常拿不到 = 用户实测"按 9 没反应"）
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_FAIL_RAW=1 FAKE_BODY="$(cat /tmp/fwtest/bin/newscript.sh)" \
+    bash -c 'source "$1"; check_root() { :; }; do_update_script' bash "$TMPF" > /tmp/fwtest/upd4.out 2>&1
+grep -q 'SCRIPT_VERSION="9.9.9"' /tmp/fwtest/app/install.sh && ok "raw 不通时回退到备用源并成功写入缓存" || bad "多源回退失败: $(tail -2 /tmp/fwtest/upd4.out)"
+grep -q "已改用备用源" /tmp/fwtest/upd4.out && ok "换源时有明确提示" || bad "换源没提示"
+
+# ③d 绝不降级：备用源还在发旧内容时，不能把本地脚本换成旧的
+before=$(md5sum /tmp/fwtest/app/install.sh | awk '{print $1}')
+printf '%s\n' '#!/usr/bin/env bash' 'readonly SCRIPT_VERSION="0.0.1"' > /tmp/fwtest/bin/oldscript.sh
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="$(cat /tmp/fwtest/bin/oldscript.sh)" \
+    bash -c 'source "$1"; check_root() { :; }; do_update_script' bash "$TMPF" > /tmp/fwtest/upd5.out 2>&1 || true
+[ "$(md5sum /tmp/fwtest/app/install.sh | awk '{print $1}')" = "$before" ] \
+    && ok "下载到较旧版本时保留本地脚本（不降级）" || bad "被降级了"
+grep -q "较旧版本" /tmp/fwtest/upd5.out && ok "不降级时说明原因" || bad "缺少不降级说明"
+
+# ③e CDN 未同步：线上已有更新版本、但下载到的还是当前版本 → 必须说清楚，不能只说"已是最新"
+cat > /tmp/fwtest/bin/samescript.sh <<'SEOF'
+#!/usr/bin/env bash
+SEOF
+printf 'readonly SCRIPT_VERSION="%s"\n' "$(grep -m1 -o 'SCRIPT_VERSION="[0-9.]*"' "$SCRIPT" | tr -d '"' | cut -d= -f2)" >> /tmp/fwtest/bin/samescript.sh
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="$(cat /tmp/fwtest/bin/samescript.sh)" \
+    bash -c 'source "$1"; check_root() { :; }; do_update_script 9.9.9' bash "$TMPF" > /tmp/fwtest/upd6.out 2>&1
+grep -q "线上已发布 v9.9.9" /tmp/fwtest/upd6.out && grep -q "同步有延迟" /tmp/fwtest/upd6.out \
+    && ok "下载源未同步时明确提示（不再含糊地说"已是最新"）" || bad "缺少 CDN 未同步提示: $(tail -2 /tmp/fwtest/upd6.out)"
+env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="$(cat /tmp/fwtest/bin/samescript.sh)" \
+    bash -c 'source "$1"; check_root() { :; }; do_update_script' bash "$TMPF" > /tmp/fwtest/upd7.out 2>&1
+grep -q "同步有延迟" /tmp/fwtest/upd7.out && bad "版本真已是线上最新时不该报"延迟"" || ok "确实最新时不说"同步延迟""
+
+# ③f 包装器也要多源（缓存缺失时才联网那条路）
+grep -q "cdn.jsdelivr.net" /tmp/fwtest/bin/fwp && grep -q "ghproxy.net" /tmp/fwtest/bin/fwp \
+    && ok "fwp 包装器拉缓存时也有多源回退" || bad "包装器仍是单源"
 # 老版本机器不用重装面板：--update-script 也要顺手把包装器刷新成新版本
 rm -f /tmp/fwtest/bin/fwp
 env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="$(cat "$SCRIPT")" \
