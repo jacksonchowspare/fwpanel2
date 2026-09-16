@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.12"
+readonly SCRIPT_VERSION="3.2.13"
 readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
@@ -276,7 +276,8 @@ do_check() {
     fi
     check_os; check_root; check_arch; check_tools; check_existing check
     echo "==========================================================================="
-    echo "体检通过，可执行: sudo bash $0"
+    echo "体检通过。安装/升级请重跑一键命令（或直接回车使用菜单）："
+    echo "  curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash"
 }
 
 # ============================== 参数解析 ==============================
@@ -286,7 +287,7 @@ usage() {
 $SCRIPT_NAME（安装脚本 v$SCRIPT_VERSION）—— 简易VPS管理面板2.0（Debian 13 · nftables）
 
 用法:
-  sudo bash $0                           交互式：弹出菜单选【正式版/测试版/指定版本】
+  sudo bash $0                           交互式菜单：安装正式版/测试版/指定版本、环境体检、改密码、卸载
   sudo bash $0 -y                        无人值守：跳过菜单，直接装/升【最新正式版】
   sudo bash $0 --beta                    安装/升级【最新测试版】（尝鲜通道）
   sudo bash $0 -p 17890                  指定面板端口
@@ -633,27 +634,50 @@ interactive_channel_menu() {
         echo "  当前已装 : 面板 v$cur"
         echo "  ------------------------------------------------------------"
     fi
-    echo "  请选择要安装 / 升级的版本："
+    echo "  请选择要执行的操作："
     echo ""
     echo "    1) 安装正式版    最新正式版：${stable:-（查询失败，安装时会重试）}"
     echo "    2) 安装测试版    最新测试版：${beta_tag:-（查询失败，安装时会重试）}"
-    echo "    3) 指定版本      手动输入版本号（不用带 v，例如 3.1.1）"
+    echo "    3) 安装指定版本  手动输入版本号（不用带 v，例如 3.1.1）"
+    echo "    ------------------------------------------------------------"
+    echo "    4) 环境体检      只检查系统环境与依赖，不改动任何东西"
+    echo "    5) 改密码        交互式修改面板登录密码（至少 8 位，输两遍）"
+    echo "    6) 卸载          停止服务并删除程序文件（保留 /etc/fwpanel 配置与规则）"
     echo ""
 
     ans=""; tries=0
     while :; do
-        printf '  请输入 1 / 2 / 3 后回车（直接回车 = 1 正式版）: '
+        printf '  请输入 1 - 6 后回车（直接回车 = 1 安装正式版）: '
         menu_read ans || return 0
         case "$ans" in
             ""|1)  log_info "已选择：安装正式版"; return 0 ;;
             2)     BETA=1; log_info "已选择：安装测试版"; return 0 ;;
             3)     break ;;
+            4)     echo ""
+                   do_check
+                   echo ""
+                   log_info "体检完成（未做任何改动）"
+                   exit 0 ;;
+            5)     echo ""
+                   do_change_password
+                   echo ""
+                   log_info "密码修改流程结束"
+                   exit 0 ;;
+            6)     echo ""
+                   printf '  确认卸载 fwpanel？输入 yes 确认，其他内容取消: '
+                   local confirm=""
+                   menu_read confirm || confirm=""
+                   case "$confirm" in
+                       y|Y|yes|YES|Yes) do_uninstall; echo ""; log_info "卸载流程结束" ;;
+                       *) log_warn "已取消卸载（未做任何改动）" ;;
+                   esac
+                   exit 0 ;;
             *)     tries=$((tries + 1))
                    if [ "$tries" -ge 3 ]; then
                        log_warn "输入无效，按默认处理：安装正式版"
                        return 0
                    fi
-                   log_warn "输入无效：$ans（请填 1 / 2 / 3）" ;;
+                   log_warn "输入无效：$ans（请填 1 - 6）" ;;
         esac
     done
 
@@ -929,8 +953,13 @@ do_uninstall() {
 do_change_password() {
     check_root
     [ -f "$ETC_DIR/config.json" ] || error "面板未安装，无法修改密码"
-    log_info "交互式重置面板密码（至少 8 位）..."
-    python3 "$APP_DIR/panel.py" reset-password
+    log_info "交互式重置面板密码（至少 8 位，输入两遍确认）..."
+    # 管道模式（curl | sudo bash）下 stdin 是脚本自身，密码输入必须走 /dev/tty
+    if { : < /dev/tty; } 2>/dev/null; then
+        python3 "$APP_DIR/panel.py" reset-password < /dev/tty
+    else
+        python3 "$APP_DIR/panel.py" reset-password
+    fi
 }
 
 # ============================== 入口 ==============================

@@ -351,7 +351,28 @@ case "$out" in
     *"目标版本 : 面板 v9.9.10-beta（最新测试版）"*) ok "菜单选 2 端到端 → 目标版本 v9.9.10-beta（最新测试版）" ;;
     *) bad "端到端菜单失败: $(printf '%s' "$out" | head -8)" ;;
 esac
-rm -rf /tmp/fakebin_menu
+# 4) 环境体检 / 5) 改密码 / 6) 卸载：用 stub 替换真实动作，只验证菜单分发与确认弹窗
+menu_action() {  # $1=输入
+    printf '%s\n' "$1" | env -i PATH=/tmp/fakebin_menu FW_MENU=1 HOME=/tmp bash -c '
+        source '"$TMPF"'
+        ACTION=install; VERSION_TAG=""; BETA=0; YES=0
+        do_check() { echo "DO_CHECK_CALLED"; }
+        do_change_password() { echo "DO_CHANGE_PW_CALLED"; }
+        do_uninstall() { echo "DO_UNINSTALL_CALLED"; }
+        interactive_channel_menu
+        echo "MENU_RETURNED BETA=$BETA VERSION_TAG=$VERSION_TAG"' 2>/dev/null
+}
+t4="$(menu_action 4)";  case "$t4" in *DO_CHECK_CALLED*) case "$t4" in *MENU_RETURNED*) bad "选 4 不该继续走安装" ;; *) ok "菜单 4) 环境体检 → 执行体检并退出（不走安装）" ;; esac ;; *) bad "选 4 未触发体检: $t4" ;; esac
+t5="$(menu_action 5)";  case "$t5" in *DO_CHANGE_PW_CALLED*) case "$t5" in *MENU_RETURNED*) bad "选 5 不该继续走安装" ;; *) ok "菜单 5) 改密码 → 执行改密并退出" ;; esac ;; *) bad "选 5 未触发改密: $t5" ;; esac
+t6y="$(menu_action '6
+yes')"; case "$t6y" in *DO_UNINSTALL_CALLED*) case "$t6y" in *MENU_RETURNED*) bad "选 6 确认后不该继续走安装" ;; *) ok "菜单 6) 卸载 → 确认 yes 后执行卸载" ;; esac ;; *) bad "选 6+yes 未触发卸载: $t6y" ;; esac
+t6n="$(menu_action '6
+no')"; case "$t6n" in *DO_UNINSTALL_CALLED*) bad "选 6 输入 no 竟然还卸载了" ;; *) case "$t6n" in *MENU_RETURNED*) bad "取消卸载后不该继续安装" ;; *) ok "菜单 6) 卸载 → 未确认则取消，不做任何改动" ;; esac ;; esac
+t1="$(menu_action 1)"; case "$t1" in *MENU_RETURNED*) ok "菜单 1) 仍正常进入安装流程" ;; *) bad "选 1 未回到安装流程: $t1" ;; esac
+t7="$(menu_action '7
+7
+7')"; case "$t7" in *MENU_RETURNED*) ok "乱填 3 次 → 按默认正式版继续安装" ;; *) bad "乱填后未回到安装流程: $t7" ;; esac
+
 # 管道模式（curl | sudo bash）下 stdin 是脚本自身，菜单必须改走 /dev/tty —— 用 script 造 pty 模拟真实场景
 if command -v script >/dev/null 2>&1; then
     probe="$(mktemp)"
@@ -374,6 +395,7 @@ if command -v script >/dev/null 2>&1; then
 else
     echo "  （无 script 命令，跳过 pty 用例）"
 fi
+rm -rf /tmp/fakebin_menu
 
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
