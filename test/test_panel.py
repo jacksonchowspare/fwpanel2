@@ -6498,5 +6498,62 @@ class TestAtomicDeploy(unittest.TestCase):
         self.assertIn("_safe_theme_name(get_theme(", src, "服务端注入主题前没有做白名单校验")
 
 
+class TestFrontendBbrUi(unittest.TestCase):
+    """v3.2.32：BBR 按钮必须是状态驱动的。
+
+    用户实测：BBR 已开启，按钮却永远写着「一键开启 BBR」，点下去弹「确认关闭 BBR？」。
+    根因是按钮文案写死在 HTML 里、状态只渲染在另一行文字上。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(cls.root, "static", "index.html"), encoding="utf-8") as f:
+            cls.html = f.read()
+        with open(os.path.join(cls.root, "panel.py"), encoding="utf-8") as f:
+            cls.panel = f.read()
+
+    def test_button_has_id(self):
+        self.assertIn('id="sys_bbr_btn"', self.html)
+        self.assertIn('id="sys_bbr_btn" onclick="sysBbrToggle()"', self.html)
+
+    def test_single_render_outlet(self):
+        # 状态行只允许由 renderBbrUi 写，避免两处渲染分叉
+        # #sys_bbr 只在两处取用：renderBbrUi 渲染 + loadBbr 的存在性守卫（renderSysNet 已改为调函数）
+        self.assertEqual(self.html.count('$("sys_bbr")'), 2)
+        self.assertEqual(self.html.count('id="sys_bbr"'), 1, "状态行元素必须有且只有一个 id 定义")
+        idx = self.html.index("function renderBbrUi(")
+        seg = self.html[idx:idx + 1500]
+        self.assertIn("el.innerHTML = ", seg)
+        # renderSysNet 不能再自己拼状态行
+        ridx = self.html.index("function renderSysNet(d) {")
+        self.assertNotIn("sys_bbr", self.html[ridx:ridx + 400])
+
+    def test_both_entries_use_render(self):
+        # 系统页渲染 + 旧 loadBbr 兼容路径，都必须走同一个出口
+        self.assertGreaterEqual(self.html.count("renderBbrUi()"), 3)  # 定义1处 + 调用2处
+        self.assertIn("function renderSysNet(d) {", self.html)
+        self.assertIn("function loadBbr(", self.html)
+
+    def test_loadbbr_does_not_clobber_state(self):
+        # 不得用 !!d.enabled 无条件覆盖（残缺响应会把"已开启"冲成"未开启"）
+        self.assertIn('typeof d.enabled === "boolean"', self.html)
+        self.assertNotIn("sysData.bbr.enabled = !!d.enabled", self.html)
+
+    def test_backend_reports_current_cc(self):
+        self.assertIn("def current_cc():", self.panel)
+        self.assertIn('"current_cc": current_cc()', self.panel)
+
+    def test_button_label_state_driven(self):
+        idx = self.html.index("function renderBbrUi(")
+        seg = self.html[idx:idx + 1500]
+        self.assertIn("btn.textContent = on ?", seg)
+        self.assertIn("btn.className = on ?", seg)
+        self.assertIn("btn.disabled = !sup", seg)
+
+    def test_node_test_present(self):
+        self.assertTrue(os.path.isfile(os.path.join(self.root, "test", "frontend_bbr_ui_test.js")))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

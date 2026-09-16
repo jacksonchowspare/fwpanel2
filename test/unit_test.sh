@@ -857,6 +857,20 @@ env -i PATH=/usr/bin:/bin HOME=/tmp bash -c 'source "$1"; check_root() { :; }; s
 [ -e /tmp/fwtest/app ] && bad "卸载后程序目录仍在" || ok "卸载会删除程序目录（缓存一并清掉）"
 rm -rf /tmp/fwtest /tmp/fakebin_fwp /tmp/fwtest_hang.sh
 
+echo "== 前端行为测试（node；机器上没有 node 就跳过） =="
+NODE_BIN="$(command -v node || command -v /home/saxon/.local/bin/node || true)"
+if [ -n "$NODE_BIN" ]; then
+    for t in frontend_port_redirect_test.js frontend_bbr_ui_test.js; do
+        if out=$("$NODE_BIN" "$(dirname "$SCRIPT")/test/$t" 2>&1); then
+            ok "$t 全部通过"
+        else
+            bad "$t 失败: $(echo "$out" | tail -4 | tr '\n' ' ')"
+        fi
+    done
+else
+    echo "  - 跳过（未安装 node）"
+fi
+
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
 rm -f "$TMPF" /tmp/install_funcs_fw.sh

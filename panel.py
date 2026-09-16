@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.31"
+CURRENT_VERSION = "3.2.32"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 # 主题清单：必须与 static/index.html 里的 THEMES 一致（单测会比对两边，避免漂移）
 THEME_IDS = ("dark", "light", "cream-light", "cream-dark",
@@ -6258,6 +6258,15 @@ def set_ipv6_mode(mode):
     return True, f"设置完成：{label}"
 
 
+def current_cc():
+    """当前内核实际生效的拥塞控制算法（读不到就返回空串，前端据此决定显示什么）。"""
+    try:
+        with open("/proc/sys/net/ipv4/tcp_congestion_control") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
 def bbr_status():
     """BBR 是否已开启"""
     try:
@@ -7715,7 +7724,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             "dns": dns_status(with_test=with_test),
             "time": time_status(),
             "hostname": os.uname().nodename,
-            "bbr": {"enabled": bbr_status(), "supported": bbr_available(), "kernel": os.uname().release},
+            "bbr": {"enabled": bbr_status(), "supported": bbr_available(),
+                    "kernel": os.uname().release, "current_cc": current_cc()},
             "ipv6": {"status": ipv6_status()},   # 前端兼容字符串/对象两种形态
             "panel_port": int(self.server.config.get("port", 0) or 0),
             "backup_dir": SYS_BACKUP_DIR,

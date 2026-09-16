@@ -1432,7 +1432,7 @@ window.addEventListener("error", function (ev) {
           <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h7l-1 8 10-12h-7z"/></svg> 网络优化（BBR / IPv6）</h2>
           <div id="sys_bbr" style="font-size:13px;margin-bottom:8px">检测中...</div>
           <div class="form-row" style="margin-bottom:8px">
-            <button class="btn" onclick="sysBbrToggle()">一键开启 BBR</button>
+            <button class="btn" id="sys_bbr_btn" onclick="sysBbrToggle()">一键开启 BBR</button>
             <button class="btn ghost" onclick="showKernel()">内核版本</button>
           </div>
           <div style="color:var(--muted);font-size:12px;margin-bottom:10px">BBR 为 Google 的 TCP 拥塞控制算法，可提升网络传输速度（需 Linux 4.9+ 内核）</div>
@@ -3428,12 +3428,33 @@ function renderSysHost(d) {
   if ($("sys_hostname") && !$("sys_hostname").value) $("sys_hostname").value = d.hostname || "";
 }
 
+/* BBR 状态渲染的唯一出口（v3.2.32）：
+   状态文字 + **按钮文案/样式/可用性**都按当前状态来。
+   以前按钮文案写死在 HTML 里（永远"一键开启 BBR"），BBR 已开启时按钮还写着"开启"、
+   点下去却弹"确认关闭 BBR？"——用户实测一头雾水。 */
+function renderBbrUi() {
+  const b = (sysData && sysData.bbr) || {};
+  const el = $("sys_bbr"), btn = $("sys_bbr_btn");
+  const on = !!b.enabled, sup = b.supported !== false;
+  if (el) {
+    el.innerHTML = '<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">BBR</span><span>'
+      + (on ? '<span style="color:var(--accent2)">已开启</span>' : "未开启")
+      + (sup ? "" : '　<span style="color:var(--danger)">内核不支持（需 4.9+）</span>')
+      + "　内核 " + esc(b.kernel || "")
+      + (b.current_cc ? "　当前算法 " + esc(b.current_cc) : "")
+      + "</span></div>";
+  }
+  if (btn) {
+    btn.textContent = on ? "一键关闭 BBR" : "一键开启 BBR";
+    btn.className = on ? "btn danger" : "btn";
+    btn.disabled = !sup;
+    btn.title = sup ? "" : "内核不支持 BBR（需 Linux 4.9+）";
+  }
+}
+
 function renderSysNet(d) {
-  const b = d.bbr || {}, v6 = d.ipv6 || {};
-  $("sys_bbr").innerHTML = '<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">BBR</span><span>'
-    + (b.enabled ? '<span style="color:var(--accent2)">已开启</span>' : "未开启")
-    + (b.supported ? "" : '　<span style="color:var(--danger)">内核不支持（需 4.9+）</span>')
-    + "　内核 " + esc(b.kernel || "") + "</span></div>";
+  const v6 = d.ipv6 || {};
+  renderBbrUi();
   // /api/system 的 ipv6 字段可能是字符串（旧接口语义）也可能是对象，两种都要认
   const v6st = (typeof v6 === "string") ? v6 : (v6.status || v6.mode || "");
   const modeTxt = v6st === "disabled" || v6st === "disable" ? "🚫 已禁用"
@@ -4368,12 +4389,17 @@ async function loadBbr() {
   try {
     const d = await api("GET", "/api/bbr");
     bbrInfo = d;                                   // 兼容旧代码（showKernel 等）
-    if (sysData.bbr) { sysData.bbr.enabled = !!d.enabled; sysData.bbr.supported = d.supported !== false; }
-    if (!sysData.bbr) sysData.bbr = d;
-    el.innerHTML = '<div style="display:flex;gap:8px;margin-bottom:4px"><span style="color:var(--muted);min-width:88px">BBR</span><span>'
-      + (d.enabled ? '<span style="color:var(--accent2)">已开启</span>' : "未开启")
-      + (d.supported === false ? '　<span style="color:var(--danger)">内核不支持（需 4.9+）</span>' : "")
-      + "　内核 " + esc(d.kernel || "") + "</span></div>";
+    // 不能无条件覆盖：/api/system 才是权威来源。以前用 !!d.enabled 直接冲掉，
+    // 只要 /api/bbr 返回残缺/陈旧数据（{}、{} → enabled=false），界面就会把"已开启"
+    // 显示成"未开启"、把"内核不支持"擦掉——实测复现过。
+    if (d && typeof d.enabled === "boolean") {
+      if (!sysData.bbr) sysData.bbr = {};
+      sysData.bbr.enabled = d.enabled;
+      if (typeof d.supported === "boolean") sysData.bbr.supported = d.supported;
+      if (d.kernel) sysData.bbr.kernel = d.kernel;
+      if (d.current_cc) sysData.bbr.current_cc = d.current_cc;
+    }
+    renderBbrUi();   // 与系统页共用同一渲染出口，避免两处又分叉
   } catch (e) { el.textContent = "状态获取失败"; }
 }
 function showKernel() {
