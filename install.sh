@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.40"
+readonly SCRIPT_VERSION="3.2.41"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -201,8 +201,10 @@ do_upgrade() {
     fi
     # 防降级：当前版本 ≥ 下载版本时跳过（例如服务器已是更高版本）；--version 显式指定时允许降级回退
     local cur_ver new_ver
-    cur_ver=$(grep -oP 'CURRENT_VERSION\s*=\s*"\K[\d.]+' "$APP_DIR/panel.py" 2>/dev/null | head -1)
-    new_ver=$(grep -oP 'CURRENT_VERSION\s*=\s*"\K[\d.]+' "$tmpdir/panel.py" 2>/dev/null | head -1)
+    # ⚠ 取值必须带 || true：卸载后 $APP_DIR/panel.py 不存在 → grep 退出码 2，
+    #   在 set -e + pipefail 下会直接把整个升级流程中断（「卸载后重装」实测就是这个坑）
+    cur_ver=$(grep -oP 'CURRENT_VERSION\s*=\s*"\K[\d.]+' "$APP_DIR/panel.py" 2>/dev/null | head -1 || true)
+    new_ver=$(grep -oP 'CURRENT_VERSION\s*=\s*"\K[\d.]+' "$tmpdir/panel.py" 2>/dev/null | head -1 || true)
     if [ -z "$VERSION_TAG" ] && [ -n "$cur_ver" ] && [ -n "$new_ver" ]; then
         if [ "$(printf '%s\n' "$cur_ver" "$new_ver" | sort -V | tail -1)" = "$cur_ver" ]; then
             if [ "$BETA" = "1" ]; then
@@ -232,11 +234,19 @@ do_upgrade() {
     for f in xterm.js xterm.css xterm-addon-fit.js; do
         fetch_source "$tmpdir/vendor/$f" "static/vendor/$f" || log_warn "终端资源 $f 下载失败(Web 终端不可用)"
     done
-    # 备份当前版本（保留最近 3 份）
+    # v3.2.40：程序目录可能整个不存在（卸载时删掉了、配置还留着）→ 先建好目录，
+    # 否则下面 install/mv 全部失败、set -e 直接中断升级（用户实测的「卸载后重装又出问题」）
+    mkdir -p "$APP_DIR/static"
+    # 备份当前版本（保留最近 3 份）；程序文件不存在（刚卸载过）就跳过备份，
+    # 且清理旧备份的取值/管道不得中断流程
     local bak
     bak="$APP_DIR/panel.py.bak.$(date +%Y%m%d%H%M%S)"
-    cp "$APP_DIR/panel.py" "$bak" 2>/dev/null && log_info "已备份旧版本: $bak"
-    ls -t "$APP_DIR"/panel.py.bak.* 2>/dev/null | tail -n +4 | xargs -r rm -f
+    if [ -f "$APP_DIR/panel.py" ]; then
+        if cp "$APP_DIR/panel.py" "$bak" 2>/dev/null; then
+            log_info "已备份旧版本: $bak"
+        fi
+    fi
+    ls -t "$APP_DIR"/panel.py.bak.* 2>/dev/null | tail -n +4 | xargs -r rm -f || true
     # 覆盖安装
     atomic_put "$tmpdir/panel.py" "$APP_DIR/panel.py" 755
     if [ -s "$tmpdir/index.html" ]; then

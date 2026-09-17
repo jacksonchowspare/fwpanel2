@@ -1178,6 +1178,38 @@ case "$UP2_OUT" in
     *START_CALLED*) ok "单元存在 → 显式 restart + 回读自检（替代 enable --now）" ;;
     *) bad "未走 restart 分支: $(printf '%s' "$UP2_OUT" | tail -3 | tr '\n' ' ')" ;;
 esac
+# 关键回归：刚卸载过（程序目录不存在、配置保留）→ do_upgrade 必须能跑完并重新部署
+rm -rf "$UTMP/app"; mkdir -p "$UTMP/app"
+echo 'CURRENT_VERSION = "2.1.33"' > "$UTMP/app/placeholder.txt"
+python3 - "$UTMP/etc/config.json" <<'PYCFG'
+import json, sys
+json.dump({"username": "keep_user", "password_hash": "keep$hash", "port": 42608,
+           "bind": "0.0.0.0", "mode": "strict", "ssh_port": 42606, "ssh_port_auto": True},
+          open(sys.argv[1], "w"))
+PYCFG
+rm -f "$UTMP/app/panel.py"        # 模拟卸载后：panel.py 已删
+rm -f "$UTMP/sd/fwpanel_utest.service"   # 卸载还会删掉 systemd 单元
+cat > "$UTMP/inner3.sh" <<'UGI3'
+source @UTMP@/install.sh
+VERSION_TAG=""; BETA=1
+resolve_src_tag() { SRC_TAG=v9.9.9; }
+fetch_source() { printf 'CURRENT_VERSION = "9.9.9"\n' > "$1"; return 0; }
+install_shortcut() { return 0; }
+install_service() { echo INSTALL_SERVICE_CALLED; }
+do_upgrade
+UGI3
+sed -i "s|@UTMP@|$UTMP|g" "$UTMP/inner3.sh"
+UP3_OUT=$(FW_SYSTEMD_DIR="$UTMP/sd" bash "$UTMP/inner3.sh" 2>&1 || true)
+case "$UP3_OUT" in
+    *INSTALL_SERVICE_CALLED*) ok "程序文件已删（卸载后重装）也能跑完升级流程" ;;
+    *) bad "卸载后重装中断: $(printf '%s' "$UP3_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+if [ -s "$UTMP/app/panel.py" ]; then ok "卸载后重装重新部署了 panel.py"; else bad "panel.py 未重新部署"; fi
+if [ "$(python3 -c "import json;print(json.load(open('$UTMP/etc/config.json'))['username'])" 2>/dev/null)" = "keep_user" ]; then
+    ok "卸载后重装保留原账号（不被重置）"
+else
+    bad "账号被改动"
+fi
 rm -rf "$UTMP"
 
 echo "== 前端行为测试（node；机器上没有 node 就跳过） =="
