@@ -8,10 +8,10 @@ rm -rf "$E2E"; mkdir -p "$E2E/app/static" "$E2E/etc" "$E2E/bin" "$E2E/sd"
 CALLS="$E2E/calls.log"; : > "$CALLS"
 
 # 1) 被测脚本副本（去掉末尾 main "$@"，所有落盘路径指向 $E2E）
-sed -e "s|^readonly APP_DIR=\"/usr/local/lib/fwpanel\"|readonly APP_DIR=\"$E2E/app\"|" \
-    -e "s|^readonly ETC_DIR=\"/etc/fwpanel\"|readonly ETC_DIR=\"$E2E/etc\"|" \
-    -e "s|^readonly LOG_FILE=\"/var/log/fwpanel-install.log\"|readonly LOG_FILE=\"$E2E/install.log\"|" \
-    -e "s|^readonly WRAPPER_PATH=\"/usr/local/bin/fwp\"|readonly WRAPPER_PATH=\"$E2E/bin/fwp\"|" \
+sed -e "s|^readonly APP_DIR=.*|readonly APP_DIR=\"$E2E/app\"|" \
+    -e "s|^readonly ETC_DIR=.*|readonly ETC_DIR=\"$E2E/etc\"|" \
+    -e "s|^readonly LOG_FILE=.*|readonly LOG_FILE=\"$E2E/install.log\"|" \
+    -e "s|^readonly WRAPPER_PATH=.*|readonly WRAPPER_PATH=\"$E2E/bin/fwp\"|" \
     -e "s|^readonly SERVICE_NAME=\"fwpanel.service\"|readonly SERVICE_NAME=\"fwpanel_e2e.service\"|" \
     -e "s|^readonly SYSTEMD_DIR=\"\${FW_SYSTEMD_DIR:-/etc/systemd/system}\"|readonly SYSTEMD_DIR=\"$E2E/sd\"|" \
     <(head -n -1 "$SRC/install.sh") > "$E2E/install.sh"

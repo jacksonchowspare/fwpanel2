@@ -13,6 +13,7 @@
 #   sudo bash install.sh --check                 仅体检环境
 #   sudo bash install.sh --change-password       重置面板密码（交互式）
 #   sudo bash install.sh --uninstall             卸载（停服务+删文件）
+#   sudo bash install.sh --purge                 彻底卸载（连配置/规则/站点文件/容器数据/证书一起删）
 #
 # 环境变量（与参数等效，参数优先）：
 #   FW_PORT FW_BIND FW_USER FW_PASS
@@ -22,16 +23,29 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.43"
+readonly SCRIPT_VERSION="3.2.44"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
-readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
+readonly WRAPPER_PATH="${FW_WRAPPER:-/usr/local/bin/fwp}"   # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
-readonly LOG_FILE="/var/log/fwpanel-install.log"
-readonly APP_DIR="/usr/local/lib/fwpanel"
-readonly ETC_DIR="/etc/fwpanel"
+readonly LOG_FILE="${FW_LOG_FILE:-/var/log/fwpanel-install.log}"
+readonly APP_DIR="${FW_APP_DIR:-/usr/local/lib/fwpanel}"
+readonly ETC_DIR="${FW_ETC_DIR:-/etc/fwpanel}"
 readonly SERVICE_NAME="fwpanel.service"
 # systemd 单元目录（可用 FW_SYSTEMD_DIR 覆盖——测试/沙箱里不希望真写 /etc）
 readonly SYSTEMD_DIR="${FW_SYSTEMD_DIR:-/etc/systemd/system}"
+
+# ---- 彻底卸载（--purge）会碰到的路径 ----
+# 同样支持 FW_* 覆盖：测试/演练用，生产走默认值（默认值与面板自身的路径常量一一对应）
+readonly NFT_TABLE_NAME="inet fwpanel"                          # 面板管理的 nft 表
+readonly NGINX_SITES_ENABLED="${FW_NGINX_SITES:-/etc/nginx/sites-enabled}"
+readonly NGINX_CONF_D="${FW_NGINX_CONFD:-/etc/nginx/conf.d}"
+readonly SITE_ROOT_BASE="${FW_SITE_ROOT:-/var/www}"             # 站点根目录（与面板默认一致）
+readonly ACME_WEBROOT="${FW_ACME_WEBROOT:-/var/www/fwpanel-acme}"
+readonly LE_DIR="${FW_LE_DIR:-/etc/letsencrypt}"
+readonly DOCKER_DATA_BASE="${FW_DOCKER_DATA:-/DockerData}"
+readonly COMPOSE_BASE="$DOCKER_DATA_BASE/dockercompose"
+readonly APP_DATA_BASE="$DOCKER_DATA_BASE/apps"
+readonly NGINX_LOG_DIR="${FW_NGINX_LOG_DIR:-/var/log/nginx}"
 readonly MIN_DEBIAN_VERSION=11
 readonly SUPPORTED_DISTROS="debian ubuntu arch fedora centos rocky alma rhel manjaro endeavouros"
 
@@ -340,6 +354,7 @@ $SCRIPT_NAME（安装脚本 v$SCRIPT_VERSION）—— 简易VPS管理面板2.0�
   sudo bash $0 --version v1.24.42        指定版本安装/升级/回退（如回退到 v1.24.42）
   sudo bash $0 --change-password         重置面板密码（交互式）
   sudo bash $0 --uninstall               卸载（停服务 + 删文件）
+  sudo bash $0 --purge               卸载（停服务 + 删文件）
   sudo bash $0 --update-script            升级本地缓存的安装脚本（fwp 用的那份；菜单 9 同效）
   fwp                                    已装面板后可用：直接打开上面的交互式菜单（脚本缓存于 $APP_DIR/$CACHED_SCRIPT_NAME）
 
@@ -381,6 +396,7 @@ parse_args() {
             --change-password) ACTION="change-password"; shift ;;
             --update-script) ACTION="update-script"; shift ;;
             -u|--uninstall) ACTION="uninstall"; shift ;;
+            --purge)       ACTION="purge"; shift ;;
             --force)       FORCE=1; shift ;;
             -h|--help)     usage; exit 0 ;;
             *) error "未知参数: $1（用 -h 查看帮助）" ;;
@@ -1254,13 +1270,14 @@ interactive_channel_menu() {
         echo "    4) 环境体检      只检查系统环境与依赖，不改动任何东西"
         echo "    5) 改用户名密码  交互式修改面板登录用户名和/或密码（回车 = 该项不改）"
         echo "    6) 卸载          停止服务（含孤儿进程）+ 删程序文件（保留 /etc/fwpanel 配置与规则）"
-        echo "    7) 查看登录信息  显示面板登录地址和用户名（需 root；密码不保存，只能重设）"
+        echo "    7) 彻底卸载      删程序 + 配置/规则 + 站点文件 + 容器数据 + 证书（不可恢复，需输入 DELETE）"
         echo "    8) 退出脚本      不做任何改动直接退出"
         echo "    9) 升级脚本      把 fwp 用的那份脚本更新到最新（更新完立刻用新脚本重开菜单）"
         echo "   10) 升级脚本+面板 先更新脚本，再用最新脚本把面板升到最新（不用敲命令）"
+        echo "   11) 查看登录信息  显示面板登录地址和用户名（需 root；密码不保存，只能重设）"
         echo ""
 
-        printf '  请输入 1 - 10 后回车（直接回车 = 1 安装正式版，8 = 退出）: '
+        printf '  请输入 1 - 11 后回车（直接回车 = 1 安装正式版，8 = 退出，11 = 查看登录信息）: '
         ans=""
         menu_read ans || return 0
         case "$ans" in
@@ -1311,6 +1328,18 @@ interactive_channel_menu() {
                    esac
                    echo "" ;;
             7)     echo ""
+                   log_warn "彻底卸载会删除：程序、配置与规则、站点文件、容器数据、证书 —— 全部不可恢复"
+                   printf '  确认执行？输入 DELETE 确认，其它任何内容取消: '
+                   confirm2=""
+                   menu_read confirm2 || confirm2=""
+                   if [ "$confirm2" = "DELETE" ]; then
+                       do_purge
+                       log_info "彻底卸载流程结束"
+                   else
+                       log_warn "已取消彻底卸载（未做任何改动）"
+                   fi
+                   echo "" ;;
+            11)    echo ""
                    do_show_login_info ;;
             8|q|Q|quit|exit)
                    echo ""
@@ -1342,7 +1371,7 @@ interactive_channel_menu() {
                    log_info "正在用最新脚本升级面板（测试版）…"
                    exec bash "$APP_DIR/$CACHED_SCRIPT_NAME" --beta ;;
             *)     echo ""
-                   log_warn "输入无效：$ans（请填 1 - 10）" ;;
+                   log_warn "输入无效：$ans（请填 1 - 11，11 = 查看登录信息）" ;;
         esac
     done
 }
@@ -1746,7 +1775,7 @@ print_summary() {
     else
         # 管道模式（curl | sudo bash）下 $0 是 "bash"，直接引用会印出 "sudo bash bash ..." 这种不可用的命令
         echo "  改用户名/密码: 重跑一键安装命令 → 菜单选 5) 改用户名密码"
-        echo "  查看登录地址/用户名: 同一菜单 7) 查看登录信息（需 root；密码只能重设）"
+        echo "  查看登录地址/用户名: 同一菜单 11) 查看登录信息（需 root；密码只能重设）"
         echo "  升级 / 换通道: 重跑一键安装命令 → 菜单选 1 / 2 / 3（或加 --beta / --version vX.Y.Z）"
     fi
     echo "  面板内可修改密码；SSH(22) 始终放行防锁死"
@@ -1830,6 +1859,367 @@ do_uninstall() {
     log_info "卸载完成"
 }
 
+
+# ============================== 彻底卸载（--purge） ==============================
+# 与普通卸载的区别：
+#   普通卸载（菜单 6 / --uninstall）只删程序文件，配置/规则/数据都留着，重装自动复用；
+#   彻底卸载（菜单 7 / --purge）把面板在这台机器上留下的东西一起清掉 —— 全部不可恢复，
+#   所以先列「将删除清单 + 大小」，再要求输入 DELETE，且**只碰名单里、形状能认出来的文件**。
+
+_path_size() {   # 人类可读大小；不存在打印 "-"
+    if [ -e "$1" ]; then du -sh "$1" 2>/dev/null | cut -f1 || true; else echo "-"; fi
+}
+
+_conf_owned_by_panel() {   # 只认面板的命名形状（与 panel.py 的 CONF_ID_RE 对齐，别误删别人的配置）
+    local base="$1" id
+    base="$(basename "$1")"
+    case "$base" in
+        fwpanel-default.conf) return 0 ;;
+        fwpanel-*.conf|fwsite-*.conf) ;;
+        *) return 1 ;;
+    esac
+    id="${base%.conf}"; id="${id#fwpanel-}"; id="${id#fwsite-}"
+    [[ "$id" =~ ^[0-9a-f]{12}$ ]]
+}
+
+_panel_conf_files() {   # 面板写的 nginx 配置（反代 fwpanel-<id>.conf / 站点 fwsite-<id>.conf / 兜底守卫）
+    local d fn
+    for d in "$NGINX_SITES_ENABLED" "$NGINX_CONF_D"; do
+        [ -d "$d" ] || continue
+        for fn in "$d"/*.conf; do
+            [ -f "$fn" ] || continue
+            if _conf_owned_by_panel "$fn"; then printf '%s\n' "$fn"; fi
+        done
+    done
+}
+
+_panel_domains() {   # 面板记录里涉及的域名（证书记录 + 站点/反代引用），用于清证书
+    python3 - "$ETC_DIR" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+etc = sys.argv[1]
+doms = set()
+
+def load(name):
+    try:
+        with open(os.path.join(etc, name)) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+c = load("certificates.json")
+if isinstance(c, dict):
+    doms.update(k.strip() for k in c if isinstance(k, str) and k.strip())
+for name in ("sites.json", "proxies.json"):
+    data = load(name)
+    if isinstance(data, dict):
+        data = data.get("items") or data.get("sites") or data.get("proxies") or []
+    for it in (data or []):
+        if not isinstance(it, dict):
+            continue
+        for k in ("domain", "cert_ref"):
+            v = it.get(k)
+            if isinstance(v, str) and v.strip():
+                doms.add(v.strip())
+print("\n".join(sorted(doms)))
+PYEOF
+}
+
+_panel_site_roots() {   # 只认 sites.json 里、位于站点根目录之下（且不是根目录本身）的路径
+    python3 - "$ETC_DIR" "$SITE_ROOT_BASE" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+etc, base = sys.argv[1], sys.argv[2].rstrip("/")
+try:
+    with open(os.path.join(etc, "sites.json")) as f:
+        sites = json.load(f)
+except Exception:
+    sites = []
+if not isinstance(sites, list):
+    sites = []
+roots = []
+for s in sites:
+    if not isinstance(s, dict):
+        continue
+    r = str(s.get("root") or "").strip()
+    if not r.startswith("/"):
+        continue
+    r = os.path.normpath(r)
+    if r != base and r.startswith(base + "/") and r not in ("/",):
+        roots.append(r)
+print("\n".join(sorted(set(roots))))
+PYEOF
+}
+
+_panel_apps() {   # 应用记录里的 id / folder（用于 compose down -v）
+    python3 - "$ETC_DIR" <<'PYEOF' 2>/dev/null || true
+import json, os, sys
+try:
+    with open(os.path.join(sys.argv[1], "apps.json")) as f:
+        d = json.load(f)
+except Exception:
+    d = {}
+apps = d.get("apps", []) if isinstance(d, dict) else []
+for a in apps:
+    if isinstance(a, dict):
+        print("%s\t%s" % (a.get("id", ""), a.get("folder", "")))
+PYEOF
+}
+
+_purge_firewall() {
+    if ! command -v nft >/dev/null 2>&1; then
+        echo "  - 本机没有 nft 命令（跳过）"
+        return 0
+    fi
+    if nft list table $NFT_TABLE_NAME >/dev/null 2>&1; then
+        if nft delete table $NFT_TABLE_NAME >/dev/null 2>&1; then
+            echo "  ✓ 已删除内核里的 $NFT_TABLE_NAME 表（规则文件随 $ETC_DIR 一起删掉了）"
+            log_warn "注意：此后本机不再有面板下发的防火墙规则"
+        else
+            log_warn "删除 $NFT_TABLE_NAME 表失败，可手工执行：sudo nft delete table $NFT_TABLE_NAME"
+        fi
+    else
+        echo "  - 内核里没有 $NFT_TABLE_NAME 表（跳过）"
+    fi
+}
+
+_purge_nginx_confs() {
+    local files="$1" cnt=0 f
+    if [ -z "$files" ]; then
+        echo "  - 没有面板写的 nginx 配置（跳过）"
+        return 0
+    fi
+    while IFS= read -r f; do
+        [ -n "$f" ] || continue
+        if rm -f "$f" 2>/dev/null; then cnt=$((cnt + 1)); fi
+    done <<< "$files"
+    echo "  ✓ 已删除 $cnt 个面板写的 nginx 配置（其它配置文件一律没动）"
+    if command -v nginx >/dev/null 2>&1; then
+        if nginx -t >/dev/null 2>&1; then
+            systemctl reload nginx >/dev/null 2>&1 || nginx -s reload >/dev/null 2>&1 || true
+            echo "  ✓ nginx 配置校验通过并已 reload"
+        else
+            log_warn "nginx 配置校验未通过（可能是你其它配置的问题）——面板配置已删但没 reload，请自己跑一下：nginx -t"
+        fi
+    fi
+}
+
+_purge_site_roots() {
+    local roots="$1" r
+    if [ -z "$roots" ]; then
+        echo "  - 没有面板记录的站点目录（跳过）"
+        return 0
+    fi
+    while IFS= read -r r; do
+        [ -n "$r" ] || continue
+        if [ -d "$r" ]; then
+            if rm -rf "$r" 2>/dev/null; then echo "  ✓ 已删除站点目录：$r"; else log_warn "删除失败：$r"; fi
+        fi
+    done <<< "$roots"
+    if [ -d "$ACME_WEBROOT" ]; then
+        rm -rf "$ACME_WEBROOT" 2>/dev/null && echo "  ✓ 已删除 ACME 校验目录：$ACME_WEBROOT"
+    fi
+}
+
+_purge_certs() {
+    local doms="$1" d
+    if [ -z "$doms" ]; then
+        echo "  - 面板记录里没有证书域名（跳过）"
+        return 0
+    fi
+    while IFS= read -r d; do
+        [ -n "$d" ] || continue
+        if command -v certbot >/dev/null 2>&1 \
+           && certbot delete --cert-name "$d" --non-interactive --config-dir "$LE_DIR" >/dev/null 2>&1; then
+            echo "  ✓ certbot 已删除证书：$d"
+        else
+            rm -rf "$LE_DIR/live/$d" "$LE_DIR/archive/$d" >/dev/null 2>&1 || true
+            rm -f "$LE_DIR/renewal/$d.conf" >/dev/null 2>&1 || true
+            if [ ! -e "$LE_DIR/live/$d" ]; then
+                echo "  ✓ 已删除证书文件：$d"
+            else
+                log_warn "删除证书 $d 失败，可手工：sudo certbot delete --cert-name $d"
+            fi
+        fi
+        # 站点访问/错误日志（面板为每个站点单独写的）
+        rm -f "$NGINX_LOG_DIR/$d.access.log" "$NGINX_LOG_DIR/$d.error.log" >/dev/null 2>&1 || true
+    done <<< "$doms"
+}
+
+_purge_docker() {
+    local apps="$1" id folder dir
+    if [ -n "$apps" ] && command -v docker >/dev/null 2>&1; then
+        while IFS=$'\t' read -r id folder; do
+            [ -n "$folder" ] || continue
+            dir="$COMPOSE_BASE/$folder"
+            if [ -f "$dir/docker-compose.yml" ]; then
+                if ( cd "$dir" && docker compose down -v --remove-orphans >/dev/null 2>&1 ); then
+                    echo "  ✓ 已停止并删除容器与数据卷：$folder"
+                else
+                    log_warn "应用 $folder 的容器/卷删除失败，可手工：cd $dir && sudo docker compose down -v"
+                fi
+            fi
+        done <<< "$apps"
+    else
+        echo "  - 没有面板应用记录或本机无 docker（跳过容器清理）"
+    fi
+    local sub
+    for sub in "$APP_DATA_BASE" "$COMPOSE_BASE" "$DOCKER_DATA_BASE/dockerrun" "$DOCKER_DATA_BASE/dockerimage"; do
+        if [ -e "$sub" ]; then
+            if rm -rf "$sub" 2>/dev/null; then echo "  ✓ 已删除数据目录：$sub"; fi
+        fi
+    done
+    rmdir "$DOCKER_DATA_BASE" >/dev/null 2>&1 && echo "  ✓ 已删除空目录：$DOCKER_DATA_BASE" || true
+}
+
+do_purge() {
+    echo "================== $SCRIPT_NAME 彻底卸载（含数据，不可恢复） =================="
+    check_root
+    cleanup_plaintext_credentials    # 顺手清掉旧版明文凭据文件（幂等）
+
+    local rport confs doms roots apps ncerts
+    rport="$(cfg_field port 2>/dev/null || true)"
+    confs="$(_panel_conf_files)"
+    doms="$(_panel_domains)"
+    roots="$(_panel_site_roots)"
+    apps="$(_panel_apps)"
+    ncerts="$(printf '%s' "$doms" | grep -c . || true)"
+    local nconfs
+    nconfs="$(printf '%s' "$confs" | grep -c . || true)"
+
+    echo ""
+    echo "------------------------------------------------------------------"
+    echo "  第一步：停服务并删除程序（与普通卸载相同）"
+    echo "    程序文件   : $APP_DIR          $(_path_size "$APP_DIR")"
+    echo "    快捷命令   : $WRAPPER_PATH"
+    echo "    服务单元   : $SYSTEMD_DIR/$SERVICE_NAME"
+    echo ""
+    echo "  第二步：删除面板的配置与痕迹"
+    echo "    配置与规则 : $ETC_DIR          $(_path_size "$ETC_DIR")（含账号、规则、反代与站点、应用记录、联邦令牌）"
+    echo "    安装日志   : $LOG_FILE         $(_path_size "$LOG_FILE")"
+    printf '    防火墙表   : %s' "$NFT_TABLE_NAME"
+    if command -v nft >/dev/null 2>&1 && nft list table $NFT_TABLE_NAME >/dev/null 2>&1; then
+        echo "（内核里正在生效，会一并删掉）"
+    else
+        echo "（内核里当前没有这张表）"
+    fi
+    if [ "${nconfs:-0}" -gt 0 ]; then
+        echo "    nginx 配置 : $nconfs 个"
+        printf '%s' "$confs" | sed 's/^/      /'
+    else
+        echo "    nginx 配置 : 无"
+    fi
+    echo ""
+    echo "  第三步：以下内容删了不可恢复，逐项确认 →"
+    if [ -n "$roots" ]; then
+        echo "    站点文件   :"
+        while IFS= read -r r; do [ -n "$r" ] && echo "      $r   $(_path_size "$r")"; done <<< "$roots"
+    else
+        echo "    站点文件   : 无"
+    fi
+    [ -d "$ACME_WEBROOT" ] && echo "    ACME 目录  : $ACME_WEBROOT   $(_path_size "$ACME_WEBROOT")"
+    if [ "${ncerts:-0}" -gt 0 ]; then
+        echo "    证书（$ncerts 个）:"
+        printf '%s' "$doms" | sed 's/^/      /'
+    else
+        echo "    证书       : 无"
+    fi
+    if [ -n "$apps" ]; then
+        echo "    Docker 应用容器与数据 :"
+        while IFS=$'\t' read -r _a_id _a_folder; do
+            [ -n "$_a_folder" ] && echo "      $_a_folder   $(_path_size "$COMPOSE_BASE/$_a_folder") + $(_path_size "$APP_DATA_BASE/$_a_folder")"
+        done <<< "$apps"
+    else
+        echo "    Docker 应用容器与数据 : 无"
+        [ -d "$DOCKER_DATA_BASE" ] && echo "      $DOCKER_DATA_BASE   $(_path_size "$DOCKER_DATA_BASE")"
+    fi
+    echo "------------------------------------------------------------------"
+
+    # 确认（--yes 无人值守时才自动放行）
+    if [ "$YES" = "1" ]; then
+        log_warn "--yes：已自动确认彻底卸载（无人值守模式）"
+    else
+        local ans=""
+        printf '  确认彻底删除以上全部内容？输入 DELETE 执行，其它任何输入 = 取消: '
+        menu_read ans || ans=""
+        if [ "$ans" != "DELETE" ]; then
+            log_warn "已取消彻底卸载（未做任何改动）"
+            return 0
+        fi
+    fi
+
+    echo ""
+    log_info "① 停止面板服务（含孤儿进程检测）..."
+    if ! stop_panel_service; then
+        error "面板进程仍在运行，未继续——请按上面提示手动结束后重试"
+    fi
+    log_info "② 删除 systemd 服务与程序文件..."
+    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_DIR/$SERVICE_NAME"
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -rf "$APP_DIR"
+    [ -e "$WRAPPER_PATH" ] && rm -f "$WRAPPER_PATH"
+
+    log_info "③ 删除配置、日志、nginx 配置与防火墙表..."
+    _purge_nginx_confs "$confs"
+    _purge_firewall
+    rm -rf "$ETC_DIR"
+    rm -f "$LOG_FILE"
+
+    log_info "④ 清理站点文件、容器数据与证书..."
+    if [ "$YES" = "1" ]; then
+        # 无人值守：三样都按清单删掉
+        _purge_site_roots "$roots"
+        _purge_docker "$apps"
+        _purge_certs "$doms"
+    else
+        # 删了不可恢复的三项，逐项再确认一次（默认否）
+        if _ask_yn "删除站点文件与 ACME 目录（不可恢复）？"; then
+            _purge_site_roots "$roots"
+        else
+            echo "  - 已保留站点文件"
+        fi
+        if _ask_yn "删除 Docker 应用容器与其数据（不可恢复）？"; then
+            _purge_docker "$apps"
+        else
+            echo "  - 已保留 Docker 应用与数据"
+        fi
+        if _ask_yn "删除面板申请/引用的证书（不可恢复）？"; then
+            _purge_certs "$doms"
+        else
+            echo "  - 已保留证书"
+        fi
+    fi
+
+    # 收尾自检：逐项确认，而不是只喊一句完成
+    echo "------------------------------------------------------------------"
+    local pids
+    pids="$(panel_pids)"
+    if [ -n "$pids" ]; then log_warn "仍有面板进程残留: $pids"; else echo "  ✓ 无残留面板进程"; fi
+    [ -f "$APP_DIR/panel.py" ] && log_warn "程序文件仍存在: $APP_DIR/panel.py" || echo "  ✓ 程序文件已删除"
+    [ -e "$ETC_DIR" ] && log_warn "配置目录仍存在: $ETC_DIR" || echo "  ✓ 配置目录已删除（$ETC_DIR）"
+    systemctl list-unit-files 2>/dev/null | grep -q "$SERVICE_NAME" \
+        && log_warn "service 单元仍存在" || echo "  ✓ systemd 服务已移除"
+    if [ -n "$rport" ] && port_listening "$rport"; then
+        log_warn "端口 $rport 仍在监听（可能是别的服务）"
+    fi
+    echo "------------------------------------------------------------------"
+    echo "  以下改动**故意保留**（动它们有风险，需要你自己决定）："
+    for _f in /etc/ssh/sshd_config.d/99-fwpanel-port.conf /etc/ssh/sshd_config.d/99-fwpanel-auth.conf \
+              /etc/sysctl.d/99-fwpanel-swap.conf /etc/sysctl.d/99-fwpanel-ipv6.conf /etc/sysctl.d/99-fwpanel-bbr.conf; do
+        [ -e "$_f" ] && echo "    $_f（删掉会立刻回到系统默认，可能影响你的 SSH 端口/内核参数）"
+    done
+    echo "  重装面板可以直接再来一遍安装命令（会当作全新安装，账号重新设置）"
+    echo "------------------------------------------------------------------"
+    log_info "彻底卸载完成"
+}
+
+_ask_yn() {   # $1=提示；默认否
+    local a=""
+    printf '  %s [y/N]: ' "$1"
+    menu_read a || a=""
+    case "$a" in y|Y|yes|YES|Yes) return 0 ;; *) return 1 ;; esac
+}
+
 # ============================== 改密 ==============================
 
 do_change_password() {
@@ -1861,6 +2251,7 @@ main() {
     case "$ACTION" in
         check)   do_check ;;
         uninstall) exec > >(tee -a "$LOG_FILE") 2>&1; do_uninstall ;;
+        purge)   exec > >(tee -a "$LOG_FILE") 2>&1; do_purge ;;
         change-password) do_change_password ;;
         update-script) do_update_script ;;
         *)       exec > >(tee -a "$LOG_FILE") 2>&1; do_install ;;

@@ -4,8 +4,8 @@ set -u
 SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/install.sh"
 TMPF=$(mktemp)
 head -n -1 "$SCRIPT" \
-    | sed -e 's|^readonly WRAPPER_PATH="/usr/local/bin/fwp"|readonly WRAPPER_PATH="/tmp/fwtest/bin/fwp"|' \
-          -e 's|^readonly APP_DIR="/usr/local/lib/fwpanel"|readonly APP_DIR="/tmp/fwtest/app"|' \
+    | sed -e 's|^readonly WRAPPER_PATH=.*|readonly WRAPPER_PATH="/tmp/fwtest/bin/fwp"|' \
+          -e 's|^readonly APP_DIR=.*|readonly APP_DIR="/tmp/fwtest/app"|' \
     > "$TMPF"      # 去掉最后一行 main "$@"；并把会落盘的真实路径换成临时路径
 # shellcheck disable=SC1090
 source "$TMPF"
@@ -86,7 +86,7 @@ rm -rf /tmp/fakebin
 echo "== do_upgrade 防降级（当前 ≥ 下载版本时跳过） =="
 mkdir -p /tmp/fwpanel-dg-cur /tmp/fwpanel-dg-tmp
 echo 'CURRENT_VERSION = "1.23.20"' > /tmp/fwpanel-dg-cur/panel.py
-head -n -1 "$SCRIPT" | sed 's|readonly APP_DIR="/usr/local/lib/fwpanel"|readonly APP_DIR="/tmp/fwpanel-dg-cur"|' > /tmp/install_funcs_dg.sh
+head -n -1 "$SCRIPT" | sed 's|^readonly APP_DIR=.*|readonly APP_DIR="/tmp/fwpanel-dg-cur"|' > /tmp/install_funcs_dg.sh
 # curl 必须用「可执行桩 + PATH」，不能用 shell 函数：do_upgrade 的下载现在经过
 # run_with_timeout（timeout 是外部命令），函数桩会被绕过而真的联网
 mkdir -p /tmp/fakebin_dg
@@ -370,6 +370,7 @@ menu_case() {  # $1=输入 → 输出原文（含 stub 调用标记）
         do_change_password() { echo "DO_CHANGE_PW_CALLED"; }
         do_uninstall() { echo "DO_UNINSTALL_CALLED"; }
         do_show_login_info() { echo "DO_SHOW_INFO_CALLED"; }
+        do_purge() { echo "DO_PURGE_CALLED"; }
         do_update_script() { echo "DO_UPDATE_SCRIPT_CALLED"; }
         interactive_channel_menu
         echo "MENU_RETURNED BETA=$BETA VERSION_TAG=$VERSION_TAG"' 2>&1
@@ -387,10 +388,21 @@ out="$(menu_case '5
 8')"
 menu_has DO_CHANGE_PW_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
     && ok "5) 改凭据后返回主菜单" || bad "5) 未返回菜单"
-out="$(menu_case '7
+out="$(menu_case '11
 8')"
 menu_has DO_SHOW_INFO_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
-    && ok "7) 查看信息后返回主菜单" || bad "7) 未返回菜单"
+    && ok "11) 查看信息后返回主菜单（v3.2.44 起从 7 顺移到 11）" || bad "11) 未返回菜单"
+# 7) 彻底卸载：必须输入 DELETE 才执行（防手滑），且执行完回主菜单
+out="$(menu_case '7
+DELETE
+8')"
+menu_has DO_PURGE_CALLED "$out" && [ "$(menu_draws "$out")" -eq 2 ] \
+    && ok "7) 彻底卸载：输入 DELETE 才执行，之后回主菜单" || bad "7) 未按预期执行: $(printf '%s' "$out" | tail -4)"
+out="$(menu_case '7
+no
+8')"
+menu_has DO_PURGE_CALLED "$out" && bad "7) 没输入 DELETE 竟然执行了卸载" \
+    || { menu_has "已取消" "$out" && ok "7) 输入不是 DELETE → 取消（不做任何改动）" || bad "7) 取消时没有明确提示"; }
 
 out="$(menu_case '9
 8')"
@@ -428,7 +440,7 @@ menu_has "NEW_SCRIPT_RAN args=[]" "$out" && ok "10) 选 1 正式版：不带 --b
 
 out="$(menu_case '10
 8' 2>/dev/null || true)"
-menu_has "请输入 1 - 10" "$out" && ok "菜单提示为「请输入 1 - 10」" || bad "菜单提示未更新"
+menu_has "请输入 1 - 11" "$out" && ok "菜单提示为「请输入 1 - 11」" || bad "菜单提示未更新"
 menu_has "10) 升级脚本+面板" "$out" && ok "菜单里有 10) 升级脚本+面板" || bad "菜单缺少第 10 项"
 menu_has "9) 升级脚本" "$out" && ok "第 9 项已改名「升级脚本」" || bad "第 9 项文案未更新"
 # 线上最新版比本地脚本新 → 头部直接提示（省得用户自己去想"要不要更新脚本"）
@@ -508,7 +520,7 @@ echo "== do_upgrade：正式版 2.1.33 选测试版 = 升级（不是跳过） =
 # 用户实测场景：机器上装的是正式版，菜单选「安装测试版」应升级过去而不是被防降级拦住
 mkdir -p /tmp/fwupg-cur /tmp/fwupg-tmp
 echo 'CURRENT_VERSION = "2.1.33"' > /tmp/fwupg-cur/panel.py
-head -n -1 "$SCRIPT" | sed 's|readonly APP_DIR="/usr/local/lib/fwpanel"|readonly APP_DIR="/tmp/fwupg-cur"|' > /tmp/install_funcs_ug.sh
+head -n -1 "$SCRIPT" | sed 's|^readonly APP_DIR=.*|readonly APP_DIR="/tmp/fwupg-cur"|' > /tmp/install_funcs_ug.sh
 mkdir -p /tmp/fwupg-cwd        # 受控工作目录：升级不得在 CWD 造垃圾文件
 mkdir -p /tmp/fwupg-sd         # systemd 单元目录也隔离（FW_SYSTEMD_DIR），不写真 /etc
 # curl 桩必须是「可执行文件 + PATH」：do_upgrade 的下载走 run_with_timeout（timeout 是外部命令），
@@ -642,7 +654,7 @@ EOF
 cat > /tmp/fwinfo/etc/credentials.json <<'EOF'
 {"username": "jackson", "password": "ShouldBeDeleted", "updated_at": "2026-09-16 20:30:00"}
 EOF
-head -n -1 "$SCRIPT" | sed 's|readonly ETC_DIR="/etc/fwpanel"|readonly ETC_DIR="/tmp/fwinfo/etc"|' > /tmp/fwinfo/install_info.sh
+head -n -1 "$SCRIPT" | sed 's|^readonly ETC_DIR=.*|readonly ETC_DIR="/tmp/fwinfo/etc"|' > /tmp/fwinfo/install_info.sh
 infoline() {  # $1=匹配片段 $2=说明 $3=输出
     local out="$3"
     case "$out" in *"$1"*) ok "$2" ;; *) bad "$2 —— 输出里没有「$1」: $(printf '%s' "$out" | tail -8)" ;; esac
@@ -800,7 +812,7 @@ env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="<html>404 Not
 env -i PATH=/tmp/fwtest/fakebin:/usr/bin:/bin HOME=/tmp FAKE_BODY="$(cat "$SCRIPT")" \
   bash -c 'source "$1"; install_shortcut' bash "$TMPF" >/dev/null 2>&1
 # 缓存应变成"线上原件"（带生产路径），而不再是刚才那份测试副本
-grep -q 'readonly WRAPPER_PATH="/usr/local/bin/fwp"' /tmp/fwtest/app/install.sh \
+grep -qE '^readonly WRAPPER_PATH=' /tmp/fwtest/app/install.sh \
     && ok "管道模式下按官方地址抓到完整脚本并入库" || bad "管道模式抓取入库异常"
 
 # ②b 旧缓存（没有菜单的老脚本，模拟用户机器上那份 v2.1.24）必须给出明确提示，不能让人猜
@@ -1021,9 +1033,9 @@ rm -f "$RTMP" "$RTMP".broken.*
 echo "== write_config：已有 config.json 时端口/账号/密码哈希/自定义字段都不被覆盖（v3.2.40） =="
 WTMP=$(mktemp -d); mkdir -p "$WTMP/etc" "$WTMP/app"
 head -n -1 "$SCRIPT" \
-    | sed -e "s|^readonly APP_DIR=\"/usr/local/lib/fwpanel\"|readonly APP_DIR=\"$WTMP/app\"|" \
-          -e "s|^readonly ETC_DIR=\"/etc/fwpanel\"|readonly ETC_DIR=\"$WTMP/etc\"|" \
-          -e "s|^readonly LOG_FILE=\"/var/log/fwpanel-install.log\"|readonly LOG_FILE=\"$WTMP/install.log\"|" \
+    | sed -e "s|^readonly APP_DIR=.*|readonly APP_DIR=\"$WTMP/app\"|" \
+          -e "s|^readonly ETC_DIR=.*|readonly ETC_DIR=\"$WTMP/etc\"|" \
+          -e "s|^readonly LOG_FILE=.*|readonly LOG_FILE=\"$WTMP/install.log\"|" \
     > "$WTMP/install.sh"
 cat > "$WTMP/etc/config.json" <<'JSON'
 {"username":"huoshen2877","password_hash":"saltXhashY","port":42608,"bind":"0.0.0.0",
@@ -1053,7 +1065,7 @@ rm -rf "$WTMP"
 echo "== stop_panel_service：孤儿进程必须被真杀（v3.2.40 修「卸载假成功、进程占着端口」） =="
 OTMP=$(mktemp -d); mkdir -p "$OTMP/app" "$OTMP/bin"
 # 生成被测脚本副本（APP_DIR 指向临时目录）
-head -n -1 "$SCRIPT" | sed -e "s|^readonly APP_DIR=\"/usr/local/lib/fwpanel\"|readonly APP_DIR=\"$OTMP/app\"|" > "$OTMP/install.sh"
+head -n -1 "$SCRIPT" | sed -e "s|^readonly APP_DIR=.*|readonly APP_DIR=\"$OTMP/app\"|" > "$OTMP/install.sh"
 cat > "$OTMP/app/panel.py" <<'PYBODY'
 import time
 time.sleep(300)
@@ -1077,7 +1089,7 @@ SP_OUT=$(PATH="$OTMP/bin:$PATH" bash "$OTMP/run1.sh" 2>&1 | tail -1 || true)
 if [ "$SP_OUT" = "GONE rc=0" ]; then ok "systemctl 无效时仍把进程杀掉并返回成功"; else bad "孤儿进程未清理: $SP_OUT"; fi
 
 OTMP2=$(mktemp -d); mkdir -p "$OTMP2/app" "$OTMP2/bin"
-head -n -1 "$SCRIPT" | sed -e "s|^readonly APP_DIR=\"/usr/local/lib/fwpanel\"|readonly APP_DIR=\"$OTMP2/app\"|" > "$OTMP2/install.sh"
+head -n -1 "$SCRIPT" | sed -e "s|^readonly APP_DIR=.*|readonly APP_DIR=\"$OTMP2/app\"|" > "$OTMP2/install.sh"
 cat > "$OTMP2/app/panel.py" <<'PYBODY'
 import signal, time
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
@@ -1131,9 +1143,9 @@ UTMP=$(mktemp -d); mkdir -p "$UTMP/app" "$UTMP/etc"
 # 预置「已装旧版」的 panel.py：do_upgrade 的防降级检查要读它（读不到时 grep 退出码 2 会被 set -e 杀掉）
 echo 'CURRENT_VERSION = "2.1.33"' > "$UTMP/app/panel.py"
 head -n -1 "$SCRIPT" \
-    | sed -e "s|^readonly APP_DIR=\"/usr/local/lib/fwpanel\"|readonly APP_DIR=\"$UTMP/app\"|" \
-          -e "s|^readonly ETC_DIR=\"/etc/fwpanel\"|readonly ETC_DIR=\"$UTMP/etc\"|" \
-          -e "s|^readonly LOG_FILE=\"/var/log/fwpanel-install.log\"|readonly LOG_FILE=\"$UTMP/install.log\"|" \
+    | sed -e "s|^readonly APP_DIR=.*|readonly APP_DIR=\"$UTMP/app\"|" \
+          -e "s|^readonly ETC_DIR=.*|readonly ETC_DIR=\"$UTMP/etc\"|" \
+          -e "s|^readonly LOG_FILE=.*|readonly LOG_FILE=\"$UTMP/install.log\"|" \
           -e "s|^readonly SERVICE_NAME=\"fwpanel.service\"|readonly SERVICE_NAME=\"fwpanel_utest.service\"|" \
     > "$UTMP/install.sh"
 cat > "$UTMP/inner1.sh" <<'UGI1'
@@ -1273,6 +1285,182 @@ case "$POUT2" in
     *) bad "无反代时中断: $(printf '%s' "$POUT2" | tail -2 | tr '\n' ' ')" ;;
 esac
 rm -rf "$PTMP"
+
+echo "== 彻底卸载（--purge）：该删的全删、名单外的文件一个不动 =="
+HX1=aaaaaaaaaaaa
+HX2=bbbbbbbbbbbb
+DOM=p.example.com
+
+build_env() {   # $1 = 场景根目录；$2 = 场景名
+    local R="$1"
+    rm -rf "$R"
+    mkdir -p "$R"/etc "$R"/app "$R"/bin "$R"/sd "$R"/log \
+             "$R"/nginx/sites-enabled "$R"/nginx/conf.d \
+             "$R"/le/live "$R"/le/archive "$R"/le/renewal \
+             "$R"/docker/apps/wp-8080 "$R"/docker/dockercompose/wp-8080 \
+             "$R"/docker/dockerrun/c1 "$R"/docker/dockerimage \
+             "$R"/nginxlogs "$R"/www/blog.example.com "$R"/www/fwpanel-acme "$R"/fakebin
+    printf '{"username":"u1","password_hash":"h","port":54999,"bind":"0.0.0.0","mode":"strict"}' > "$R/etc/config.json"
+    echo '[]' > "$R/etc/rules.json"
+    printf '[{"id":"%s","domain":"%s","target_port":42608,"enabled":true}]' "$HX1" "$DOM" > "$R/etc/proxies.json"
+    printf '[{"id":"%s","domain":"blog.example.com","root":"%s/www/blog.example.com","enabled":true}]' "$HX2" "$R" > "$R/etc/sites.json"
+    printf '{"%s":"a@b.c"}' "$DOM" > "$R/etc/certificates.json"
+    printf '{"apps":[{"id":"cccccccccccc","folder":"wp-8080"}]}' > "$R/etc/apps.json"
+    echo 'table inet fwpanel {}' > "$R/etc/firewall.nft"
+    echo 'CURRENT_VERSION = "9.9.9"' > "$R/app/panel.py"
+    echo 'wrapper' > "$R/bin/fwp"
+    echo 'unit' > "$R/sd/fwpanel.service"
+    echo 'install log' > "$R/log/fwpanel-install.log"
+    echo 'proxy conf' > "$R/nginx/sites-enabled/fwpanel-$HX1.conf"
+    echo 'site conf'  > "$R/nginx/sites-enabled/fwsite-$HX2.conf"
+    echo 'guard'      > "$R/nginx/sites-enabled/fwpanel-default.conf"
+    echo 'MUST SURVIVE' > "$R/nginx/sites-enabled/zzz-user-own.conf"
+    echo 'MUST SURVIVE' > "$R/nginx/conf.d/other.conf"
+    echo '<h1>blog</h1>' > "$R/www/blog.example.com/index.html"
+    echo 'acme token' > "$R/www/fwpanel-acme/token"
+    mkdir -p "$R/le/live/$DOM" "$R/le/archive/$DOM"
+    echo 'cert' > "$R/le/live/$DOM/fullchain.pem"
+    echo 'cert' > "$R/le/archive/$DOM/cert1.pem"
+    echo 'renew' > "$R/le/renewal/$DOM.conf"
+    echo 'db dump' > "$R/docker/apps/wp-8080/db.sql"
+    echo 'services: {}' > "$R/docker/dockercompose/wp-8080/docker-compose.yml"
+    echo 'vol' > "$R/docker/dockerrun/c1/data"
+    echo 'img' > "$R/docker/dockerimage/x.tar"
+    echo 'logline' > "$R/nginxlogs/blog.example.com.access.log"
+    : > "$R/calls.log"
+    : > "$R/nft_present"
+
+    cat > "$R/fakebin/systemctl" <<'STUB'
+#!/bin/bash
+case "$1" in
+  is-active|status) exit 3 ;;
+  show)             echo ""; exit 0 ;;
+  *)                exit 0 ;;
+esac
+STUB
+    cat > "$R/fakebin/nft" <<STUB
+#!/bin/bash
+echo "nft \$*" >> "$R/calls.log"
+if [ "\$1" = "list" ]; then [ -f "$R/nft_present" ] && exit 0 || exit 1; fi
+exit 0
+STUB
+    cat > "$R/fakebin/docker" <<STUB
+#!/bin/bash
+echo "docker \$* (cwd=\$PWD)" >> "$R/calls.log"
+exit 0
+STUB
+    cat > "$R/fakebin/certbot" <<'STUB'
+#!/bin/bash
+exit 1        # 模拟 certbot 不可用 → 走文件删除分支
+STUB
+    printf '#!/bin/bash\nexit 0\n' > "$R/fakebin/nginx"
+    printf '#!/bin/bash\nexit 0\n' > "$R/fakebin/ss"
+    chmod +x "$R"/fakebin/*
+
+    # 加载真实函数库（去掉末行 main），覆盖 check_root（测试非 root），导出 FW_* 隔离路径
+    cat > "$R/run.sh" <<RUNNER
+#!/bin/bash
+export FW_ETC_DIR="$R/etc" FW_APP_DIR="$R/app" FW_WRAPPER="$R/bin/fwp"
+export FW_LOG_FILE="$R/log/fwpanel-install.log" FW_SYSTEMD_DIR="$R/sd"
+export FW_NGINX_SITES="$R/nginx/sites-enabled" FW_NGINX_CONFD="$R/nginx/conf.d"
+export FW_SITE_ROOT="$R/www" FW_ACME_WEBROOT="$R/www/fwpanel-acme"
+export FW_LE_DIR="$R/le" FW_DOCKER_DATA="$R/docker" FW_NGINX_LOG_DIR="$R/nginxlogs"
+export PATH="$R/fakebin:\$PATH"
+source <(sed 's/^main "\$@"\$//' "$SCRIPT" | head -n -1)
+check_root() { return 0; }
+YES="\${1:-0}"
+do_purge
+echo "PURGE_RC=\$?"
+RUNNER
+}
+
+echo "── ① 不是 DELETE / 无 tty → 必须什么都不删（防误触） ──"
+R=/tmp/fwpurge_a; build_env "$R" a
+OUT="$(bash "$R/run.sh" 0 2>&1 || true)"
+case "$OUT" in *"已取消彻底卸载"*) ok "明确提示已取消" ;; *) bad "未提示取消: $(printf '%s' "$OUT" | tail -3 | tr '\n' ' ')" ;; esac
+[ -f "$R/etc/config.json" ] && ok "配置目录原封不动" || bad "配置被删了（不该！）"
+[ -f "$R/nginx/sites-enabled/fwpanel-$HX1.conf" ] && ok "nginx 配置原封不动" || bad "nginx 配置被删了（不该！）"
+[ -f "$R/app/panel.py" ] && ok "程序文件原封不动" || bad "程序被删了（不该！）"
+
+echo "── ② --purge -y：该删的全删、不该删的一个不动 ──"
+R=/tmp/fwpurge_b; build_env "$R" b
+OUT="$(bash "$R/run.sh" 1 2>&1 || true)"
+printf '%s' "$OUT" > "$R/out.log"
+case "$OUT" in *"PURGE_RC=0"*) ok "流程正常结束（rc=0）" ;; *) bad "非 0 退出: $(printf '%s' "$OUT" | tail -5 | tr '\n' ' ')" ;; esac
+case "$OUT" in *"不再有面板下发的防火墙规则"*) ok "提示「此后不再有面板下发的规则」" ;; *) bad "缺防火墙提示" ;; esac
+# 该删的
+[ ! -d "$R/etc" ]                && ok "配置目录 /etc/fwpanel 已删" || bad "配置目录仍在"
+[ ! -f "$R/app/panel.py" ]       && ok "程序文件已删" || bad "程序文件仍在"
+[ ! -f "$R/bin/fwp" ]            && ok "快捷命令 fwp 已删" || bad "fwp 仍在"
+[ ! -f "$R/sd/fwpanel.service" ] && ok "systemd 单元已删" || bad "单元仍在"
+[ ! -f "$R/log/fwpanel-install.log" ] && ok "安装日志已删" || bad "安装日志仍在"
+[ ! -f "$R/nginx/sites-enabled/fwpanel-$HX1.conf" ] && ok "反代配置已删" || bad "反代配置仍在"
+[ ! -f "$R/nginx/sites-enabled/fwsite-$HX2.conf" ]  && ok "站点配置已删" || bad "站点配置仍在"
+[ ! -f "$R/nginx/sites-enabled/fwpanel-default.conf" ] && ok "兜底守卫配置已删" || bad "守卫配置仍在"
+[ ! -d "$R/www/blog.example.com" ] && ok "站点文件已删" || bad "站点文件仍在"
+[ ! -d "$R/www/fwpanel-acme" ]     && ok "ACME 校验目录已删" || bad "ACME 目录仍在"
+[ ! -d "$R/le/live/$DOM" ]         && ok "证书 live 目录已删" || bad "证书 live 仍在"
+[ ! -f "$R/le/renewal/$DOM.conf" ] && ok "证书续期配置已删" || bad "renewal 仍在"
+[ ! -d "$R/docker/apps/wp-8080" ]  && ok "应用数据目录已删" || bad "应用数据仍在"
+[ ! -d "$R/docker/dockercompose/wp-8080" ] && ok "compose 目录已删" || bad "compose 目录仍在"
+[ ! -d "$R/docker" ]               && ok "整个 /DockerData 已清空" || bad "/DockerData 还在"
+[ ! -f "$R/nginxlogs/blog.example.com.access.log" ] && ok "站点访问日志已删" || bad "站点日志仍在"
+# 不该删的（安全护栏）
+[ -f "$R/nginx/sites-enabled/zzz-user-own.conf" ] && ok "★ 别人的 nginx 配置活下来了（sites-enabled）" || bad "误删了别人的配置！"
+[ -f "$R/nginx/conf.d/other.conf" ] && ok "★ 别人的 nginx 配置活下来了（conf.d）" || bad "误删了 conf.d 里的配置！"
+[ -d "$R/le/live" ] && ok "证书根目录保留（只删域名子目录）" || bad "连证书根目录一起删了"
+# 系统调用
+grep -q "delete table inet fwpanel" "$R/calls.log" && ok "调用了 nft delete table inet fwpanel" || bad "没删内核表"
+grep -q "docker compose down -v" "$R/calls.log" && ok "调用了 docker compose down -v（删容器与卷）" || bad "没停容器"
+grep -q "cwd=$R/docker/dockercompose/wp-8080" "$R/calls.log" && ok "down 在应用自己的目录里执行" || bad "down 的执行目录不对"
+
+echo "── ③ 幂等：再跑一遍不报错 ──"
+OUT2="$(bash "$R/run.sh" 1 2>&1 || true)"
+case "$OUT2" in *"PURGE_RC=0"*) ok "重复执行 rc=0" ;; *) bad "重复执行失败: $(printf '%s' "$OUT2" | tail -4 | tr '\n' ' ')" ;; esac
+case "$OUT2" in *"彻底卸载完成"*) ok "重复执行仍给出完成提示" ;; *) bad "重复执行输出异常" ;; esac
+[ ! -d "$R/etc" ] && ok "重复执行后依然干净" || bad "重复执行后又冒出配置目录"
+
+echo "── ④ 普通卸载语义没被改动（配置仍保留） ──"
+UNINST="$(sed -n "$(grep -n '^do_uninstall()' "$SCRIPT" | cut -d: -f1),/^}/p" "$SCRIPT")"
+case "$UNINST" in *"按设计保留"*) ok "do_uninstall 仍声明保留配置" ;; *) bad "do_uninstall 文案被改动" ;; esac
+case "$UNINST" in *'rm -rf "$ETC_DIR"'*) bad "普通卸载里出现了删配置（不该）" ;; *) ok "普通卸载不删 ETC_DIR" ;; esac
+
+echo "── ⑤ 接线检查（菜单/参数/分派） ──"
+grep -q '            --purge)       ACTION="purge"' "$SCRIPT" && ok "parse_args 认识 --purge" || bad "缺少 --purge 参数"
+grep -q 'purge)   exec > >(tee -a "$LOG_FILE") 2>&1; do_purge' "$SCRIPT" && ok "main 分派到 do_purge" || bad "main 未分派"
+grep -q '7) 彻底卸载' "$SCRIPT" && ok "菜单有 7) 彻底卸载" || bad "菜单缺项"
+grep -q '11) 查看登录信息' "$SCRIPT" && ok "查看登录信息顺移到 11" || bad "菜单编号未调整"
+grep -q '请输入 1 - 11' "$SCRIPT" && ok "输入范围提示已更新为 1 - 11" || bad "范围提示未更新"
+grep -q '确认执行？输入 DELETE 确认' "$SCRIPT" && ok "菜单路径要求输入 DELETE" || bad "菜单确认文案缺失"
+grep -q '输入 DELETE 执行' "$SCRIPT" && ok "--purge 路径要求输入 DELETE" || bad "参数路径确认文案缺失"
+
+echo "── ⑥ 交互模式：DELETE 确认后，不可恢复的三项逐项问、答否就保留 ──"
+R=/tmp/fwpurge_c; build_env "$R" c
+cat > "$R/run2.sh" <<RUNNER2
+#!/bin/bash
+export FW_ETC_DIR="$R/etc" FW_APP_DIR="$R/app" FW_WRAPPER="$R/bin/fwp"
+export FW_LOG_FILE="$R/log/fwpanel-install.log" FW_SYSTEMD_DIR="$R/sd"
+export FW_NGINX_SITES="$R/nginx/sites-enabled" FW_NGINX_CONFD="$R/nginx/conf.d"
+export FW_SITE_ROOT="$R/www" FW_ACME_WEBROOT="$R/www/fwpanel-acme"
+export FW_LE_DIR="$R/le" FW_DOCKER_DATA="$R/docker" FW_NGINX_LOG_DIR="$R/nginxlogs"
+export PATH="$R/fakebin:\$PATH"
+source <(sed 's/^main "\$@"\$//' "$SCRIPT" | head -n -1)
+check_root() { return 0; }
+menu_read() { eval "\$1=DELETE"; return 0; }   # 模拟用户输入 DELETE
+_ask_yn() { return 1; }                        # 模拟三项都答否
+YES=0
+do_purge
+echo "PURGE_RC=\$?"
+RUNNER2
+OUT3="$(bash "$R/run2.sh" 2>&1 || true)"
+case "$OUT3" in *"PURGE_RC=0"*) ok "交互流程 rc=0" ;; *) bad "交互流程失败: $(printf '%s' "$OUT3" | tail -4 | tr '\n' ' ')" ;; esac
+[ ! -d "$R/etc" ] && ok "默认档（配置/程序/规则/nginx 配置）照常删除" || bad "配置没删"
+[ -d "$R/www/blog.example.com" ] && ok "★ 答否 → 站点文件保留" || bad "答否却删了站点文件"
+[ -d "$R/docker/apps/wp-8080" ] && ok "★ 答否 → 容器数据保留" || bad "答否却删了容器数据"
+[ -d "$R/le/live/$DOM" ] && ok "★ 答否 → 证书保留" || bad "答否却删了证书"
+case "$OUT3" in *"已保留站点文件"*) ok "逐项给出保留提示" ;; *) bad "缺少保留提示" ;; esac
+[ -f "$R/nginx/sites-enabled/zzz-user-own.conf" ] && ok "别人的配置依然安全" || bad "误删别人的配置"
+rm -rf /tmp/fwpurge_a /tmp/fwpurge_b /tmp/fwpurge_c
 
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"

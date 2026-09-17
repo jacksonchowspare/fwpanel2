@@ -34,18 +34,19 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
     ------------------------------------------------------------
     4) 环境体检      只检查系统环境与依赖，不改动任何东西
     5) 改用户名密码  交互式修改面板登录用户名和/或密码（回车 = 该项不改）
-    6) 卸载          停止服务并删除程序文件（保留 /etc/fwpanel 配置与规则）
-    7) 查看登录信息  显示面板登录地址和用户名（需 root；密码不保存，只能重设）
+    6) 卸载          停止服务并删除程序文件（保留 /etc/fwpanel 配置与规则，重装可复用）
+    7) 彻底卸载      删程序 + 配置/规则 + 站点文件 + 容器数据 + 证书（不可恢复，需输入 DELETE）
     8) 退出脚本      不做任何改动直接退出
     9) 升级脚本      把 fwp 用的那份脚本更新到最新（更新完立刻用新脚本重开菜单）
    10) 升级脚本+面板 先更新脚本，再用最新脚本把面板升到最新（不用敲命令）
+   11) 查看登录信息  显示面板登录地址和用户名（需 root；密码不保存，只能重设）
 
-  请输入 1 - 10 后回车（直接回车 = 1 安装正式版，8 = 退出）:
+  请输入 1 - 11 后回车（直接回车 = 1 安装正式版，8 = 退出，11 = 查看登录信息）:
 ```
 
 - 选 3 时再提示输入版本号（直接输数字即可，例如 `3.1.1`，会自动补 `v`；直接回车 = 返回主菜单）
-- **选 4 / 5 / 6 / 7 执行完会回到主菜单**，可以接着做别的事（选 1/2/3 才进入安装流程）；
-  **选 6 会先要你输入 `yes` 确认**，其他内容视为取消；危险操作前都会说明清楚
+- **选 4 / 5 / 6 / 7 / 11 执行完会回到主菜单**，可以接着做别的事（选 1/2/3 才进入安装流程）；
+  **选 6 会先要你输入 `yes` 确认，选 7（彻底卸载）要输入 `DELETE`**，其他内容一律视为取消；危险操作前都会说明清楚
 - 选 8（或 `q`）退出脚本，不做任何改动；输入无效只会提示重问，不会强行往下走
 - **选 9 升级脚本**：把缓存里那份脚本更新到最新，**更新完立刻用新脚本重开菜单**（不用再敲一次 `fwp`）；
   脚本已是最新时不会有任何变化
@@ -95,7 +96,7 @@ sudo bash /tmp/fwinst.sh --update-script
 - 命令行已带 `--user` / `--password`、加了 `-y`、或没有可用终端（systemd / cron / CI）→ 不询问，直接随机
 
 **忘记密码怎么办：** 面板只把密码存成 pbkdf2 哈希，**明文不落盘、无法反查**（这是刻意的：凭据只在安装结束打印一次）。
-忘了就用菜单 `5) 改用户名密码` 重设一个；忘了**用户名**可以先用菜单 `7) 查看登录信息` 看（用户名是明文存的），
+忘了就用菜单 `5) 改用户名密码` 重设一个；忘了**用户名**可以先用菜单 `11) 查看登录信息` 看（用户名是明文存的），
 或在面板网页顶栏「修改密码」→「账户设置」里改。
 
 **带参数直接执行(脚本 / 无人值守用)：**
@@ -140,7 +141,8 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
 | `--version V` | **指定安装/升级到某版本**（如 `v1.24.42`，自动补 v 前缀；显式指定允许降级，用于回退） |
 | `--check` | 仅体检环境 |
 | `--change-password` | 重置面板密码（交互式） |
-| `--uninstall` | 卸载（停服务 + 删文件） |
+| `--uninstall` | 卸载（停服务 + 删程序，**保留配置与数据**，重装可复用） |
+| `--purge` | **彻底卸载**（连配置/规则/站点文件/容器数据/证书一起删，需输入 `DELETE`；配 `-y` = 无人值守） |
 
 示例：
 
@@ -301,18 +303,44 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
 
 ## 卸载
 
+卸载分两种，故意分开，别搞混：
+
+### 1) 普通卸载：只删程序，保留数据（重装可复用）
+
 ```bash
 curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --uninstall
 ```
 
-卸载会：停止面板服务（含 systemd 之外的**孤儿进程**，逐级 TERM → SIGKILL 并逐项自检）、移除 systemd 服务单元、删除程序文件与 `fwp` 快捷命令。收尾会逐条报告「无残留进程 / 程序文件已删 / 服务单元已移除 / 端口是否仍被占用」。
+会：停止面板服务（含 systemd 之外的**孤儿进程**，逐级 TERM → SIGKILL 并逐项自检）、移除 systemd 服务单元、删除程序文件与 `fwp` 快捷命令。收尾逐条报告「无残留进程 / 程序文件已删 / 服务单元已移除 / 端口是否仍被占用」。
 
-**默认保留配置与规则**，重装会自动复用（面板端口、登录账号、防火墙规则、反代与证书记录都不变）；想装一个全新的面板再执行：
+**配置与规则照旧保留**，重装自动复用（面板端口、登录账号、防火墙规则、反代与证书记录都不变）。
+
+### 2) 彻底卸载：连配置与数据一起清掉（不可恢复）
 
 ```bash
-sudo rm -rf /etc/fwpanel              # 清配置与规则（账号需重新设置）
-sudo nft delete table inet fwpanel    # 清防火墙规则（回到无规则状态，慎用）
+# 交互式：先列「将删除清单 + 各自大小」，要你输入 DELETE 才动手
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --purge
+
+# 无人值守（脚本里用；不会问，直接按下面的清单删干净）
+curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --purge -y
 ```
+
+删除清单（前四项不需额外确认，后三项在交互模式下会逐个再问一次）：
+
+| 内容 | 路径 |
+| --- | --- |
+| 程序文件 / 快捷命令 / 服务单元 | `/usr/local/lib/fwpanel`、`/usr/local/bin/fwp`、`fwpanel.service` |
+| 配置与规则（账号、防火墙规则、反代与站点、应用记录、联邦令牌） | `/etc/fwpanel` |
+| 安装日志（含历史明文密码） | `/var/log/fwpanel-install.log` |
+| 内核防火墙表 | `table inet fwpanel`（删掉后本机不再有面板下发的规则） |
+| 面板写的 nginx 配置 | `sites-enabled / conf.d` 下的 `fwpanel-<12位id>.conf`、`fwsite-<12位id>.conf`、`fwpanel-default.conf`（**别人的配置一律不碰**） |
+| 站点文件 / ACME 目录 | `/var/www/<站点目录>`、`/var/www/fwpanel-acme` |
+| 容器与数据 | 每个应用 `docker compose down -v` + `/DockerData`（apps / dockercompose / dockerrun / dockerimage） |
+| 证书 | 面板记录里涉及域名的 `certbot delete`（或删 `live / archive / renewal` 对应目录）+ 站点日志 |
+
+> ⚠ 以下改动**故意保留**（删掉可能立刻影响你的连接）：`/etc/ssh/sshd_config.d/99-fwpanel-*.conf`（SSH 端口/认证）、`/etc/sysctl.d/99-fwpanel-*.conf`（swappiness/IPv6/BBR）。需要还原请自行删除后重启对应服务。
+>
+> 菜单里也有入口：`fwp` → `7) 彻底卸载`（同样要输入 `DELETE`）。
 
 重装/升级**不会**重置面板端口与密码；忘记密码：重跑安装命令 → 菜单 `5) 改用户名密码`。
 安装与升级结束都会回读 `config.json` 打印**真实**地址，并做本机 HTTP 200 自检——自检没过会直接提示查看哪条日志，不会只喊一句「安装完成」。
