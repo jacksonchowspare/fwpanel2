@@ -55,7 +55,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.8"
+CURRENT_VERSION = "3.3.9"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -9875,11 +9875,22 @@ class PanelHandler(BaseHTTPRequestHandler):
                 src, note = "system", "本机已有"
             store[dom] = {"email": "", "method": "http", "provider": "certbot",
                           "source": src, "note": note}
+        # v3.3.9：证书被谁引用着 —— 前端据此把「移除」显示为灰态并说明原因
+        try:
+            proxy_users = {}
+            for _p in ProxyStore().proxies:
+                _ref = (str(_p.get("cert_ref") or "").strip() or str(_p.get("domain") or "").strip())
+                if _ref:
+                    proxy_users.setdefault(_ref, []).append(str(_p.get("domain") or ""))
+        except Exception:
+            proxy_users = {}
         items = []
         for domain, entry in store.items():
             email, method, provider, source = _cert_meta(entry)
             item = {"domain": domain, "email": email, "method": method, "provider": provider,
                     "source": source,
+                    "used_by_proxies": proxy_users.get(domain, []),
+                    "used_by_site": domain in refs,
                     "cert_exists": cert_files_exist(domain),
                     "cert_expiry": cert_status(domain)}
             if item["cert_exists"]:

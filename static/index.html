@@ -374,7 +374,12 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
    （如证书表第一行有「移除」、第二行没有 → 右对齐后「手动续期」被挤到右边）。
    槽位定宽 + 缺按钮时补占位 <span>，逐列对齐。 */
 .ops-grid { display: inline-grid; grid-auto-flow: column; grid-auto-columns: 84px; gap: 6px; justify-content: end; }
-.ops-grid > .btn { width: 100%; }
+.ops-grid .btn { width: 100%; }
+/* 每颗按钮都包在槽位 span 里：grid 直接子项与 span 包裹项的几何会差几像素（实测 7px），
+   统一结构后跨行才不会错位；槽位上的 title 也保证悬停能出提示 */
+.ops-slot { display: block; min-height: 1px; }
+.ops-slot > .btn { display: flex; width: 100%; }
+.ops-slot > .btn[disabled] { pointer-events: none; }   /* 让悬停落到槽位的 title 上（disabled 元素常不弹提示） */
 .ops-grid > span { display: block; min-height: 1px; }
 /* 选项胶囊：形状/描边/文字色全部走主题变量（像素主题 --r-sm=0、霓虹/奶油主题 --r-sm=8px），
    不写死圆角与颜色 —— 写死会导致切主题时"这个控件不跟着变"。 */
@@ -2669,6 +2674,15 @@ function fmtRenew(r) {
 }
 
 /* ---------- 单独申请 SSL 证书 ---------- */
+// v3.3.9：为什么这张证书不能在这里移除（悬停提示用）
+function removeWhy(c) {
+  const users = (c.used_by_proxies || []).filter(Boolean);
+  const srcName = ({ proxy: "反代自动申请", site: "站点申请", "site-ref": "站点引用", system: "本机已有" })[c.source] || c.source;
+  if (users.length) return `该证书正被反向代理使用：${users.join("、")}——请先在反代里改用其它证书，再回来移除`;
+  if (c.used_by_site) return "该证书被站点配置引用——请先在「网站」里改用其它证书";
+  return `该证书来源是「${srcName}」，不在本页单独申请，因此这里不能直接移除（如需停用请到对应来源处处理）`;
+}
+
 async function loadCerts() {
   try {
     const d = await api("GET", "/api/cert");
@@ -2699,11 +2713,11 @@ async function loadCerts() {
       tr.innerHTML = `<td>${c.domain}${c.method === "dns" ? '<span style="color:#f59e0b;font-size:11px;margin-left:6px">DNS</span>' : '<span style="color:var(--muted);font-size:11px;margin-left:6px">HTTP</span>'}${srcTag}</td><td style="color:var(--muted);font-size:12px">${exp}</td>
         <td style="text-align:right;white-space:nowrap">
           <span class="ops-grid">
-          <button class="btn mini ghost" onclick="renewCertSolo('${c.domain}')">手动续期</button>
-          <button class="btn mini ghost" onclick="showCertPathsSolo('${c.domain}')">显示路径</button>
-          ${c.source === "independent"
-            ? `<button class="btn mini danger" onclick="delCert('${c.domain}')">移除</button>`
-            : "<span></span>"}
+          <span class="ops-slot"><button class="btn mini ghost" onclick="renewCertSolo('${c.domain}')">手动续期</button></span>
+          <span class="ops-slot"><button class="btn mini ghost" onclick="showCertPathsSolo('${c.domain}')">显示路径</button></span>
+          ${(c.source === "independent")
+            ? `<span class="ops-slot"><button class="btn mini danger" onclick="delCert('${c.domain}')">移除</button></span>`
+            : `<span class="ops-slot" title="${attrEsc(removeWhy(c))}"><button class="btn mini danger" disabled>移除</button></span>`}
           </span>
         </td>`;
       tbody.appendChild(tr);

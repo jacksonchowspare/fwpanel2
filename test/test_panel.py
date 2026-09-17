@@ -7838,11 +7838,39 @@ class TestProxyCertTabWiring(unittest.TestCase):
         self.assertIn(".ops-grid { display: inline-grid; grid-auto-flow: column; grid-auto-columns: 84px;",
                       self.html, "缺少定宽槽位样式")
         self.assertIn("grid-auto-columns: 84px", self.html)
-        self.assertIn('.ops-grid > .btn { width: 100%; }', self.html, "槽位内按钮应铺满，保证等宽")
-        self.assertIn(': "<span></span>"}', self.html, "证书表缺按钮时必须补占位，否则该行按钮整体右移")
+        self.assertIn(".ops-grid .btn { width: 100%; }", self.html, "槽位内按钮应铺满，保证等宽")
+        self.assertIn(".ops-slot { display: block; min-height: 1px; }", self.html, "每颗按钮都要有槽位 span")
+        self.assertIn(".ops-slot > .btn { display: flex; width: 100%; }", self.html,
+                      "槽位内按钮必须块级铺满（grid 直接子项与 span 包裹项实测差 7px）")
         self.assertIn(">更换</button><span></span>", self.html, "代理表「更换」分支要补占位")
         self.assertIn(">申请证书</button><span></span>", self.html, "代理表「申请证书」分支要补占位")
         self.assertIn('class="ops-grid"', self.html)
+
+    def test_unremovable_cert_shows_greyed_button_with_reason(self):
+        """被引用/非独立申请的证书：「移除」显示为灰态 + 悬停说明原因（v3.3.9，用户要求）
+
+        旧行为是把按钮整颗隐藏 → 右对齐后该行按钮整体位移（v3.3.8 才用槽位对齐）。
+        现在常显三槽、不可移除时 disabled 并说明原因；真浏览器实测三行按钮逐列对齐（1692/1804/1917）。
+        """
+        self.assertIn("function removeWhy(c)", self.html, "缺少原因文案函数")
+        self.assertIn("该证书正被反向代理使用", self.html, "被反代引用时要点名")
+        self.assertIn("该证书被站点配置引用", self.html, "被站点引用时要有对应说明")
+        self.assertIn("不在本页单独申请", self.html, "其它来源要有兜底说明")
+        self.assertIn('<span class="ops-slot" title="${attrEsc(removeWhy(c))}"><button class="btn mini danger" disabled>移除</button></span>',
+                      self.html, "灰态槽位必须带 title（且经 attrEsc 转义）")
+        # 三颗按钮都要包在槽位里（结构一致才不会错位）
+        self.assertIn('<span class="ops-slot"><button class="btn mini ghost" onclick="renewCertSolo(', self.html)
+        self.assertIn('.ops-slot > .btn[disabled] { pointer-events: none; }', self.html,
+                      "灰态按钮要让悬停透传到槽位，否则浏览器不弹 title")
+
+    def test_backend_reports_cert_users(self):
+        """后端要告诉前端「这张证书被谁引用着」"""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "panel.py"), encoding="utf-8") as f:
+            src = f.read()
+        self.assertIn('"used_by_proxies": proxy_users.get(domain, [])', src)
+        self.assertIn('"used_by_site": domain in refs', src)
+        self.assertIn("for _p in ProxyStore().proxies:", src)
 
     def test_renew_and_paths_handlers_exist(self):
         for fn in ("renewCertSolo", "showCertPathsSolo", "renewCert", "showCertPaths"):
