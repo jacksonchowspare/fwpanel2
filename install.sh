@@ -23,7 +23,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.44"
+readonly SCRIPT_VERSION="3.2.45"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="${FW_WRAPPER:-/usr/local/bin/fwp}"   # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -2093,7 +2093,7 @@ do_purge() {
     echo "    服务单元   : $SYSTEMD_DIR/$SERVICE_NAME"
     echo ""
     echo "  第二步：删除面板的配置与痕迹"
-    echo "    配置与规则 : $ETC_DIR          $(_path_size "$ETC_DIR")（含账号、规则、反代与站点、应用记录、联邦令牌）"
+    echo "    配置与规则 : $ETC_DIR          $(_path_size "$ETC_DIR")（账号、防火墙规则、反代与站点、应用记录、任务与流量记录、联邦令牌）"
     echo "    安装日志   : $LOG_FILE         $(_path_size "$LOG_FILE")"
     printf '    防火墙表   : %s' "$NFT_TABLE_NAME"
     if command -v nft >/dev/null 2>&1 && nft list table $NFT_TABLE_NAME >/dev/null 2>&1; then
@@ -2103,7 +2103,7 @@ do_purge() {
     fi
     if [ "${nconfs:-0}" -gt 0 ]; then
         echo "    nginx 配置 : $nconfs 个"
-        printf '%s' "$confs" | sed 's/^/      /'
+        printf '%s\n' "$confs" | sed 's/^/      /'
     else
         echo "    nginx 配置 : 无"
     fi
@@ -2118,7 +2118,7 @@ do_purge() {
     [ -d "$ACME_WEBROOT" ] && echo "    ACME 目录  : $ACME_WEBROOT   $(_path_size "$ACME_WEBROOT")"
     if [ "${ncerts:-0}" -gt 0 ]; then
         echo "    证书（$ncerts 个）:"
-        printf '%s' "$doms" | sed 's/^/      /'
+        printf '%s\n' "$doms" | sed 's/^/      /'
     else
         echo "    证书       : 无"
     fi

@@ -1411,6 +1411,11 @@ case "$OUT" in *"不再有面板下发的防火墙规则"*) ok "提示「此后�
 [ -d "$R/le/live" ] && ok "证书根目录保留（只删域名子目录）" || bad "连证书根目录一起删了"
 # 系统调用
 grep -q "delete table inet fwpanel" "$R/calls.log" && ok "调用了 nft delete table inet fwpanel" || bad "没删内核表"
+# v3.2.45 回归：清单最后一项与下一段标题曾被旧写法粘在同一行（ak 真机预览发现）
+grep -qE "^      $DOM.*(Docker|最后)?" "$R/out.log" && ! grep -qE "$DOM.*Docker 应用容器与数据" "$R/out.log" \
+    && ok "证书清单独占一行（不与下一段粘连）" || bad "清单出现粘连行: $(grep -E "$DOM" "$R/out.log" | tail -1)"
+grep -qE "^    Docker 应用容器与数据" "$R/out.log" && ok "后续段落从行首正常开始" || bad "后续段落被粘连"
+
 grep -q "docker compose down -v" "$R/calls.log" && ok "调用了 docker compose down -v（删容器与卷）" || bad "没停容器"
 grep -q "cwd=$R/docker/dockercompose/wp-8080" "$R/calls.log" && ok "down 在应用自己的目录里执行" || bad "down 的执行目录不对"
 

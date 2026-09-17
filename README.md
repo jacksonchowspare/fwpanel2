@@ -330,7 +330,7 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
 | 内容 | 路径 |
 | --- | --- |
 | 程序文件 / 快捷命令 / 服务单元 | `/usr/local/lib/fwpanel`、`/usr/local/bin/fwp`、`fwpanel.service` |
-| 配置与规则（账号、防火墙规则、反代与站点、应用记录、联邦令牌） | `/etc/fwpanel` |
+| 配置与规则（账号、防火墙规则、反代与站点、应用记录、任务与流量记录、联邦令牌） | `/etc/fwpanel` |
 | 安装日志（含历史明文密码） | `/var/log/fwpanel-install.log` |
 | 内核防火墙表 | `table inet fwpanel`（删掉后本机不再有面板下发的规则） |
 | 面板写的 nginx 配置 | `sites-enabled / conf.d` 下的 `fwpanel-<12位id>.conf`、`fwsite-<12位id>.conf`、`fwpanel-default.conf`（**别人的配置一律不碰**） |
