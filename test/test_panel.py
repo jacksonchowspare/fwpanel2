@@ -7683,5 +7683,37 @@ class TestUiViewportGuard(unittest.TestCase):
             self.fail("未限高的 <pre>（行内与 CSS 都没有 max-height）：" + tag[:120])
 
 
+class TestProxyCertTabWiring(unittest.TestCase):
+    """反代证书页：证书列表操作列对齐 + 安装依赖后状态自动刷新"""
+
+    def setUp(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "static", "index.html"), encoding="utf-8") as f:
+            self.html = f.read()
+
+    def test_cert_ops_column_right_aligned(self):
+        """「已申请证书」的操作列必须右对齐并按内容收缩（用户反馈：按钮靠左看着乱）"""
+        self.assertIn('<th style="text-align:right;width:1px;white-space:nowrap">操作</th>', self.html)
+        self.assertIn('style="text-align:right;white-space:nowrap"', self.html,
+                      "操作单元格必须右对齐且不换行")
+        # 三颗按钮成组，间距统一
+        self.assertIn('display:inline-flex;gap:6px;justify-content:flex-end', self.html)
+
+    def test_nginx_install_refreshes_cert_section(self):
+        """一键安装 Nginx+certbot 之后，「单独申请 SSL 证书」的状态必须一并刷新
+
+        （旧实现只 loadProxy() + 站点列表 → 该段状态停留在「nginx 未安装」，要手动刷新）
+        """
+        i = self.html.index("async function installNginx()")
+        body = self.html[i:i + 1200]
+        self.assertIn("/api/proxy/install", body)
+        self.assertIn("loadProxy()", body)
+        self.assertIn("loadCerts()", body, "装完必须刷新证书段状态")
+
+    def test_renew_and_paths_handlers_exist(self):
+        for fn in ("renewCertSolo", "showCertPathsSolo", "renewCert", "showCertPaths"):
+            self.assertIn("function " + fn + "(", self.html)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

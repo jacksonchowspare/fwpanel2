@@ -1054,7 +1054,7 @@ window.addEventListener("error", function (ev) {
       <div style="display:flex;align-items:center;font-size:13px;font-weight:600;margin-bottom:8px"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg> 已申请证书</div>
       <div class="table-wrap">
       <table>
-        <thead><tr><th>域名</th><th>有效期</th><th>操作</th></tr></thead>
+        <thead><tr><th>域名</th><th>有效期</th><th style="text-align:right;width:1px;white-space:nowrap">操作</th></tr></thead>
         <tbody id="cert_rows"><tr><td colspan="3" style="color:var(--muted)">暂无独立申请记录</td></tr></tbody>
       </table>
       </div>
@@ -2670,10 +2670,12 @@ async function loadCerts() {
       const SRC_LABEL = { proxy: "反代", site: "站点申请", "site-ref": "站点引用", system: "本机已有" };
       const srcTag = SRC_LABEL[c.source] ? '<span style="color:var(--muted);font-size:11px;margin-left:6px">' + SRC_LABEL[c.source] + "</span>" : "";
       tr.innerHTML = `<td>${c.domain}${c.method === "dns" ? '<span style="color:#f59e0b;font-size:11px;margin-left:6px">DNS</span>' : '<span style="color:var(--muted);font-size:11px;margin-left:6px">HTTP</span>'}${srcTag}</td><td style="color:var(--muted);font-size:12px">${exp}</td>
-        <td>
+        <td style="text-align:right;white-space:nowrap">
+          <span style="display:inline-flex;gap:6px;justify-content:flex-end">
           <button class="btn mini ghost" onclick="renewCertSolo('${c.domain}')">手动续期</button>
           <button class="btn mini ghost" onclick="showCertPathsSolo('${c.domain}')">显示路径</button>
           ${c.source === "independent" ? `<button class="btn mini danger" onclick="delCert('${c.domain}')">移除</button>` : ""}
+          </span>
         </td>`;
       tbody.appendChild(tr);
     }
@@ -4978,7 +4980,7 @@ async function loadProxy() {
         : (p.ssl ? "未签发" : "未申请");
       const certRefTag = p.cert_ref ? `<span style="color:#4da3ff;font-size:11px;margin-right:6px">使用证书 ${p.cert_ref}</span>` : "";
       const certCell = p.cert_exists
-        ? `${certRefTag}${cert} <button class="btn mini ghost" onclick="renewCert('${p.id}')">手动续期</button> <button class="btn mini ghost" onclick="showCertPaths('${p.id}')">显示路径</button>`
+        ? `${certRefTag}${cert} <span style="display:inline-flex;gap:6px;margin-left:8px;vertical-align:middle"><button class="btn mini ghost" onclick="renewCert('${p.id}')">手动续期</button><button class="btn mini ghost" onclick="showCertPaths('${p.id}')">显示路径</button></span>`
         : (p.cert_ref ? `${certRefTag}<span style="color:var(--danger)">⚠ 证书缺失</span> <button class="btn mini ghost" onclick="editProxy('${p.id}')">更换</button>`
            : (p.ssl ? "未签发" : `<button class="btn mini" onclick="issueSsl('${p.id}')">申请证书</button>`));
       const ipBtn = p.block_ip
@@ -5011,6 +5013,9 @@ async function installNginx() {
     if (btn) { btn.disabled = true; btn.textContent = "安装中...（几分钟）"; }
     apiTask("POST", "/api/proxy/install", {}).then(d => {
       toast(d.msg || "安装完成", "okk"); loadProxy();
+      // v3.3.4：安装前该段状态是「nginx 未安装」，装完必须一并刷新，
+      // 否则「单独申请 SSL 证书」的状态要手动刷新才更新（用户实测反馈）
+      loadCerts();
       if (sitesLoaded) loadSites();
       if (btn) { btn.disabled = false; btn.textContent = old; }
     }).catch(e => { toast(e.message, "err"); if (btn) { btn.disabled = false; btn.textContent = old; } });
