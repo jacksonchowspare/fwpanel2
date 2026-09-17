@@ -23,7 +23,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.45"
+readonly SCRIPT_VERSION="3.3.0"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="${FW_WRAPPER:-/usr/local/bin/fwp}"   # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -46,6 +46,7 @@ readonly DOCKER_DATA_BASE="${FW_DOCKER_DATA:-/DockerData}"
 readonly COMPOSE_BASE="$DOCKER_DATA_BASE/dockercompose"
 readonly APP_DATA_BASE="$DOCKER_DATA_BASE/apps"
 readonly NGINX_LOG_DIR="${FW_NGINX_LOG_DIR:-/var/log/nginx}"
+readonly BACKUP_ARCHIVE_DIR="${FW_BACKUP_ARCHIVE:-/var/backups/fwpanel}"   # 面板备份包（彻底卸载也保留）
 readonly MIN_DEBIAN_VERSION=11
 readonly SUPPORTED_DISTROS="debian ubuntu arch fedora centos rocky alma rhel manjaro endeavouros"
 
@@ -2095,6 +2096,7 @@ do_purge() {
     echo "  第二步：删除面板的配置与痕迹"
     echo "    配置与规则 : $ETC_DIR          $(_path_size "$ETC_DIR")（账号、防火墙规则、反代与站点、应用记录、任务与流量记录、联邦令牌）"
     echo "    安装日志   : $LOG_FILE         $(_path_size "$LOG_FILE")"
+    echo "    备份包     : $BACKUP_ARCHIVE_DIR   $(_path_size "$BACKUP_ARCHIVE_DIR")（**保留**，见末尾说明）"
     printf '    防火墙表   : %s' "$NFT_TABLE_NAME"
     if command -v nft >/dev/null 2>&1 && nft list table $NFT_TABLE_NAME >/dev/null 2>&1; then
         echo "（内核里正在生效，会一并删掉）"
@@ -2208,6 +2210,10 @@ do_purge() {
               /etc/sysctl.d/99-fwpanel-swap.conf /etc/sysctl.d/99-fwpanel-ipv6.conf /etc/sysctl.d/99-fwpanel-bbr.conf; do
         [ -e "$_f" ] && echo "    $_f（删掉会立刻回到系统默认，可能影响你的 SSH 端口/内核参数）"
     done
+    if [ -e "$BACKUP_ARCHIVE_DIR" ]; then
+        echo "    $BACKUP_ARCHIVE_DIR（面板备份包：故意保留，它是你换机/重装的回退筹码）"
+        echo "      要一起删：sudo rm -rf $BACKUP_ARCHIVE_DIR"
+    fi
     echo "  重装面板可以直接再来一遍安装命令（会当作全新安装，账号重新设置）"
     echo "------------------------------------------------------------------"
     log_info "彻底卸载完成"

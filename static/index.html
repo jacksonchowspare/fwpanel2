@@ -1472,6 +1472,40 @@ window.addEventListener("error", function (ev) {
       </div>
     </div>
 
+    <div class="panel" data-sec="sys">
+      <h2><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 8v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8"/><path d="M1 3h22v5H1z"/><path d="M10 12h4"/></svg> 备份与恢复</h2>
+      <div style="color:var(--muted);font-size:12px;margin-bottom:10px">
+        把面板的配置与规则打包成一个文件下载保存（换机／重装／后悔药）。恢复时先预览包内内容，再逐项勾选要恢复的部分；恢复前会自动留一份快照，可随时回滚。
+      </div>
+
+      <div style="font-size:13px;margin-bottom:6px">备份内容</div>
+      <div id="bk_mods" style="display:flex;flex-wrap:wrap;gap:12px;font-size:13px;margin-bottom:8px"></div>
+      <div class="form-row" style="margin-bottom:10px">
+        <input id="bk_note" placeholder="备注（可选，例如「换机前」）" style="flex:1;min-width:180px">
+        <button class="btn" id="bk_btn" onclick="bkCreate()">开始备份</button>
+        <button class="btn ghost" onclick="bkLoad()">刷新</button>
+      </div>
+      <div id="bk_hint" style="color:var(--muted);font-size:12px;margin-bottom:12px">加载中...</div>
+
+      <div style="font-size:13px;margin-bottom:6px">备份包</div>
+      <div class="table-wrap">
+        <table id="bk_table">
+          <thead><tr><th>时间</th><th>文件（点名字下载）</th><th>大小</th><th>来源</th><th>包含</th><th style="width:1px;white-space:nowrap">操作</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div style="margin-top:14px;padding-top:12px;border-top:1px solid var(--hover-bg)">
+        <div style="font-size:13px;margin-bottom:6px">恢复：选择本地备份包</div>
+        <div class="form-row" style="flex-wrap:wrap;gap:8px">
+          <input type="file" id="bk_file" accept=".gz,.tar.gz" style="flex:1;min-width:220px">
+          <button class="btn ghost" onclick="bkUpload()">上传并预览</button>
+        </div>
+        <div id="bk_upload" style="color:var(--muted);font-size:12px;margin-top:6px"></div>
+        <div id="bk_prev"></div>
+      </div>
+    </div>
+
     <div class="panel" data-sec="fed">
       <h2 style="margin-bottom:4px"><svg class="h-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="14" rx="2"/><path d="M8 21h8M12 18v3"/></svg> 服务器管理</h2>
       <div style="color:var(--muted);font-size:12px;margin:0 0 14px;line-height:1.7">
@@ -1891,6 +1925,238 @@ async function apiTask(method, path, body, onProgress) {
     // running → 继续等
   }
 }
+
+/* ==================== 备份与恢复（v3.3.0） ==================== */
+let bkInfo = null, bkSel = "", bkBusy = false;
+
+function bkFmt(n) {
+  n = Number(n) || 0;
+  const u = ["B", "KB", "MB", "GB", "TB"];
+  let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return (i === 0 ? n.toFixed(0) : n.toFixed(1)) + " " + u[i];
+}
+
+function bkMods() {
+  return Array.from(document.querySelectorAll("[data-bkmod]")).filter(c => c.checked).map(c => c.dataset.bkmod);
+}
+
+async function bkLoad() {
+  const box = $("bk_mods");
+  if (!box || !token) return;
+  if (fedNode) {
+    box.innerHTML = '<span style="color:var(--muted)">远程模式下不支持备份/恢复，请先返回本机</span>';
+    return;
+  }
+  try {
+    const d = await api("GET", "/api/backup");
+    bkInfo = d;
+    box.innerHTML = (d.modules || []).map(m =>
+      '<label style="display:inline-flex;align-items:center;gap:5px;' + (m.ready ? "" : "opacity:.45") + '" title="' + attrEsc(m.desc || "") + '">' +
+      '<input type="checkbox" data-bkmod="' + attrEsc(m.id) + '"' + (m.on && m.ready ? " checked" : "") + (m.ready ? "" : " disabled") + ' style="width:auto"> ' +
+      esc(m.name) + (m.ready ? "" : "（后续版本）") + '</label>').join("");
+    const c = d.counts || {};
+    $("bk_hint").innerHTML = "落地目录 <b>" + esc(d.dir) + "</b> ｜ 可用空间 " + bkFmt(d.free) +
+      " ｜ 当前内容：规则 " + (c.rules || 0) + " 条 · 反代 " + (c.proxies || 0) + " 个 · 站点 " + (c.sites || 0) +
+      " 个 · 应用 " + (c.apps || 0) + " 个 · 证书 " + (c.certs || 0) + " 张";
+    bkTable(d.items || []);
+  } catch (e) {
+    $("bk_hint").textContent = "读取备份信息失败：" + (e.message || "");
+  }
+}
+
+function bkTable(items) {
+  const tb = $("bk_table") && $("bk_table").querySelector("tbody");
+  if (!tb) return;
+  if (!items.length) {
+    tb.innerHTML = '<tr><td colspan="6" style="color:var(--muted);font-size:13px">还没有备份包</td></tr>';
+    return;
+  }
+  const modsAll = (bkInfo && bkInfo.modules) || [];
+  tb.innerHTML = items.map(it => {
+    const mods = (it.modules || []).map(m => (modsAll.find(x => x.id === m) || {}).name || m).join("、");
+    return '<tr>' +
+      '<td style="white-space:nowrap">' + new Date(it.time * 1000).toLocaleString() +
+        (it.pre_restore ? ' <span class="tag">快照</span>' : '') + '</td>' +
+      '<td><span style="cursor:pointer;color:var(--accent2)" onclick="bkDownload(' + qjs(it.name) + ')">' + esc(it.name) + '</span></td>' +
+      '<td style="white-space:nowrap">' + bkFmt(it.size) + '</td>' +
+      '<td style="white-space:nowrap">' + esc(it.hostname || "-") + (it.panel_version ? " · v" + esc(it.panel_version) : '') + '</td>' +
+      '<td style="font-size:12px;color:var(--muted)">' + esc(mods || "-") + (it.note ? ' ｜ ' + esc(it.note) : '') + '</td>' +
+      '<td style="width:1px;white-space:nowrap">' +
+        btnHtml("恢复", "bkOpen(" + qjs(it.name) + ")", "mini ghost") +
+        btnHtml("下载", "bkDownload(" + qjs(it.name) + ")", "mini ghost") +
+        btnHtml("删除", "bkDelete(" + qjs(it.name) + ")", "mini danger") +
+      '</td></tr>';
+  }).join("");
+}
+
+async function bkCreate() {
+  const mods = bkMods();
+  if (!mods.length) { toast("请至少勾选一项备份内容", "err"); return; }
+  const btn = $("bk_btn");
+  if (btn) btn.disabled = true;
+  try {
+    const r = await apiTask("POST", "/api/backup/create",
+      { modules: mods, note: (($("bk_note") || {}).value || "") },
+      t => { $("bk_hint").textContent = "备份中：" + (t.msg || ""); });
+    toast(r.msg || "备份完成");
+    if ($("bk_note")) $("bk_note").value = "";
+  } catch (e) {
+    toast(e.message || "备份失败", "err");
+  } finally {
+    if (btn) btn.disabled = false;
+    bkLoad();
+  }
+}
+
+async function bkDownload(name) {
+  try {
+    const r = await fetch(API + "/api/backup/download?name=" + encodeURIComponent(name),
+      { headers: token ? { Authorization: "Bearer " + token } : {} });
+    if (!r.ok) {
+      let d = {};
+      try { d = await r.json(); } catch (e) { }
+      toast(d.error || "下载失败", "err");
+      return;
+    }
+    const blob = await r.blob();
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 30000);
+  } catch (e) {
+    toast("下载失败：" + (e.message || ""), "err");
+  }
+}
+
+function bkDelete(name) {
+  confirmPanel("删除备份包 " + name + "？（不可恢复）", async () => {
+    try {
+      const d = await api("POST", "/api/backup/delete", { name: name });
+      toast(d.msg || "已删除");
+      if (bkSel === name) { bkSel = "";$("bk_prev").innerHTML = ""; }
+      bkLoad();
+    } catch (e) {
+      toast(e.message || "删除失败", "err");
+    }
+  }, "🗑 删除备份包");
+}
+
+/* 分块上传：现有上传接口是 base64+32MB 上限，大备份包传不上去，所以走分块 */
+async function bkUpload() {
+  if (bkBusy) { toast("正在上传，请稍候", "err"); return; }
+  const fi = $("bk_file");
+  const f = fi && fi.files && fi.files[0];
+  if (!f) { toast("请先选择备份包", "err"); return; }
+  const box = $("bk_upload");
+  bkBusy = true;
+  try {
+    const ini = await api("POST", "/api/backup/upload/init", { name: f.name, size: f.size });
+    const chunk = ini.chunk || 4 * 1024 * 1024;
+    let idx = 0;
+    for (let off = 0; off < f.size; off += chunk, idx++) {
+      const blob = f.slice(off, Math.min(off + chunk, f.size));
+      const r = await fetch(API + "/api/backup/upload/chunk", {
+        method: "POST",
+        headers: Object.assign({
+          "X-Upload-Uid": ini.uid, "X-Chunk-Index": String(idx),
+          "Content-Type": "application/octet-stream",
+        }, token ? { Authorization: "Bearer " + token } : {}),
+        body: blob,
+      });
+      if (!r.ok) {
+        let d = {};
+        try { d = await r.json(); } catch (e) { }
+        throw new Error(d.error || ("第 " + (idx + 1) + " 块上传失败"));
+      }
+      if (box) box.textContent = "上传中 " + Math.round(Math.min(off + chunk, f.size) / f.size * 100) + "%";
+    }
+    const fin = await api("POST", "/api/backup/upload/finish", { uid: ini.uid, name: f.name });
+    if (box) box.textContent = "已上传：" + fin.name;
+    bkLoad();
+    bkPreviewRender(fin.name, fin.preview, fin.preview_error);
+  } catch (e) {
+    if (box) box.textContent = "";
+    toast(e.message || "上传失败", "err");
+  } finally {
+    bkBusy = false;
+  }
+}
+
+async function bkOpen(name) {
+  try {
+    const d = await api("GET", "/api/backup/preview?name=" + encodeURIComponent(name));
+    bkPreviewRender(name, d.preview, d.error);
+  } catch (e) {
+    toast(e.message || "读取失败", "err");
+  }
+}
+
+function bkPreviewRender(name, prev, err) {
+  bkSel = name || "";
+  const box = $("bk_prev");
+  if (!box) return;
+  if (err || !prev) {
+    box.innerHTML = '<div style="color:var(--danger);font-size:13px;margin-top:8px">无法恢复：' + esc(err || "预览失败") + '</div>';
+    return;
+  }
+  const m = prev.manifest || {};
+  const diff = prev.diff || {};
+  const items = (bkInfo && bkInfo.restore_items) || [];
+  const dPort = diff.panel_port || {};
+  box.innerHTML =
+    '<div style="margin-top:10px;padding:10px;border:1px solid var(--hover-bg);border-radius:var(--r-card)">' +
+      '<div style="font-size:13px;margin-bottom:6px">将要恢复 <b>' + esc(name) + '</b> ｜ 来自 ' + esc(m.hostname || "-") +
+        ' · v' + esc(m.panel_version || "-") + ' · ' + esc(m.created ? new Date(m.created * 1000).toLocaleString() : "-") + '</div>' +
+      '<div style="font-size:12px;color:var(--muted);margin-bottom:8px">包内文件：' + esc((prev.files || []).join("、")) +
+        ' ｜ 端口对照：面板 ' + esc(String(dPort.now)) + ' → ' + esc(String(dPort.pkg)) +
+        '（默认保持当前，勾选「面板端口与绑定」才覆盖）</div>' +
+      '<div style="display:flex;flex-wrap:wrap;gap:12px;font-size:13px;margin-bottom:8px">' +
+        items.map(it => '<label style="display:inline-flex;align-items:center;gap:5px" title="' + attrEsc(it.desc || "") + '">' +
+          '<input type="checkbox" data-bkitem="' + attrEsc(it.id) + '"' + (it.on ? " checked" : "") + ' style="width:auto"> ' +
+          (it.danger ? '<span style="color:var(--danger)">' + esc(it.name) + '</span>' : esc(it.name)) +
+          '</label>').join("") +
+      '</div>' +
+      '<div class="form-row" style="margin-bottom:8px">' +
+        '<label style="font-size:13px;display:inline-flex;align-items:center;gap:5px"><input type="checkbox" id="bk_opt_snap" checked style="width:auto"> 恢复前自动快照（可回滚）</label>' +
+        '<label style="font-size:13px;display:inline-flex;align-items:center;gap:5px"><input type="checkbox" id="bk_opt_restart" checked style="width:auto"> 恢复后重启面板</label>' +
+      '</div>' +
+      btnHtml("确认恢复", "bkRestore()", "") +
+      ' <span style="font-size:12px;color:var(--muted)">恢复会覆盖当前配置与规则；防火墙恢复后会自动补回当前 SSH／面板端口放行</span>' +
+    '</div>';
+}
+
+function bkItems() {
+  const o = {};
+  document.querySelectorAll("[data-bkitem]").forEach(c => { o[c.dataset.bkitem] = !!c.checked; });
+  return o;
+}
+
+function bkRestore() {
+  const items = bkItems();
+  const picked = Object.keys(items).filter(k => items[k]);
+  if (!picked.length) { toast("请至少勾选一个恢复项", "err"); return; }
+  const snap = ($("bk_opt_snap") || {}).checked !== false;
+  const restart = ($("bk_opt_restart") || {}).checked !== false;
+  const txt = "将用 " + bkSel + " 覆盖：" + picked.join("、") +
+    (snap ? "\n（恢复前会自动快照，可回滚）" : "\n（未勾选快照——出问题将无法回滚）");
+  confirmPanel(txt + "\n\n确定继续？", async () => {
+    try {
+      const r = await apiTask("POST", "/api/backup/restore",
+        { name: bkSel, items: items, opts: { snapshot: snap, restart: restart } },
+        t => { $("bk_prev").innerHTML = '<div style="font-size:13px;color:var(--muted);margin-top:8px">恢复中：' + esc(t.msg || "") + '</div>'; });
+      toast(restart ? "恢复完成，面板即将重启（约 5 秒）" : "恢复完成");
+      if (!restart) bkLoad();
+    } catch (e) {
+      toast(e.message || "恢复失败", "err");
+      bkOpen(bkSel);
+    }
+  }, restart ? "♻ 恢复备份（含重启面板）" : "♻ 恢复备份");
+}
+/* ==================== 备份与恢复 结束 ==================== */
 
 /* ---------- 登录 ---------- */
 function fedUiReset() {
@@ -3369,6 +3635,7 @@ async function loadSystem(withTest) {
     renderSysTime(d);
     renderSysHost(d);
     renderSysNet(d);
+    bkLoad();   // v3.3.0：备份与恢复（系统页底部）
   } catch (e) {
     // 取不到就明确写出来，别让卡片永远停在"检测中..."（用户看不出来是没加载还是没数据）
     ["sys_info", "sys_mem", "sys_dns", "sys_time", "sys_host", "sys_bbr", "sys_ipv6", "sys_panel_port"]

@@ -31,6 +31,7 @@ import argparse
 import base64
 import datetime
 import hashlib
+import io
 import hmac
 import ipaddress
 import json
@@ -54,7 +55,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.45"
+CURRENT_VERSION = "3.3.0"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -683,6 +684,8 @@ FED_LONG_TASK_PREFIXES = (
     "/api/proxy/install", "/api/proxy/",
     "/api/cert/", "/api/upgrade",
     "/api/sites/",                       # v3.0.0：网站文件上传/解压可能较慢
+    "/api/backup/",                      # v3.3.0：备份/恢复可能很久（否则主控 25s 假超时）
+    "/api/backup",
 )
 
 
@@ -2553,6 +2556,584 @@ def render_proxy_conf(p):
         lines.append("    }")
         lines.append("}")
     return "\n".join(lines) + "\n"
+
+
+# ============================== 备份与恢复（v3.3.0） ==============================
+# 设计要点：
+#   · 备份 = 打包「面板管着的东西」→ tar.gz（manifest.json + data/…），落地 /var/backups/fwpanel（0600）
+#   · manifest 记：格式版本、面板版本、主机名、模块清单、逐文件 sha256、条目数（反代/站点/应用/规则）
+#   · 恢复 = 校验（格式/大版本/路径穿越）→ 自动快照 → 按勾选项逐项恢复 → 自检 → 可回滚
+#   · ⚠ 防锁死：恢复规则后必须补回「当前 SSH 端口 + 当前面板端口」放行（否则可能把自己关在外面）
+#   · ⚠ 面板 port/bind 默认不覆盖，勾选了才覆盖（防止恢复完自己连不上）
+BACKUP_DIR = os.environ.get("FW_BACKUP_DIR", "/var/backups/fwpanel")
+BACKUP_FORMAT = 1
+BACKUP_UPLOAD_CHUNK = 4 * 1024 * 1024              # 分块上传块大小（前端按此切片）
+BACKUP_MAX_BYTES = 8 * 1024 * 1024 * 1024          # 单包上限 8G（防塞满磁盘）
+BACKUP_EXTRACT_MAX = 16 * 1024 * 1024 * 1024       # 解包总量上限
+BACKUP_RECORD_FILES = ("config.json", "rules.json", "proxies.json", "sites.json",
+                       "certificates.json", "apps.json", "fed_nodes.json", "firewall.nft")
+
+BACKUP_MODULES = [
+    {"id": "config", "name": "面板配置与规则", "desc": "面板设置、防火墙规则、反代/站点/证书/应用记录", "on": True, "ready": True},
+    {"id": "nginx", "name": "nginx 配置", "desc": "面板写的反代/站点/兜底守卫配置", "on": True, "ready": True},
+    {"id": "certs", "name": "证书（含私钥）", "desc": "面板管理域名的证书与续期配置", "on": True, "ready": False},
+    {"id": "sites", "name": "站点文件", "desc": "/var/www 下的站点目录（可能较大）", "on": False, "ready": False},
+    {"id": "apps", "name": "Docker 应用数据", "desc": "应用数据与数据库 dump（可能很大）", "on": False, "ready": False},
+]
+
+RESTORE_ITEMS = [
+    {"id": "settings", "name": "面板设置", "desc": "主题、DNS 凭据等（端口/绑定默认不动）", "on": True},
+    {"id": "port", "name": "面板端口与绑定", "desc": "⚠ 与当前不同会让你当前地址连不上", "on": False, "danger": True},
+    {"id": "rules", "name": "防火墙规则", "desc": "恢复后自动补回当前 SSH/面板端口放行", "on": True},
+    {"id": "proxies", "name": "反代条目", "desc": "反代与证书引用", "on": True},
+    {"id": "sites", "name": "站点记录", "desc": "静态站/端口站记录（不含站点文件）", "on": True},
+    {"id": "cert_records", "name": "证书记录", "desc": "到期时间等记录（不含证书文件）", "on": True},
+    {"id": "apps", "name": "应用记录", "desc": "Docker 应用记录（不含容器与数据）", "on": True},
+    {"id": "fed", "name": "联邦节点令牌", "desc": "⚠ 含明文令牌，恢复后建议 rotate", "on": True},
+    {"id": "nginx", "name": "nginx 重新渲染", "desc": "按恢复后的记录重生成配置并 reload", "on": True},
+]
+
+# 「恢复项」→ 包内记录文件
+RESTORE_ITEM_FILE = {
+    "settings": ("config.json",),
+    "rules": ("rules.json",),
+    "proxies": ("proxies.json",),
+    "sites": ("sites.json",),
+    "cert_records": ("certificates.json",),
+    "apps": ("apps.json",),
+    "fed": ("fed_nodes.json",),
+}
+
+
+def _fmt_size(n):
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "-"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1024 or unit == "TB":
+            return ("%.0f %s" % (n, unit)) if unit == "B" else ("%.1f %s" % (n, unit))
+        n /= 1024.0
+    return "-"
+
+
+def backup_dir_path():
+    """备份落地目录（0700）。测试用 FW_BACKUP_DIR 覆盖。"""
+    d = BACKUP_DIR
+    os.makedirs(d, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def backup_name_safe(name):
+    """只接受纯文件名形式的包名（含路径分隔符/绝对路径一律拒绝 —— fail closed）"""
+    name = str(name or "").strip()
+    if not name or len(name) > 200 or name.startswith("."):
+        return ""
+    if "/" in name or "\\" in name or ".." in name:
+        return ""
+    if not name.endswith(".tar.gz"):
+        return ""
+    return name
+
+
+def backup_path(name):
+    """包名 → 绝对路径（校验在备份目录内）；不合法返回 "" """
+    name = backup_name_safe(name)
+    if not name:
+        return ""
+    p = os.path.join(backup_dir_path(), name)
+    root = os.path.realpath(backup_dir_path())
+    if not os.path.realpath(p).startswith(root + os.sep):
+        return ""
+    return p
+
+
+def _sha256_file(path, chunk=1024 * 1024):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(chunk)
+            if not b:
+                break
+            h.update(b)
+    return h.hexdigest()
+
+
+def _read_json_file(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def _atomic_write_json(path, data):
+    tmp = path + ".tmp"
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def _backup_conf_files():
+    """面板写的 nginx 配置（按形状识别：fwpanel-<12hex>.conf / fwsite-<12hex>.conf / 兜底守卫）"""
+    out = []
+    d = nginx_conf_dir()
+    if not d:
+        return out
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith(".conf"):
+            continue
+        if fn == "fwpanel-default.conf":
+            out.append(os.path.join(d, fn))
+            continue
+        for pre in (PROXY_CONF_PREFIX, SITE_CONF_PREFIX):
+            if fn.startswith(pre) and CONF_ID_RE.match(fn[len(pre):-len(".conf")]):
+                out.append(os.path.join(d, fn))
+                break
+    return out
+
+
+def backup_collect(modules):
+    """按模块收集 (绝对路径, 归档内相对路径)；只认名单内 / 形状能识别的文件"""
+    mods = set(modules or [])
+    files = []
+    if "config" in mods:
+        for fn in BACKUP_RECORD_FILES:
+            p = os.path.join(BASE_DIR, fn)
+            if os.path.isfile(p):
+                files.append((p, "data/etc/" + fn))
+    if "nginx" in mods:
+        for p in _backup_conf_files():
+            files.append((p, "data/nginx/" + os.path.basename(p)))
+    # v3.3.1 起：certs / sites / apps 的实物内容在这里补（当前模块列表里标 ready=False）
+    return files
+
+
+def backup_counts():
+    """清单条目数（让用户一眼知道包里有什么）"""
+    out = {}
+    try:
+        out["rules"] = len(RuleStore().rules)
+    except Exception:
+        out["rules"] = 0
+    try:
+        out["proxies"] = len(ProxyStore().proxies)
+    except Exception:
+        out["proxies"] = 0
+    try:
+        out["sites"] = len(SiteStore().sites)
+    except Exception:
+        out["sites"] = 0
+    try:
+        apps = AppStore().apps if "AppStore" in globals() else []
+        out["apps"] = len(apps)
+    except Exception:
+        out["apps"] = 0
+    try:
+        out["certs"] = len(load_cert_store())
+    except Exception:
+        out["certs"] = 0
+    return out
+
+
+def backup_make_manifest(modules, note="", files=None, name_prefix=""):
+    cfg = Config()
+    files = backup_collect(modules) if files is None else files
+    entries = []
+    for src_p, arc in files:
+        try:
+            entries.append({"arc": arc, "size": os.path.getsize(src_p),
+                            "sha256": _sha256_file(src_p)})
+        except OSError:
+            continue
+    return {
+        "format": BACKUP_FORMAT,
+        "panel_version": CURRENT_VERSION,
+        "created": int(time.time()),
+        "hostname": socket.gethostname(),
+        "note": str(note or "")[:200],
+        "modules": [m for m in (modules or [])],
+        "counts": backup_counts(),
+        "panel_port": cfg.get("port"),
+        "panel_bind": cfg.get("bind", ""),
+        "ssh_port": cfg.get("ssh_port"),
+        "total_size": sum(e["size"] for e in entries),
+        "files": entries,
+    }
+
+
+def backup_create_work(modules, note="", name_prefix=""):
+    """长任务体：打包 → 落地 + 侧车 manifest"""
+    ready = set(m["id"] for m in BACKUP_MODULES if m.get("ready"))
+    mods = [m for m in (modules or []) if m in ready]
+    if not mods:
+        return False, "没有可备份的模块（当前版本支持：面板配置与规则、nginx 配置）"
+    files = backup_collect(mods)
+    if not files:
+        return False, "没有可备份的内容（面板记录文件为空？）"
+    task_progress("统计文件与校验和...")
+    man = backup_make_manifest(mods, note, files)
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    host = re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname())[:32] or "host"
+    name = ("%sfwpanel-%s-v%s-%s.tar.gz" % (name_prefix, host, CURRENT_VERSION, ts))
+    d = backup_dir_path()
+    dst = os.path.join(d, name)
+    tmp = dst + ".part"
+    data = json.dumps(man, ensure_ascii=False, indent=2).encode()
+    try:
+        with tarfile.open(tmp, "w:gz") as tf:
+            ti = tarfile.TarInfo("manifest.json")
+            ti.size = len(data)
+            ti.mode = 0o600
+            ti.mtime = int(time.time())
+            tf.addfile(ti, io.BytesIO(data))
+            for e in man["files"]:
+                src_p = ""
+                for p, arc in files:
+                    if arc == e["arc"]:
+                        src_p = p
+                        break
+                if not src_p:
+                    continue
+                task_progress("打包 %s" % os.path.basename(e["arc"]))
+                tf.add(src_p, arcname=e["arc"], recursive=False)
+        os.replace(tmp, dst)
+        os.chmod(dst, 0o600)
+        _atomic_write_json(dst + ".json", man)
+    except (OSError, tarfile.TarError) as e:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        return False, "打包失败: %s" % e
+    return True, "备份完成：%s（%s / %d 个文件）" % (name, _fmt_size(man["total_size"]), len(man["files"]))
+
+
+def backup_list():
+    """列出备份包（附带侧车 manifest 的信息，不必解包）"""
+    d = backup_dir_path()
+    out = []
+    try:
+        names = sorted(os.listdir(d), reverse=True)
+    except OSError:
+        return out
+    for fn in names:
+        if not fn.endswith(".tar.gz"):
+            continue
+        p = os.path.join(d, fn)
+        if not os.path.isfile(p):
+            continue
+        man = _read_json_file(p + ".json") or {}
+        out.append({
+            "name": fn, "size": os.path.getsize(p), "time": int(os.path.getmtime(p)),
+            "modules": man.get("modules", []), "panel_version": man.get("panel_version", ""),
+            "hostname": man.get("hostname", ""), "counts": man.get("counts", {}),
+            "note": man.get("note", ""), "total_size": man.get("total_size"),
+            "pre_restore": fn.startswith("pre-restore-") or str(man.get("note", "")).startswith("pre-restore"),
+            "has_manifest": bool(man),
+        })
+    return out
+
+
+def backup_read_manifest(path):
+    """只读包里的 manifest.json（不解整包）"""
+    try:
+        with tarfile.open(path, "r:gz") as tf:
+            try:
+                m = tf.getmember("manifest.json")
+            except KeyError:
+                return None, "包里没有 manifest.json（不是面板备份包？）"
+            f = tf.extractfile(m)
+            if f is None:
+                return None, "manifest 读取失败"
+            return json.loads(f.read().decode("utf-8")), ""
+    except (tarfile.TarError, OSError, json.JSONDecodeError) as e:
+        return None, "不是有效的备份包：%s" % e
+
+
+def backup_safe_members(tf, limit=BACKUP_EXTRACT_MAX):
+    """只放行 manifest.json 与 data/ 下的普通文件；拒绝绝对路径 / .. / 符号链接 / 设备 / 超量"""
+    ok, bad, total = [], [], 0
+    for m in tf.getmembers():
+        name = m.name
+        if name.startswith("/") or ".." in name.split("/") or name.startswith("./"):
+            bad.append(name)
+            continue
+        if m.issym() or m.islnk() or m.isdev() or m.isfifo():
+            bad.append(name)
+            continue
+        if name != "manifest.json" and not name.startswith("data/"):
+            bad.append(name)
+            continue
+        if m.isfile():
+            total += int(m.size)
+            if total > limit:
+                bad.append(name + "（超出解包总量上限）")
+                continue
+        ok.append(m)
+    return ok, bad
+
+
+def backup_preview(pkg_path):
+    """恢复前预览：包内清单 + 与当前状态的对比（逐项「当前值 → 包内值」）"""
+    man, err = backup_read_manifest(pkg_path)
+    if err:
+        return None, err
+    if int(man.get("format", 0) or 0) != BACKUP_FORMAT:
+        return None, "备份包格式版本不支持（format=%s）" % man.get("format")
+    pkg_major = str(man.get("panel_version", "")).split(".")[0]
+    if pkg_major and pkg_major != CURRENT_VERSION.split(".")[0]:
+        return None, "包来自 v%s（面板 %s），跨大版本不能恢复：请先升级面板" % (
+            man.get("panel_version"), CURRENT_VERSION)
+    cfg = Config()
+    diff = {
+        "panel_port": {"now": cfg.get("port"), "pkg": man.get("panel_port")},
+        "panel_bind": {"now": cfg.get("bind", ""), "pkg": man.get("panel_bind", "")},
+        "ssh_port": {"now": cfg.get("ssh_port"), "pkg": man.get("ssh_port")},
+    }
+    present = [e["arc"].split("/")[-1] for e in man.get("files", [])]
+    return {"manifest": man, "diff": diff, "files": present,
+            "counts_now": backup_counts()}, ""
+
+
+def backup_ensure_ports(store, cfg):
+    """防锁死：保证当前 SSH 端口与面板端口有放行规则（没有就补一条 protected 放行）"""
+    added = []
+    try:
+        ssh_port = int(cfg.get("ssh_port") or SSH_PORT_DEFAULT)
+    except (TypeError, ValueError):
+        ssh_port = SSH_PORT_DEFAULT
+    ports = [("SSH", ssh_port)]
+    try:
+        if cfg.get("port"):
+            ports.append(("面板", int(cfg.get("port"))))
+    except (TypeError, ValueError):
+        pass
+    for label, port in ports:
+        if not port or port <= 0:
+            continue
+        hit = False
+        for r in store.rules:
+            try:
+                if r.get("type") == "port_allow" and int(r.get("port")) == port:
+                    hit = True
+                    break
+            except (TypeError, ValueError):
+                continue
+        if not hit:
+            store.rules.append({
+                "id": secrets.token_hex(6), "type": "port_allow", "proto": "tcp",
+                "port": port, "comment": "%s端口(恢复时自动补放行)" % label,
+                "protected": True, "enabled": True,
+            })
+            added.append(port)
+    if added:
+        store.save()
+    return added
+
+
+def backup_restore_work(pkg_name, items, opts=None):
+    """长任务体：恢复。items = {恢复项id: True/False}；opts = {snapshot, restart}"""
+    opts = dict(opts or {})
+    pkg = backup_path(pkg_name)
+    if not pkg or not os.path.isfile(pkg):
+        return False, "备份包不存在"
+    man, err = backup_read_manifest(pkg)
+    if err:
+        return False, err
+    if int(man.get("format", 0) or 0) != BACKUP_FORMAT:
+        return False, "备份包格式版本不支持"
+    pkg_major = str(man.get("panel_version", "")).split(".")[0]
+    if pkg_major and pkg_major != CURRENT_VERSION.split(".")[0]:
+        return False, "包来自 v%s，跨大版本不能恢复（请先升级面板）" % man.get("panel_version")
+    items = {k: bool(v) for k, v in (items or {}).items()}
+    if not any(items.values()):
+        return False, "没有勾选任何恢复项"
+
+    steps = []
+    snapshot_name = ""
+    if opts.get("snapshot", True):
+        task_progress("恢复前自动快照...")
+        ok, msg = backup_create_work(["config", "nginx"], note="pre-restore 自动快照",
+                                     name_prefix="pre-restore-")
+        if ok:
+            snapshot_name = msg.split("：", 1)[-1].split("（", 1)[0].strip()
+            steps.append("已生成恢复前快照：%s" % snapshot_name)
+        else:
+            steps.append("⚠ 恢复前快照失败：%s" % msg)
+
+    import tempfile
+    with tempfile.TemporaryDirectory(prefix="fwrestore-") as tmp:
+        task_progress("校验并解包...")
+        try:
+            with tarfile.open(pkg, "r:gz") as tf:
+                members, bad = backup_safe_members(tf)
+                if bad:
+                    return False, "包内含有不安全条目，已拒绝恢复：%s" % ", ".join(bad[:5])
+                tf.extractall(tmp, members=members)
+        except (tarfile.TarError, OSError) as e:
+            return False, "解包失败：%s" % e
+        etc = os.path.join(tmp, "data", "etc")
+        cur = Config()
+        restored = []
+
+        task_progress("恢复面板设置与记录...")
+        # 面板设置（config.json）：端口/绑定除非显式勾选，否则保持当前
+        pkg_cfg = _read_json_file(os.path.join(etc, "config.json")) if "settings" in RESTORE_ITEM_FILE else None
+        if pkg_cfg and (items.get("settings") or items.get("port")):
+            merged = dict(cur.data)
+            for k, v in pkg_cfg.items():
+                if k in ("port", "bind") and not items.get("port"):
+                    continue
+                merged[k] = v
+            if not items.get("port"):
+                merged["port"] = cur.get("port", pkg_cfg.get("port"))
+                merged["bind"] = cur.get("bind", pkg_cfg.get("bind", ""))
+            _atomic_write_json(CONFIG_FILE, merged)
+            restored.append("面板设置" + ("（含端口/绑定）" if items.get("port") else "（端口/绑定保持当前）"))
+        # 其余记录文件
+        for item, fnames in RESTORE_ITEM_FILE.items():
+            if item in ("settings",) or not items.get(item):
+                continue
+            for fn in fnames:
+                p = os.path.join(etc, fn)
+                data = _read_json_file(p)
+                if data is None:
+                    continue
+                if fn == "rules.json":
+                    if not isinstance(data, list):
+                        continue
+                    store = RuleStore()
+                    store.rules = data
+                    store.save()
+                    cfg_now = Config()
+                    added = backup_ensure_ports(store, cfg_now)
+                    nftm = NFTManager(store, cfg_now)
+                    ok_apply, msg_apply = nftm.apply()
+                    restored.append("防火墙规则 %d 条%s（生效：%s）" % (
+                        len(data), ("，补回端口放行 %s" % added) if added else "", msg_apply))
+                else:
+                    _atomic_write_json(os.path.join(BASE_DIR, fn), data)
+                    restored.append(fn)
+
+        if items.get("nginx"):
+            task_progress("按恢复后的记录重新渲染 nginx...")
+            try:
+                if DRY_RUN:
+                    restored.append("nginx 配置重渲染：DRY_RUN 跳过")
+                    raise _DryRunSkip()
+                ok_ng, msg_ng = apply_all_nginx(ProxyStore(), SiteStore(), Config())
+                restored.append("nginx 配置重渲染：%s" % ("成功" if ok_ng else ("失败 " + str(msg_ng))))
+            except _DryRunSkip:
+                pass
+            except Exception as e:
+                restored.append("nginx 配置重渲染异常：%s" % e)
+
+        # 收尾自检
+        task_progress("收尾自检...")
+        checks = []
+        try:
+            store_now = RuleStore()
+            r = subprocess.run(["nft", "list", "table", "inet", "fwpanel"],
+                               capture_output=True, text=True, timeout=10)
+            checks.append("防火墙表：%s" % ("在" if r.returncode == 0 else "不在"))
+        except Exception:
+            checks.append("防火墙表：无法检查（无 nft？）")
+        if nginx_available():
+            try:
+                r = subprocess.run(["nginx", "-t"], capture_output=True, text=True, timeout=15)
+                checks.append("nginx 配置：%s" % ("校验通过" if r.returncode == 0 else "校验失败"))
+            except Exception:
+                checks.append("nginx 配置：无法校验")
+        cfg_final = Config()
+        checks.append("面板端口：%s" % cfg_final.get("port"))
+
+    if opts.get("restart", True) and not DRY_RUN:
+        task_progress("面板将在 2 秒后重启以加载恢复的数据...")
+        threading.Timer(2.0, restart_service).start()
+        tail = "面板约 5 秒后重启完成（页面会自动重连）"
+    else:
+        tail = "面板未重启：部分改动需重启服务后完全生效"
+    msg = ("恢复完成：%s ｜ 快照：%s ｜ 自检：%s ｜ %s"
+           % ("、".join(restored) or "无", snapshot_name or "未生成",
+              "；".join(checks), tail))
+    return True, msg
+
+
+class _DryRunSkip(Exception):
+    """内部信号：DRY_RUN 下跳过会碰系统的步骤"""
+
+
+def backup_rollback_work(pkg_name):
+    """从快照回滚（等价于用该包做一次全量记录恢复，端口仍走护栏）"""
+    items = {k: True for k in RESTORE_ITEM_FILE}
+    items["nginx"] = True
+    items["port"] = False          # 端口永远走护栏：不覆盖
+    return backup_restore_work(pkg_name, items, {"snapshot": False, "restart": True})
+
+
+def backup_upload_dir():
+    d = os.path.join(backup_dir_path(), ".uploads")
+    os.makedirs(d, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    return d
+
+
+def backup_upload_path(uid):
+    uid = re.sub(r"[^0-9a-f]", "", str(uid or ""))[:32]
+    if len(uid) < 8:
+        return ""
+    return os.path.join(backup_upload_dir(), uid + ".part")
+
+
+def backup_upload_finish(uid, name=""):
+    """分块上传收尾：校验 → 落成正式包 → 返回 manifest"""
+    part = backup_upload_path(uid)
+    if not part or not os.path.isfile(part):
+        return False, "上传任务不存在或已过期", None
+    size = os.path.getsize(part)
+    if size <= 0:
+        return False, "上传的文件是空的", None
+    if size > BACKUP_MAX_BYTES:
+        try:
+            os.unlink(part)
+        except OSError:
+            pass
+        return False, "文件超过上限（%s）" % _fmt_size(BACKUP_MAX_BYTES), None
+    man, err = backup_read_manifest(part)
+    if err:
+        return False, err, None
+    if int(man.get("format", 0) or 0) != BACKUP_FORMAT:
+        return False, "不是本面板的备份包（格式版本 %s）" % man.get("format"), None
+    host = re.sub(r"[^A-Za-z0-9._-]", "_", str(man.get("hostname") or "host"))[:32] or "host"
+    base = backup_name_safe(name) or ("ffwpanel-%s-imported-%s.tar.gz"
+                                      % (host, time.strftime("%Y%m%d-%H%M%S")))
+    base = base.replace("ffwpanel-", "fwpanel-")
+    dst = os.path.join(backup_dir_path(), base)
+    if os.path.exists(dst):
+        base = base[:-len(".tar.gz")] + "-%s.tar.gz" % secrets.token_hex(3)
+        dst = os.path.join(backup_dir_path(), base)
+    try:
+        os.replace(part, dst)
+        os.chmod(dst, 0o600)
+        _atomic_write_json(dst + ".json", man)
+    except OSError as e:
+        return False, "落盘失败：%s" % e, None
+    return True, base, man
+
 
 
 def repair_stale_jobs():
@@ -6810,6 +7391,12 @@ class PanelHandler(BaseHTTPRequestHandler):
         elif path.startswith("/api/fed/"):
             # 终端 WebSocket 升级由 _api_fed_proxy 内部识别（HTTP 头含 Upgrade）
             self._api_fed_proxy()
+        elif path == "/api/backup":
+            self._api_backup_list()
+        elif path == "/api/backup/download":
+            self._api_backup_download(parsed.query)
+        elif path == "/api/backup/preview":
+            self._api_backup_preview(parsed.query)
         elif path.startswith("/api/tasks/"):
             self._api_task_status(path[len("/api/tasks/"):])
         elif path == "/api/term/ws":
@@ -7370,6 +7957,20 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_add_rule()
         elif path.startswith("/api/rules/"):
             self._api_edit_rule(path.rsplit("/", 1)[1])
+        elif path == "/api/backup/create":
+            self._api_backup_create()
+        elif path == "/api/backup/delete":
+            self._api_backup_delete()
+        elif path == "/api/backup/upload/init":
+            self._api_backup_upload_init()
+        elif path == "/api/backup/upload/chunk":
+            self._api_backup_upload_chunk()
+        elif path == "/api/backup/upload/finish":
+            self._api_backup_upload_finish()
+        elif path == "/api/backup/restore":
+            self._api_backup_restore()
+        elif path == "/api/backup/rollback":
+            self._api_backup_rollback()
         elif path == "/api/service":
             self._api_service()
         elif path == "/api/open-port":
@@ -9764,6 +10365,244 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._send(500, {"error": f"规则应用失败: {nft_msg}"})
             return
         self._send(200, {"ok": True, "msg": nft_msg})
+
+    # ---------------- 备份与恢复（v3.3.0） ----------------
+
+    def _api_backup_list(self):
+        """GET /api/backup → 备份包列表 + 模块定义 + 磁盘余量"""
+        token = self._require_auth()
+        if token is None:
+            return
+        try:
+            usage = shutil.disk_usage(backup_dir_path())
+            free = usage.free
+            total = usage.total
+        except OSError:
+            free = total = 0
+        self._send(200, {
+            "items": backup_list(),
+            "modules": BACKUP_MODULES,
+            "restore_items": RESTORE_ITEMS,
+            "dir": backup_dir_path(),
+            "free": free, "total": total,
+            "chunk": BACKUP_UPLOAD_CHUNK,
+            "max_bytes": BACKUP_MAX_BYTES,
+            "counts": backup_counts(),
+            "panel_version": CURRENT_VERSION,
+        })
+
+    def _api_backup_create(self):
+        """POST /api/backup/create {modules, note} → 后台打包"""
+        token = self._require_auth()
+        if token is None:
+            return
+        d = self._read_json()
+        mods = d.get("modules")
+        if not isinstance(mods, list) or not mods:
+            mods = [m["id"] for m in BACKUP_MODULES if m.get("on") and m.get("ready")]
+        note = str(d.get("note") or "")[:200]
+        if DRY_RUN:
+            self._send(200, {"ok": True, "msg": "DRY_RUN: 跳过打包"})
+            return
+        tid = start_task("backup/create", backup_create_work, mods, note)
+        self._send(200, {"task": tid})
+
+    def _api_backup_download(self, query):
+        """GET /api/backup/download?name=xxx → 流式下载（分块写，避免整包进内存）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        from urllib.parse import parse_qs, unquote
+        name = unquote((parse_qs(query or "").get("name") or [""])[0])
+        p = backup_path(name)
+        if not p or not os.path.isfile(p):
+            self._send(404, {"error": "备份包不存在"})
+            return
+        size = os.path.getsize(p)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/gzip")
+        self.send_header("Content-Disposition", 'attachment; filename="%s"' % name.replace('"', ""))
+        self.send_header("Content-Length", str(size))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        try:
+            with open(p, "rb") as f:
+                while True:
+                    b = f.read(1024 * 1024)
+                    if not b:
+                        break
+                    self.wfile.write(b)
+        except (BrokenPipeError, ConnectionResetError):
+            return
+
+    def _api_backup_preview(self, query):
+        """GET /api/backup/preview?name=xxx → 包内清单 + 与当前状态对比"""
+        token = self._require_auth()
+        if token is None:
+            return
+        from urllib.parse import parse_qs, unquote
+        name = unquote((parse_qs(query or "").get("name") or [""])[0])
+        p = backup_path(name)
+        if not p or not os.path.isfile(p):
+            self._send(404, {"error": "备份包不存在"})
+            return
+        prev, err = backup_preview(p)
+        if err:
+            self._send(400, {"error": err})
+            return
+        self._send(200, {"name": name, "preview": prev})
+
+    def _api_backup_delete(self):
+        """POST /api/backup/delete {name} → 删除包与侧车"""
+        token = self._require_auth()
+        if token is None:
+            return
+        d = self._read_json()
+        p = backup_path(d.get("name"))
+        if not p or not os.path.isfile(p):
+            self._send(404, {"error": "备份包不存在"})
+            return
+        try:
+            os.unlink(p)
+        except OSError as e:
+            self._send(500, {"error": "删除失败: %s" % e})
+            return
+        try:
+            os.unlink(p + ".json")
+        except OSError:
+            pass
+        self._send(200, {"ok": True, "msg": "已删除 %s" % os.path.basename(p)})
+
+    def _api_backup_upload_init(self):
+        """POST /api/backup/upload/init {name, size} → 申请分块上传"""
+        token = self._require_auth()
+        if token is None:
+            return
+        d = self._read_json()
+        try:
+            size = int(d.get("size") or 0)
+        except (TypeError, ValueError):
+            size = 0
+        if size and size > BACKUP_MAX_BYTES:
+            self._send(413, {"error": "文件超过上限（%s）" % _fmt_size(BACKUP_MAX_BYTES)})
+            return
+        # 清理超过 24 小时没完成的残留分片
+        try:
+            now = time.time()
+            for fn in os.listdir(backup_upload_dir()):
+                fp = os.path.join(backup_upload_dir(), fn)
+                if fn.endswith(".part") and os.path.isfile(fp) and now - os.path.getmtime(fp) > 86400:
+                    os.unlink(fp)
+        except OSError:
+            pass
+        try:
+            free = shutil.disk_usage(backup_dir_path()).free
+        except OSError:
+            free = 0
+        if size and free and size * 2 > free:
+            self._send(507, {"error": "磁盘空间不足：包 %s，可用 %s（解包还要占一份）"
+                                      % (_fmt_size(size), _fmt_size(free))})
+            return
+        uid = secrets.token_hex(16)
+        part = backup_upload_path(uid)
+        try:
+            with open(part, "wb"):
+                pass
+        except OSError as e:
+            self._send(500, {"error": "无法创建上传文件: %s" % e})
+            return
+        self._send(200, {"uid": uid, "chunk": BACKUP_UPLOAD_CHUNK})
+
+    def _api_backup_upload_chunk(self):
+        """POST /api/backup/upload/chunk（X-Upload-Uid / X-Chunk-Index + 原始字节）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        part = backup_upload_path(self.headers.get("X-Upload-Uid") or "")
+        if not part:
+            self._send(400, {"error": "上传标识不合法（请重新发起上传）"})
+            return
+        try:
+            idx = int(self.headers.get("X-Chunk-Index") or -1)
+            n = int(self.headers.get("Content-Length") or 0)
+        except (TypeError, ValueError):
+            self._send(400, {"error": "分块参数不合法"})
+            return
+        if idx < 0 or n <= 0 or n > BACKUP_UPLOAD_CHUNK + 1024:
+            self._send(413, {"error": "分块大小超限"})
+            return
+        if (idx + 1) * BACKUP_UPLOAD_CHUNK > BACKUP_MAX_BYTES:
+            self._send(413, {"error": "超过单包上限"})
+            return
+        buf = self.rfile.read(n)
+        try:
+            exists = os.path.exists(part)
+            with open(part, "r+b" if exists else "wb") as f:
+                f.seek(idx * BACKUP_UPLOAD_CHUNK)
+                f.write(buf)
+        except OSError as e:
+            self._send(500, {"error": "写入失败: %s" % e})
+            return
+        self._send(200, {"ok": True, "got": len(buf),
+                         "size": max(os.path.getsize(part), idx * BACKUP_UPLOAD_CHUNK + len(buf))})
+
+    def _api_backup_upload_finish(self):
+        """POST /api/backup/upload/finish {uid, name} → 校验 + 落成正式包 + 预览"""
+        token = self._require_auth()
+        if token is None:
+            return
+        d = self._read_json()
+        ok, info, man = backup_upload_finish(d.get("uid"), d.get("name") or "")
+        if not ok:
+            self._send(400, {"error": info})
+            return
+        prev, err = backup_preview(backup_path(info))
+        self._send(200, {"ok": True, "name": info, "manifest": man,
+                         "preview": prev if not err else None, "preview_error": err})
+
+    def _api_backup_restore(self):
+        """POST /api/backup/restore {name, items, opts} → 后台恢复"""
+        token = self._require_auth()
+        if token is None:
+            return
+        d = self._read_json()
+        p = backup_path(d.get("name"))
+        if not p or not os.path.isfile(p):
+            self._send(404, {"error": "备份包不存在"})
+            return
+        man, err = backup_read_manifest(p)
+        if err:
+            self._send(400, {"error": err})
+            return
+        items = d.get("items")
+        if not isinstance(items, dict) or not any(bool(v) for v in items.values()):
+            self._send(400, {"error": "请至少勾选一个恢复项"})
+            return
+        opts = d.get("opts") if isinstance(d.get("opts"), dict) else {}
+        opts = {"snapshot": bool(opts.get("snapshot", True)), "restart": bool(opts.get("restart", True))}
+        if DRY_RUN:
+            self._send(200, {"ok": True, "msg": "DRY_RUN: 跳过恢复（勾选项 %s）"
+                                              % ",".join(k for k, v in items.items() if v)})
+            return
+        tid = start_task("backup/restore", backup_restore_work, os.path.basename(p), items, opts)
+        self._send(200, {"task": tid})
+
+    def _api_backup_rollback(self):
+        """POST /api/backup/rollback {name} → 用快照回滚（端口仍走护栏）"""
+        token = self._require_auth()
+        if token is None:
+            return
+        d = self._read_json()
+        p = backup_path(d.get("name"))
+        if not p or not os.path.isfile(p):
+            self._send(404, {"error": "快照不存在"})
+            return
+        if DRY_RUN:
+            self._send(200, {"ok": True, "msg": "DRY_RUN: 跳过回滚"})
+            return
+        tid = start_task("backup/rollback", backup_rollback_work, os.path.basename(p))
+        self._send(200, {"task": tid})
+
 
     def _api_service(self):
         """服务模板开关：{name: 'http', enabled: true}

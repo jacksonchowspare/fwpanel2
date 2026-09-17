@@ -6,7 +6,9 @@ import os
 import shutil
 import stat
 import sys
+import tarfile
 import tempfile
+import time
 import threading
 import types
 import re
@@ -7048,6 +7050,583 @@ class TestSystemTimezoneDisplay(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# ============================== 备份 / 恢复（v3.3.0） ==============================
+
+
+class _FileCfg:
+    """从 CONFIG_FILE 读写的 Config 替身（恢复逻辑要读「当前」配置做端口护栏）"""
+
+    def __init__(self):
+        try:
+            with open(panel.CONFIG_FILE, encoding="utf-8") as f:
+                self.data = json.load(f)
+        except Exception:
+            self.data = {}
+
+    def get(self, k, d=None):
+        return self.data.get(k, d)
+
+    def set(self, k, v):
+        self.data[k] = v
+
+    def save(self):
+        panel._atomic_write_json(panel.CONFIG_FILE, self.data)
+
+
+class TestBackup(unittest.TestCase):
+    """备份/恢复：打包、清单、路径安全、恢复护栏（端口）、快照回滚、分块上传"""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="fwbackup-")
+        self.etc = os.path.join(self.root, "etc")
+        self.bdir = os.path.join(self.root, "backups")
+        self.ngx = os.path.join(self.root, "nginx")
+        for d in (self.etc, self.bdir, self.ngx):
+            os.makedirs(d)
+        self._saved = {}
+        for k, v in (("BASE_DIR", self.etc), ("BACKUP_DIR", self.bdir),
+                     ("CONFIG_FILE", os.path.join(self.etc, "config.json")),
+                     ("RULES_FILE", os.path.join(self.etc, "rules.json")),
+                     ("PROXIES_FILE", os.path.join(self.etc, "proxies.json")),
+                     ("SITES_FILE", os.path.join(self.etc, "sites.json")),
+                     ("CERT_FILE", os.path.join(self.etc, "certificates.json")),
+                     ("APPS_FILE", os.path.join(self.etc, "apps.json")),
+                     ("FED_NODES_FILE", os.path.join(self.etc, "fed_nodes.json"))):
+            self._saved[k] = getattr(panel, k)
+            setattr(panel, k, v)
+        self._saved["Config"] = panel.Config
+        panel.Config = _FileCfg
+        self._write_cfg({"username": "u1", "port": 17999, "bind": "0.0.0.0",
+                         "mode": "permissive", "ssh_port": 2222, "theme": "dark"})
+        self._write_json("rules.json", [{"id": "r1", "type": "port_allow", "proto": "tcp",
+                                        "port": 80, "comment": "web"}])
+        self._write_json("proxies.json", [{"id": "p" + "a" * 11, "domain": "a.example.com",
+                                          "target_port": 8080, "enabled": True}])
+        self._write_json("sites.json", [])
+        self._write_json("certificates.json", {})
+        self._write_json("apps.json", {"apps": []})
+        self._write_json("fed_nodes.json", {})
+        with open(os.path.join(self.etc, "firewall.nft"), "w") as f:
+            f.write("table inet fwpanel {}\n")
+
+    def tearDown(self):
+        for k, v in self._saved.items():
+            setattr(panel, k, v)
+        shutil.rmtree(self.root, ignore_errors=True)
+
+    # ---------- 小工具 ----------
+    def _write_json(self, name, data):
+        with open(os.path.join(self.etc, name), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    def _write_cfg(self, data):
+        with open(os.path.join(self.etc, "config.json"), "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+
+    def _read_cfg(self):
+        with open(os.path.join(self.etc, "config.json"), encoding="utf-8") as f:
+            return json.load(f)
+
+    def _read_json(self, name):
+        with open(os.path.join(self.etc, name), encoding="utf-8") as f:
+            return json.load(f)
+
+    def _make_pkg(self, name, manifest, files=None):
+        import io as _io
+        p = os.path.join(self.bdir, name)
+        with tarfile.open(p, "w:gz") as tf:
+            data = json.dumps(manifest, ensure_ascii=False).encode()
+            ti = tarfile.TarInfo("manifest.json")
+            ti.size = len(data)
+            tf.addfile(ti, _io.BytesIO(data))
+            for arc, content in (files or {}).items():
+                c = content if isinstance(content, bytes) else json.dumps(content, ensure_ascii=False).encode()
+                ti = tarfile.TarInfo(arc)
+                ti.size = len(c)
+                ti.mode = 0o600
+                tf.addfile(ti, _io.BytesIO(c))
+        return p
+
+    def _manifest(self, version=None, fmt=None, modules=("config",)):
+        return {"format": panel.BACKUP_FORMAT if fmt is None else fmt,
+                "panel_version": version or panel.CURRENT_VERSION,
+                "created": 1700000000, "hostname": "src-host",
+                "modules": list(modules), "counts": {"proxies": 1}, "total_size": 10,
+                "panel_port": 19999, "panel_bind": "0.0.0.0", "ssh_port": 2200,
+                "files": [{"arc": "data/etc/config.json", "size": 10, "sha256": "x"}]}
+
+    # ---------- 收集 / 打包 ----------
+    def test_collect_config_files(self):
+        got = panel.backup_collect(["config"])
+        arcs = sorted(a for _, a in got)
+        self.assertIn("data/etc/config.json", arcs)
+        self.assertIn("data/etc/rules.json", arcs)
+        self.assertIn("data/etc/fed_nodes.json", arcs)
+        self.assertIn("data/etc/firewall.nft", arcs)
+        self.assertEqual(len(arcs), len(panel.BACKUP_RECORD_FILES))
+
+    def test_collect_nginx_shape_only_panel_owned(self):
+        for fn in ("fwpanel-%s.conf" % ("a" * 12), "fwsite-%s.conf" % ("b" * 12),
+                   "fwpanel-default.conf", "other.conf", "fwpanel-NOTHEXID.conf"):
+            with open(os.path.join(self.ngx, fn), "w") as f:
+                f.write("x")
+        old = panel.nginx_conf_dir
+        panel.nginx_conf_dir = lambda: self.ngx
+        try:
+            got = sorted(os.path.basename(a) for _, a in panel.backup_collect(["nginx"]))
+        finally:
+            panel.nginx_conf_dir = old
+        self.assertEqual(got, sorted(["fwpanel-%s.conf" % ("a" * 12),
+                                     "fwsite-%s.conf" % ("b" * 12),
+                                     "fwpanel-default.conf"]))
+
+    def test_create_writes_pkg_with_manifest_and_sha(self):
+        ok, msg = panel.backup_create_work(["config", "nginx"], note="单测")
+        self.assertTrue(ok, msg)
+        items = panel.backup_list()
+        self.assertEqual(len(items), 1)
+        name = items[0]["name"]
+        self.assertTrue(name.endswith(".tar.gz"))
+        self.assertEqual(items[0]["panel_version"], panel.CURRENT_VERSION)
+        self.assertIn("config", items[0]["modules"])
+        p = os.path.join(self.bdir, name)
+        self.assertEqual(stat.S_IMODE(os.stat(p).st_mode), 0o600)
+        self.assertTrue(os.path.exists(p + ".json"), "应写侧车 manifest")
+        man, err = panel.backup_read_manifest(p)
+        self.assertEqual(err, "")
+        self.assertEqual(man["note"], "单测")
+        by_arc = {e["arc"]: e for e in man["files"]}
+        self.assertEqual(by_arc["data/etc/config.json"]["sha256"],
+                         panel._sha256_file(os.path.join(self.etc, "config.json")))
+
+    def test_create_rejects_unknown_modules(self):
+        ok, msg = panel.backup_create_work(["certs", "sites"], note="")
+        self.assertFalse(ok)
+        self.assertIn("没有可备份的模块", msg)
+
+    def test_name_and_path_safety(self):
+        self.assertEqual(panel.backup_path("../../etc/passwd"), "")
+        self.assertEqual(panel.backup_path("/etc/shadow.tar.gz"), "")
+        self.assertEqual(panel.backup_path(".hidden.tar.gz"), "")
+        self.assertEqual(panel.backup_path("x.txt"), "")
+        self.assertTrue(panel.backup_path("ok-1.tar.gz").endswith("ok-1.tar.gz"))
+
+    # ---------- 预览 / 版本闸门 ----------
+    def test_preview_rejects_cross_major(self):
+        p = self._make_pkg("old.tar.gz", self._manifest(version="9.9.9"))
+        prev, err = panel.backup_preview(p)
+        self.assertIsNone(prev)
+        self.assertIn("跨大版本", err)
+
+    def test_preview_rejects_bad_format(self):
+        p = self._make_pkg("bad.tar.gz", self._manifest(fmt=99))
+        prev, err = panel.backup_preview(p)
+        self.assertIn("格式版本", err)
+
+    def test_preview_ok_reports_diff(self):
+        p = self._make_pkg("good.tar.gz", self._manifest(),
+                           {"data/etc/config.json": {"port": 19999}})
+        prev, err = panel.backup_preview(p)
+        self.assertEqual(err, "")
+        self.assertEqual(prev["diff"]["panel_port"]["now"], 17999)
+        self.assertEqual(prev["diff"]["panel_port"]["pkg"], 19999)
+        self.assertIn("config.json", prev["files"])
+
+    def test_read_manifest_on_non_package(self):
+        junk = os.path.join(self.bdir, "junk.tar.gz")
+        with open(junk, "wb") as f:
+            f.write(b"not a tar at all")
+        man, err = panel.backup_read_manifest(junk)
+        self.assertIsNone(man)
+        self.assertTrue(err)
+
+    # ---------- 恶意包防护 ----------
+    def test_safe_members_rejects_traversal_and_links(self):
+        import io as _io
+        p = os.path.join(self.bdir, "evil.tar.gz")
+        with tarfile.open(p, "w:gz") as tf:
+            data = json.dumps(self._manifest()).encode()
+            ti = tarfile.TarInfo("manifest.json")
+            ti.size = len(data)
+            tf.addfile(ti, _io.BytesIO(data))
+            for bad in ("../evil.txt", "/abs.txt", "data/../../etc/passwd"):
+                c = b"x"
+                ti = tarfile.TarInfo(bad)
+                ti.size = len(c)
+                tf.addfile(ti, _io.BytesIO(c))
+            ln = tarfile.TarInfo("data/etc/link")
+            ln.type = tarfile.SYMTYPE
+            ln.linkname = "/etc/passwd"
+            tf.addfile(ln)
+            okc = b"{}"
+            ti = tarfile.TarInfo("data/etc/sites.json")
+            ti.size = len(okc)
+            tf.addfile(ti, _io.BytesIO(okc))
+        with tarfile.open(p, "r:gz") as tf:
+            good, bad = panel.backup_safe_members(tf)
+        self.assertEqual([m.name for m in good], ["manifest.json", "data/etc/sites.json"])
+        self.assertEqual(len(bad), 4)
+
+    def test_restore_refuses_unsafe_package(self):
+        import io as _io
+        p = os.path.join(self.bdir, "evil2.tar.gz")
+        with tarfile.open(p, "w:gz") as tf:
+            data = json.dumps(self._manifest()).encode()
+            ti = tarfile.TarInfo("manifest.json")
+            ti.size = len(data)
+            tf.addfile(ti, _io.BytesIO(data))
+            c = b"x"
+            ti = tarfile.TarInfo("../evil.txt")
+            ti.size = len(c)
+            tf.addfile(ti, _io.BytesIO(c))
+        ok, msg = panel.backup_restore_work("evil2.tar.gz", {"settings": True}, {"snapshot": False})
+        self.assertFalse(ok)
+        self.assertIn("不安全条目", msg)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "evil.txt")))
+
+    # ---------- 恢复：端口护栏 / 逐项 ----------
+    def test_restore_settings_keeps_current_port(self):
+        p = self._make_pkg("s1.tar.gz", self._manifest(),
+                           {"data/etc/config.json": {"port": 19999, "bind": "1.2.3.4",
+                                                     "theme": "neon", "username": "restored"}})
+        ok, msg = panel.backup_restore_work("s1.tar.gz", {"settings": True, "nginx": False},
+                                            {"snapshot": False})
+        self.assertTrue(ok, msg)
+        cfg = self._read_cfg()
+        self.assertEqual(cfg["port"], 17999, "端口必须保持当前值（防锁死）")
+        self.assertEqual(cfg["bind"], "0.0.0.0", "绑定也必须保持当前值")
+        self.assertEqual(cfg["theme"], "neon")
+        self.assertEqual(cfg["username"], "restored")
+
+    def test_restore_port_only_when_checked(self):
+        p = self._make_pkg("s2.tar.gz", self._manifest(),
+                           {"data/etc/config.json": {"port": 19999, "bind": "1.2.3.4"}})
+        ok, msg = panel.backup_restore_work("s2.tar.gz", {"port": True, "nginx": False},
+                                            {"snapshot": False})
+        self.assertTrue(ok, msg)
+        cfg = self._read_cfg()
+        self.assertEqual(cfg["port"], 19999)
+        self.assertEqual(cfg["bind"], "1.2.3.4")
+
+    def test_restore_rules_merges_current_ports(self):
+        # 包里的规则故意不含当前 SSH(2222) 与面板(17999) 端口
+        p = self._make_pkg("s3.tar.gz", self._manifest(),
+                           {"data/etc/rules.json": [{"id": "x1", "type": "port_allow",
+                                                     "proto": "tcp", "port": 443, "comment": "https"}]})
+        ok, msg = panel.backup_restore_work("s3.tar.gz", {"rules": True, "nginx": False},
+                                            {"snapshot": False})
+        self.assertTrue(ok, msg)
+        rules = self._read_json("rules.json")
+        ports = sorted(r["port"] for r in rules if r.get("type") == "port_allow")
+        self.assertIn(443, ports)
+        self.assertIn(2222, ports, "必须补回当前 SSH 端口放行")
+        self.assertIn(17999, ports, "必须补回当前面板端口放行")
+        self.assertIn("补回端口放行", msg)
+        self.assertIn("2222", msg)
+
+    def test_restore_requires_items(self):
+        p = self._make_pkg("s4.tar.gz", self._manifest(), {"data/etc/config.json": {}})
+        ok, msg = panel.backup_restore_work("s4.tar.gz", {"settings": False}, {"snapshot": False})
+        self.assertFalse(ok)
+        self.assertIn("没有勾选", msg)
+
+    def test_restore_rejects_missing_package(self):
+        ok, msg = panel.backup_restore_work("nope.tar.gz", {"settings": True}, {})
+        self.assertFalse(ok)
+
+    def test_restore_restores_records_and_marks_results(self):
+        p = self._make_pkg("s5.tar.gz", self._manifest(),
+                           {"data/etc/proxies.json": [{"id": "z" * 12, "domain": "new.example.com",
+                                                       "target_port": 1234, "enabled": True}],
+                            "data/etc/sites.json": [{"id": "y" * 12, "domain": "s.example.com"}],
+                            "data/etc/fed_nodes.json": {"n1": {"name": "a", "url": "http://x", "token": "t"}}})
+        ok, msg = panel.backup_restore_work("s5.tar.gz",
+                                            {"proxies": True, "sites": True, "fed": True, "nginx": False},
+                                            {"snapshot": False})
+        self.assertTrue(ok, msg)
+        self.assertEqual(self._read_json("proxies.json")[0]["domain"], "new.example.com")
+        self.assertEqual(self._read_json("sites.json")[0]["domain"], "s.example.com")
+        self.assertIn("n1", self._read_json("fed_nodes.json"))
+        self.assertIn("proxies.json", msg)
+
+    # ---------- 快照 / 回滚 ----------
+    def test_snapshot_created_and_rollback(self):
+        snap_pkg = self._make_pkg("s6.tar.gz", self._manifest(),
+                                  {"data/etc/rules.json": [{"id": "n1", "type": "port_allow",
+                                                            "proto": "tcp", "port": 8443, "comment": "new"}]})
+        ok, msg = panel.backup_restore_work("s6.tar.gz", {"rules": True, "nginx": False},
+                                            {"snapshot": True})
+        self.assertTrue(ok, msg)
+        snaps = [i for i in panel.backup_list() if i["pre_restore"]]
+        self.assertTrue(snaps, "恢复前必须自动生成快照")
+        self.assertEqual(self._read_json("rules.json")[0]["port"], 8443)
+        # 回滚：回到快照里的规则（80）
+        ok2, msg2 = panel.backup_rollback_work(snaps[0]["name"])
+        self.assertTrue(ok2, msg2)
+        ports = [r["port"] for r in self._read_json("rules.json") if r.get("type") == "port_allow"]
+        self.assertIn(80, ports)
+        self.assertNotIn(8443, ports)
+
+    # ---------- 分块上传 ----------
+    def _upload(self, uid, chunks):
+        part = panel.backup_upload_path(uid)
+        with open(part, "wb") as f:
+            for i, c in enumerate(chunks):
+                f.seek(i * panel.BACKUP_UPLOAD_CHUNK)
+                f.write(c)
+        return part
+
+    def test_upload_chunk_roundtrip_and_manifest(self):
+        # 先做一个真实包，再模拟「分块上传」它，最后 finish
+        ok, msg = panel.backup_create_work(["config"], note="上传源")
+        src_name = panel.backup_list()[0]["name"]
+        src = os.path.join(self.bdir, src_name)
+        blob = open(src, "rb").read()
+        uid = "a" * 32
+        self._upload(uid, [blob])
+        ok2, name, man = panel.backup_upload_finish(uid, "")
+        self.assertTrue(ok2, name)
+        self.assertIsInstance(man, dict)
+        self.assertTrue(os.path.exists(os.path.join(self.bdir, name)))
+        self.assertEqual(stat.S_IMODE(os.stat(os.path.join(self.bdir, name)).st_mode), 0o600)
+        self.assertFalse(os.path.exists(panel.backup_upload_path(uid)), "分片临时文件应被移走")
+
+    def test_upload_finish_rejects_garbage(self):
+        uid = "b" * 32
+        self._upload(uid, [b"this is not a tarball"])
+        ok, msg, man = panel.backup_upload_finish(uid, "")
+        self.assertFalse(ok)
+        self.assertIsNone(man)
+
+    def test_upload_finish_rejects_oversize(self):
+        uid = "c" * 32
+        self._upload(uid, [b"x" * 64])
+        old = panel.BACKUP_MAX_BYTES
+        panel.BACKUP_MAX_BYTES = 16
+        try:
+            ok, msg, man = panel.backup_upload_finish(uid, "")
+        finally:
+            panel.BACKUP_MAX_BYTES = old
+        self.assertFalse(ok)
+        self.assertIn("上限", msg)
+
+
+class TestBackupFrontendWiring(unittest.TestCase):
+    """前端调用的接口 / 依赖的字段，后端必须都对得上（防改名漏改）"""
+
+    def setUp(self):
+        self.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(self.root, "static", "index.html"), encoding="utf-8") as f:
+            self.html = f.read()
+        with open(os.path.join(self.root, "panel.py"), encoding="utf-8") as f:
+            self.py = f.read()
+
+    def test_frontend_api_paths_exist_in_backend(self):
+        for path in ("/api/backup", "/api/backup/download?name=", "/api/backup/preview?name=",
+                     "/api/backup/create", "/api/backup/delete", "/api/backup/upload/init",
+                     "/api/backup/upload/chunk", "/api/backup/upload/finish",
+                     "/api/backup/restore"):
+            self.assertIn(path, self.html, "前端未调用 %s" % path)
+        for needle in ('path == "/api/backup"', '"/api/backup/create"', '"/api/backup/delete"',
+                       '"/api/backup/upload/init"', '"/api/backup/upload/chunk"',
+                       '"/api/backup/upload/finish"', '"/api/backup/restore"',
+                       '"/api/backup/rollback"', '"/api/backup/download"', '"/api/backup/preview"'):
+            self.assertIn(needle, self.py, "后端缺少路由 %s" % needle)
+
+    def test_frontend_fields_match_backend_payload(self):
+        for field in ("restore_items", "\"chunk\"", "\"counts\"", "\"preview_error\"",
+                      "\"modules\"", "\"items\""):
+            self.assertIn(field, self.py, "后端响应缺字段 %s" % field)
+        for field in ("d.modules", "restore_items", "d.counts", "ini.chunk",
+                      "fin.preview_error", "data-bkmod", "data-bkitem"):
+            self.assertTrue(field in self.html, "前端没用上 " + field)   # 别把整页 HTML 塞进断言消息
+
+    def test_chunked_upload_contract(self):
+        # 块大小、偏移规则、头部名必须两边一致
+        self.assertIn("BACKUP_UPLOAD_CHUNK = 4 * 1024 * 1024", self.py)
+        self.assertIn("X-Upload-Uid", self.py)
+        self.assertIn("X-Chunk-Index", self.py)
+        self.assertIn("X-Upload-Uid", self.html)
+        self.assertIn("X-Chunk-Index", self.html)
+        self.assertIn("idx * BACKUP_UPLOAD_CHUNK", self.py, "后端按块偏移写入")
+
+    def test_backup_ui_has_entry_in_system_page(self):
+        self.assertIn('data-sec="sys"', self.html)
+        self.assertIn("备份与恢复", self.html)
+        self.assertIn("bkLoad()", self.html, "系统页加载时要拉备份信息")
+
+
+class TestBackupAPI(unittest.TestCase):
+    """HTTP 层：路由 / 鉴权 / 分块上传 / 流式下载 / 路径防护"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.cfg = make_cfg()
+        cls.store = panel.RuleStore()
+        cls.store.rules = []
+        cls.nft = panel.NFTManager(cls.store, cls.cfg)
+        cls.auth = panel.Auth(cls.cfg)
+        cls.server = panel.PanelServer(("127.0.0.1", 17996), panel.PanelHandler,
+                                       cls.cfg, cls.store, cls.nft, cls.auth)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = "http://127.0.0.1:17996"
+        cls.bdir = tempfile.mkdtemp(prefix="fwbkapi-")
+        cls._old_bdir = panel.BACKUP_DIR
+        panel.BACKUP_DIR = cls.bdir
+        # 备份要有东西可打：在共享的测试 BASE_DIR 里准备记录文件（用完删掉自己造的那些）
+        cls._made = []
+        for fn, content in (("config.json", {"username": TEST_USER, "port": 17999, "bind": "127.0.0.1"}),
+                            ("rules.json", [{"id": "api1", "type": "port_allow", "proto": "tcp",
+                                             "port": 8080, "comment": "api"}]), 
+                            ("proxies.json", []), ("sites.json", []), ("certificates.json", {}),
+                            ("apps.json", {"apps": []}), ("fed_nodes.json", {})):
+            p = os.path.join(panel.BASE_DIR, fn)
+            if not os.path.exists(p):
+                with open(p, "w", encoding="utf-8") as f:
+                    json.dump(content, f)
+                cls._made.append(p)
+        p = os.path.join(panel.BASE_DIR, "firewall.nft")
+        if not os.path.exists(p):
+            with open(p, "w") as f:
+                f.write("table inet fwpanel {}\n")
+            cls._made.append(p)
+        code, d = cls._post("/api/login", {"username": TEST_USER, "password": TEST_PASS})
+        cls.token = d.get("token", "")
+        time.sleep(0.1)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown()
+        cls.server.server_close()
+        panel.BACKUP_DIR = cls._old_bdir
+        shutil.rmtree(cls.bdir, ignore_errors=True)
+        for p in getattr(cls, "_made", []):
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+
+    @classmethod
+    def _raw(cls, method, path, body=None, headers=None):
+        req = urllib.request.Request(cls.base + path, method=method)
+        for k, v in (headers or {}).items():
+            req.add_header(k, v)
+        try:
+            with urllib.request.urlopen(req, body) as resp:
+                return resp.status, resp.read(), dict(resp.headers)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read(), dict(e.headers)
+
+    @classmethod
+    def _json(cls, method, path, data=None, token=None):
+        h = {"Content-Type": "application/json"}
+        if token:
+            h["Authorization"] = "Bearer " + token
+        code, raw, _ = cls._raw(method, path, json.dumps(data).encode() if data is not None else None, h)
+        try:
+            return code, json.loads(raw)
+        except Exception:
+            return code, {}
+
+    @classmethod
+    def _post(cls, path, data, token=None):
+        return cls._json("POST", path, data, token)
+
+    def test_requires_auth(self):
+        code, _ = self._json("GET", "/api/backup")
+        self.assertEqual(code, 401)
+        code, d = self._json("GET", "/api/backup", token=self.token)
+        self.assertEqual(code, 200, d)
+        self.assertIn("modules", d)
+        self.assertIn("restore_items", d)
+        self.assertIn("chunk", d)
+        self.assertTrue(any(m["id"] == "config" for m in d["modules"]))
+
+    def test_create_and_download_stream(self):
+        ok, msg = panel.backup_create_work(["config"], note="api-test")
+        self.assertTrue(ok, msg)
+        name = panel.backup_list()[0]["name"]
+        code, d = self._post("/api/backup/create", {"modules": ["config"]}, token=self.token)
+        self.assertEqual(code, 200, d)
+        self.assertTrue(d.get("ok") or d.get("task"))       # DRY_RUN → 同步返回
+        # 下载：必须是真 gzip 流 + 附件名
+        req = urllib.request.Request(self.base + "/api/backup/download?name=" + name)
+        req.add_header("Authorization", "Bearer " + self.token)
+        with urllib.request.urlopen(req) as resp:
+            self.assertEqual(resp.status, 200)
+            head = resp.read(2)
+            self.assertEqual(head, b"\x1f\x8b")
+            self.assertIn(name, resp.headers.get("Content-Disposition", ""))
+
+    def test_download_rejects_traversal(self):
+        code, _, _ = self._raw("GET", "/api/backup/download?name=../../etc/passwd",
+                               headers={"Authorization": "Bearer " + self.token})
+        self.assertEqual(code, 404)
+
+    def test_chunked_upload_roundtrip(self):
+        ok, msg = panel.backup_create_work(["config"], note="src")
+        self.assertTrue(ok, msg)
+        src = os.path.join(self.bdir, panel.backup_list()[0]["name"])
+        with open(src, "rb") as f:
+            blob = f.read()
+        code, d = self._post("/api/backup/upload/init", {"name": "imported.tar.gz", "size": len(blob)},
+                             token=self.token)
+        self.assertEqual(code, 200, d)
+        uid, chunk = d["uid"], d["chunk"]
+        # 分两块上传（第二块故意小，验证按偏移拼接）
+        part1, part2 = blob[:chunk], blob[chunk:]
+        for i, part in enumerate([part1, part2]):
+            if not part:
+                continue
+            code, raw, _ = self._raw("POST", "/api/backup/upload/chunk", part,
+                                     {"Authorization": "Bearer " + self.token,
+                                      "X-Upload-Uid": uid, "X-Chunk-Index": str(i),
+                                      "Content-Type": "application/octet-stream"})
+            self.assertEqual(code, 200, raw[:200])
+        code, d = self._post("/api/backup/upload/finish", {"uid": uid, "name": "imported.tar.gz"},
+                             token=self.token)
+        self.assertEqual(code, 200, d)
+        self.assertTrue(d["ok"], d)
+        self.assertIn("manifest", d)
+        self.assertTrue(os.path.exists(os.path.join(self.bdir, d["name"])))
+        # 上传完成的包能预览
+        code, d2 = self._json("GET", "/api/backup/preview?name=" + d["name"], token=self.token)
+        self.assertEqual(code, 200, d2)
+        self.assertIn("manifest", d2["preview"])
+
+    def test_upload_chunk_rejects_bad_uid(self):
+        code, raw, _ = self._raw("POST", "/api/backup/upload/chunk", b"x",
+                                 {"Authorization": "Bearer " + self.token,
+                                  "X-Upload-Uid": "short", "X-Chunk-Index": "0"})
+        self.assertEqual(code, 400)
+
+    def test_restore_requires_items_and_package(self):
+        code, d = self._post("/api/backup/restore", {"name": "nope.tar.gz", "items": {"settings": True}},
+                             token=self.token)
+        self.assertEqual(code, 404)
+        ok, msg = panel.backup_create_work(["config"])
+        self.assertTrue(ok, msg)
+        name = panel.backup_list()[0]["name"]
+        code, d = self._post("/api/backup/restore", {"name": name, "items": {"settings": False}},
+                             token=self.token)
+        self.assertEqual(code, 400)
+        code, d = self._post("/api/backup/restore", {"name": name, "items": {"settings": True},
+                                                     "opts": {"snapshot": False}},
+                             token=self.token)
+        self.assertEqual(code, 200, d)
+        self.assertTrue(d.get("ok") or d.get("task"))
+
+    def test_delete_and_rollback_missing(self):
+        ok, msg = panel.backup_create_work(["config"])
+        self.assertTrue(ok, msg)
+        name = panel.backup_list()[0]["name"]
+        code, d = self._post("/api/backup/delete", {"name": name}, token=self.token)
+        self.assertEqual(code, 200, d)
+        self.assertFalse(os.path.exists(os.path.join(self.bdir, name)))
+        code, d = self._post("/api/backup/rollback", {"name": "ghost.tar.gz"}, token=self.token)
+        self.assertEqual(code, 404)
 
 
 if __name__ == "__main__":
