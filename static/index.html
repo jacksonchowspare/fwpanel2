@@ -378,7 +378,9 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
 /* 每颗按钮都包在槽位 span 里：grid 直接子项与 span 包裹项的几何会差几像素（实测 7px），
    统一结构后跨行才不会错位；槽位上的 title 也保证悬停能出提示 */
 .ops-slot { display: block; min-height: 1px; }
-.ops-slot > .btn { display: flex; width: 100%; }
+.ops-slot > .btn { display: flex; width: 100%; align-items: center; justify-content: center; }
+/* ⚠ 原生 button 靠 text-align:center 居中；一旦改成 flex 容器，文字变成 flex 项、text-align 不再管它
+   → 必须显式 justify-content:center，否则文字偏左（v3.3.11 用户截图反馈） */
 .ops-slot > .btn[disabled] { pointer-events: none; }   /* 让悬停落到槽位的 title 上（disabled 元素常不弹提示） */
 .ops-grid > span { display: block; min-height: 1px; }
 /* 选项胶囊：形状/描边/文字色全部走主题变量（像素主题 --r-sm=0、霓虹/奶油主题 --r-sm=8px），

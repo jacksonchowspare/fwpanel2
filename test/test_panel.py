@@ -8018,8 +8018,8 @@ class TestProxyCertTabWiring(unittest.TestCase):
         self.assertIn("grid-auto-columns: 84px", self.html)
         self.assertIn(".ops-grid .btn { width: 100%; }", self.html, "槽位内按钮应铺满，保证等宽")
         self.assertIn(".ops-slot { display: block; min-height: 1px; }", self.html, "每颗按钮都要有槽位 span")
-        self.assertIn(".ops-slot > .btn { display: flex; width: 100%; }", self.html,
-                      "槽位内按钮必须块级铺满（grid 直接子项与 span 包裹项实测差 7px）")
+        self.assertIn(".ops-slot > .btn { display: flex; width: 100%; align-items: center; justify-content: center; }",
+                      self.html, "槽位内按钮必须块级铺满并显式居中（实测 grid 直接子项与 span 包裹项差 7px；改 flex 后不写居中文字会偏左）")
         self.assertIn(">更换</button><span></span>", self.html, "代理表「更换」分支要补占位")
         self.assertIn(">申请证书</button><span></span>", self.html, "代理表「申请证书」分支要补占位")
         self.assertIn('class="ops-grid"', self.html)
@@ -8049,6 +8049,24 @@ class TestProxyCertTabWiring(unittest.TestCase):
         self.assertIn('"used_by_proxies": proxy_users.get(domain, [])', src)
         self.assertIn('"used_by_site": domain in refs', src)
         self.assertIn("for _p in ProxyStore().proxies:", src)
+
+    def test_ops_slot_button_text_centered(self):
+        """槽位里的按钮必须显式居中（v3.3.11 用户截图：文字偏左）
+
+        根因：原生 <button> 靠 text-align:center 居中；v3.3.9 为了铺满槽位把它改成 display:flex，
+        文字变成 flex 项、text-align 不再管它 → 靠左。真浏览器实测修好后 16 颗按钮偏心 0.0px。
+        """
+        self.assertIn(".ops-slot > .btn { display: flex; width: 100%; align-items: center; justify-content: center; }",
+                      self.html, "槽位按钮必须显式 justify-content:center")
+        # 全表扫描：任何把 .btn 变成 flex 容器的规则都必须同时写 justify-content，否则文字偏左
+        offenders = []
+        for m in re.finditer(r"([^{}]*)\{([^}]*)\}", self.html):
+            head = (m.group(1) or "").strip()
+            sel = head.splitlines()[-1] if head else ""
+            body = m.group(2)
+            if ".btn" in sel and "display: flex" in body and "justify-content" not in body:
+                offenders.append(sel[:60])
+        self.assertEqual(offenders, [], "把 .btn 改成 flex 却没写 justify-content → 文字会偏左: %s" % offenders)
 
     def test_renew_and_paths_handlers_exist(self):
         for fn in ("renewCertSolo", "showCertPathsSolo", "renewCert", "showCertPaths"):
