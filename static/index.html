@@ -370,6 +370,12 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
 #add_proxy_row input, #add_proxy_row select { width: 100%; box-sizing: border-box; }
 #add_proxy_opts { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 #add_proxy_opts .btn { width: 120px; flex: none; }
+/* 表格操作列的「定宽槽位」：右对齐只解决"贴哪一边"，行与行按钮数量不同时仍会错位
+   （如证书表第一行有「移除」、第二行没有 → 右对齐后「手动续期」被挤到右边）。
+   槽位定宽 + 缺按钮时补占位 <span>，逐列对齐。 */
+.ops-grid { display: inline-grid; grid-auto-flow: column; grid-auto-columns: 84px; gap: 6px; justify-content: end; }
+.ops-grid > .btn { width: 100%; }
+.ops-grid > span { display: block; min-height: 1px; }
 /* 选项胶囊：形状/描边/文字色全部走主题变量（像素主题 --r-sm=0、霓虹/奶油主题 --r-sm=8px），
    不写死圆角与颜色 —— 写死会导致切主题时"这个控件不跟着变"。 */
 .opt-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 11px; border: var(--bdw) solid var(--border); border-radius: var(--r-sm); background: transparent; color: var(--muted); font-size: 12px; line-height: 1.2; cursor: pointer; user-select: none; transition: border-color .15s ease, color .15s ease, background .15s ease; }
@@ -2692,10 +2698,12 @@ async function loadCerts() {
       const srcTag = SRC_LABEL[c.source] ? '<span style="color:var(--muted);font-size:11px;margin-left:6px">' + SRC_LABEL[c.source] + "</span>" : "";
       tr.innerHTML = `<td>${c.domain}${c.method === "dns" ? '<span style="color:#f59e0b;font-size:11px;margin-left:6px">DNS</span>' : '<span style="color:var(--muted);font-size:11px;margin-left:6px">HTTP</span>'}${srcTag}</td><td style="color:var(--muted);font-size:12px">${exp}</td>
         <td style="text-align:right;white-space:nowrap">
-          <span style="display:inline-flex;gap:6px;justify-content:flex-end">
+          <span class="ops-grid">
           <button class="btn mini ghost" onclick="renewCertSolo('${c.domain}')">手动续期</button>
           <button class="btn mini ghost" onclick="showCertPathsSolo('${c.domain}')">显示路径</button>
-          ${c.source === "independent" ? `<button class="btn mini danger" onclick="delCert('${c.domain}')">移除</button>` : ""}
+          ${c.source === "independent"
+            ? `<button class="btn mini danger" onclick="delCert('${c.domain}')">移除</button>`
+            : "<span></span>"}
           </span>
         </td>`;
       tbody.appendChild(tr);
@@ -5006,20 +5014,20 @@ async function loadProxy() {
       if (p.cert_exists) {
         certText = `${certRefTag}${cert}`;
         certBtns = `<button class="btn mini ghost" onclick="renewCert('${p.id}')">手动续期</button>`
-                 + `<button class="btn mini ghost" onclick="showCertPaths('${p.id}')">显示路径</button>`;
+                 + `<button class="btn mini ghost" onclick="showCertPaths('${p.id}')">显示路径</button>`;   // 2 槽位
       } else if (p.cert_ref) {
         certText = `${certRefTag}<span style="color:var(--danger)">⚠ 证书缺失</span>`;
-        certBtns = `<button class="btn mini ghost" onclick="editProxy('${p.id}')">更换</button>`;
+        certBtns = `<button class="btn mini ghost" onclick="editProxy('${p.id}')">更换</button><span></span>`;   // 占位对齐
       } else if (p.ssl) {
         certText = "未签发";
       } else {
-        certBtns = `<button class="btn mini" onclick="issueSsl('${p.id}')">申请证书</button>`;
+        certBtns = `<button class="btn mini" onclick="issueSsl('${p.id}')">申请证书</button><span></span>`;   // 占位对齐
       }
       // 窄窗口下文本会用省略号截断 → 加 title 让鼠标悬停能看全
       const certTitle = (p.cert_ref ? "使用证书 " + p.cert_ref + " " : "") + cert;
       const certCell = `<div style="display:flex;align-items:center;gap:10px">`
         + `<span title="${certTitle}" style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${certText}</span>`
-        + (certBtns ? `<span style="flex:0 0 auto;display:inline-flex;gap:6px">${certBtns}</span>` : "")
+        + (certBtns ? `<span style="flex:0 0 auto" class="ops-grid">${certBtns}</span>` : "")
         + `</div>`;
       const ipBtn = p.block_ip
         ? `<button class="btn mini" style="background:var(--accent2)" onclick="toggleBlockIp('${p.id}', false)">禁止IP访问中</button>`

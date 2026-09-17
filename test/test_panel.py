@@ -7819,7 +7819,7 @@ class TestProxyCertTabWiring(unittest.TestCase):
         self.assertIn("display:flex;align-items:center;gap:10px", self.html, "证书单元格应为 flex 两段")
         self.assertIn("flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap", self.html,
                       "证书文本必须可伸缩并在窄窗口下省略号截断")
-        self.assertIn("flex:0 0 auto;display:inline-flex;gap:6px", self.html, "按钮组必须钉在列右侧不参与伸缩")
+        self.assertIn('flex:0 0 auto" class="ops-grid"', self.html, "按钮组必须钉在列右侧不参与伸缩（走定宽槽位）")
         self.assertIn("title=\"${certTitle}\"", self.html, "被截断时要有悬浮提示")
 
     def test_proxy_ops_column_right_aligned(self):
@@ -7827,6 +7827,22 @@ class TestProxyCertTabWiring(unittest.TestCase):
         self.assertEqual(self.html.count('<th style="text-align:right;width:1px;white-space:nowrap">操作</th>'), 2,
                          "两张表的操作列表头都应右对齐并按内容收缩")
         self.assertIn("display:inline-flex;gap:6px;justify-content:flex-end;align-items:center", self.html)
+
+    def test_ops_buttons_use_fixed_slots(self):
+        """操作列必须是「定宽槽位 + 缺按钮补占位」
+
+        v3.3.8 用户截图：证书表第一行有「移除」、第二行（证书被代理引用着）没有 → 右对齐后
+        第二行的「手动续期/显示路径」整体右移，跨行对不齐。真浏览器复刻页实测：加槽位后
+        两行的「手动续期」左边缘都是 1173px、「显示路径」都是 1269px，按钮统一 84px 无裁字。
+        """
+        self.assertIn(".ops-grid { display: inline-grid; grid-auto-flow: column; grid-auto-columns: 84px;",
+                      self.html, "缺少定宽槽位样式")
+        self.assertIn("grid-auto-columns: 84px", self.html)
+        self.assertIn('.ops-grid > .btn { width: 100%; }', self.html, "槽位内按钮应铺满，保证等宽")
+        self.assertIn(': "<span></span>"}', self.html, "证书表缺按钮时必须补占位，否则该行按钮整体右移")
+        self.assertIn(">更换</button><span></span>", self.html, "代理表「更换」分支要补占位")
+        self.assertIn(">申请证书</button><span></span>", self.html, "代理表「申请证书」分支要补占位")
+        self.assertIn('class="ops-grid"', self.html)
 
     def test_renew_and_paths_handlers_exist(self):
         for fn in ("renewCertSolo", "showCertPathsSolo", "renewCert", "showCertPaths"):
