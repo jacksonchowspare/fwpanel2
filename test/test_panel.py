@@ -7629,5 +7629,43 @@ class TestBackupAPI(unittest.TestCase):
         self.assertEqual(code, 404)
 
 
+class TestUiViewportGuard(unittest.TestCase):
+    """弹窗永不超出视口 + 日志类内容独立限高
+
+    v3.3.2 背景（用户实测）：应用安装日志窗口内容一长，弹窗被顶得很高，
+    底部的「关闭」按钮被挤出屏幕 —— 根因是 .modal 没有视口上限（遮罩是居中 flex，超高就上下溢出）。
+    """
+
+    def setUp(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "static", "index.html"), encoding="utf-8") as f:
+            self.html = f.read()
+
+    def test_modal_has_viewport_cap(self):
+        self.assertIn(".modal { max-height: 92vh; overflow-y: auto; }", self.html,
+                      "所有弹窗必须有视口上限，否则内容一长按钮就点不到")
+
+    def test_log_areas_are_height_capped(self):
+        # 应用日志弹窗（日志本体）
+        self.assertIn("#applog_body { max-height: 50vh; overflow: auto; }", self.html)
+        # 部署进度日志（向导第 2 步）
+        self.assertIn("max-height:26vh;overflow:auto", self.html)
+        # SSH 密钥等长文本区
+        self.assertIn("max-height:52vh", self.html)
+
+    def test_no_uncapped_pre_blocks(self):
+        """页面里每个 <pre> 都必须有限高：行内写，或存在针对该 id 的 CSS 规则（长文本容器最容易把弹窗顶长）"""
+        import re as _re
+        css = _re.search(r"<style[^>]*>(.*?)</style>", self.html, _re.S)
+        css = css.group(1) if css else ""
+        for tag in _re.findall(r"<pre[^>]*>", self.html):
+            if "max-height" in tag:
+                continue
+            mid = _re.search(r'id="([^"]+)"', tag)
+            if mid and _re.search(r"#" + mid.group(1) + r"\s*\{[^}]*max-height", css):
+                continue          # 由 CSS 规则限高（例：#applog_body）
+            self.fail("未限高的 <pre>（行内与 CSS 都没有 max-height）：" + tag[:120])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

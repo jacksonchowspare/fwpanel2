@@ -517,6 +517,11 @@ tr:hover td { background: var(--panel-solid); }
 .modal input[type="radio"], .modal input[type="checkbox"] { width: auto; flex: 0 0 auto; }
 .modal input[type="checkbox"] { width: auto; flex: none; }
 .modal .btnrow { display: flex; gap: 8px; justify-content: flex-end; margin-top: 6px; }
+/* v3.3.2：弹窗永不超出视口 —— 「应用日志」曾因日志很长把弹窗顶高，底部关闭按钮被挤出屏幕。
+   ① 弹窗最高 92vh 且自身可滚动（按钮始终可达，任何主题/视口都成立）
+   ② 日志类内容另有独立限高（见 #applog_body），正常情况根本不需要滚动 */
+.modal { max-height: 92vh; overflow-y: auto; }
+#applog_body { max-height: 50vh; overflow: auto; }
   /* ---- Web 终端多窗口系统（v2.1.23）---- */
   #term_dock { position: fixed; left: 8px; top: 50%; transform: translateY(-50%); z-index: 46;
     display: flex; flex-direction: column; gap: 8px; }
@@ -4260,7 +4265,7 @@ function appwRender() {
       + '<div id="aw_progress_meta" style="color:var(--muted);font-size:12px;margin-top:6px">'
       + '首次部署要拉取镜像（几百 MB），通常 5-20 分钟；这段时间可以直接关掉页面，稍后回来点「刷新」看结果。</div>'
       + '<div id="aw_progress_log" style="color:var(--muted);font-size:12px;margin-top:8px;white-space:pre-wrap;'
-      + 'font-family:\'0xProto\',ui-monospace,monospace;max-height:220px;overflow:auto"></div>'
+      + 'font-family:\'0xProto\',ui-monospace,monospace;max-height:26vh;overflow:auto"></div>'
       + '<div style="margin-top:10px"><button class="btn mini ghost" onclick="appwShowLogs()">查看容器日志</button>'
       + ' <span style="color:var(--muted);font-size:12px">（容器起来了才有日志，可随时点）</span></div>';
     return;
