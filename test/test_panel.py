@@ -7732,15 +7732,16 @@ class TestAddProxyFormLayout(unittest.TestCase):
     def test_options_row_holds_chips_and_button(self):
         """选项与按钮独立成行：胶囊靠左、按钮定宽靠右"""
         self.assertIn('<div id="add_proxy_opts">', self.html, "缺少选项行容器")
-        self.assertIn("#add_proxy_opts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;", self.html)
-        self.assertIn("#add_proxy_opts .btn { width: 120px; flex: none; margin-left: auto; }", self.html,
-                      "按钮必须定宽且靠右（否则会像 1fr 列那样被拉宽）")
+        self.assertIn("#add_proxy_opts { display: flex; align-items: center; justify-content: flex-end; gap: 8px; flex-wrap: wrap;",
+                      self.html, "选项行必须右对齐成组（v3.3.7：勾选紧贴按钮左侧，不再贴到最左）")
+        self.assertIn("#add_proxy_opts .btn { width: 120px; flex: none; }", self.html,
+                      "按钮必须定宽（否则会像 1fr 列那样被拉宽）")
 
     def test_option_chips_styled_and_wired(self):
         """胶囊：自绘勾选框 + 勾选态高亮 + onchange/启动初始化都接上"""
         self.assertIn(".opt-chip { display: inline-flex;", self.html)
         self.assertIn("appearance: none", self.html, "原生复选框在深色主题下是一粒白块，必须自绘")
-        self.assertIn(".opt-chip.on, .opt-chip:has(input:checked) { border-color: var(--accent2); color: var(--accent2); }",
+        self.assertIn(".opt-chip.on, .opt-chip:has(input:checked) { border-color: var(--accent2); color: var(--accent2);",
                       self.html, "勾选态高亮规则缺失（:has 为主 + .on 兜底）")
         self.assertIn(".opt-chip input:checked { background: var(--accent2); border-color: var(--accent2); }", self.html)
         self.assertEqual(self.html.count('onchange="optChipSync(this)"'), 2, "两枚胶囊都要挂 optChipSync")
@@ -7748,11 +7749,31 @@ class TestAddProxyFormLayout(unittest.TestCase):
         self.assertIn("optChipInit();", self.html, "启动时必须初始化一次（预置勾选态）")
         self.assertIn("showMain()  { window.__FW_UI_READY__ = true; optChipInit();", self.html)
 
+    def test_opt_chip_theme_driven(self):
+        """胶囊与勾选框必须全部走主题变量（v3.3.7 用户实测：写死圆角/颜色 → 切主题时这个控件不跟着变）
+
+        面板主题会重定义 --r-sm/--r-tag（霓虹/奶油 8px、像素 0px 直角）与 --btn-fg（像素主题是深色前景）。
+        真浏览器实测：默认/light 胶囊 5px·格子 3px、cream 8px·6px、vibes 7px·5px、pixel 0px·0px ✓
+        """
+        self.assertIn("border: var(--bdw) solid var(--border)", self.html, "胶囊描边应走 --bdw/--border")
+        self.assertIn("border-radius: var(--r-sm)", self.html, "胶囊圆角应走 --r-sm（像素主题会压成 0）")
+        self.assertIn("border-radius: var(--r-tag)", self.html, "勾选框圆角应走 --r-tag")
+        self.assertIn("background-color: var(--btn-fg)", self.html,
+                      "勾的颜色应走 --btn-fg（填充色上的前景色），否则各主题勾色都一样")
+        self.assertIn("box-sizing: border-box; padding: 0", self.html,
+                      "勾选框必须 border-box + padding:0，否则会被全局 input 样式撑成长方形")
+        self.assertIn("inset: 0", self.html, "勾用 mask 绘制并 inset:0 铺满 → 无论描边多粗都严格居中")
+        self.assertIn("center / 76% no-repeat", self.html, "mask 必须居中摆放")
+        # 该控件内不得再出现写死的圆角/颜色
+        block = self.html[self.html.index(".opt-chip {"):self.html.index(".opt-chip.on, .opt-chip:has(input:checked)")]
+        self.assertNotIn("999px", block, "不得写死胶囊圆角")
+        self.assertNotIn("#fff", block, "不得写死勾/文字颜色")
+
     def test_narrow_screen_fallbacks(self):
         """窄屏降级：1080px 以下两列、760px 以下单列且按钮占满"""
         self.assertIn("@media (max-width: 1080px) { #add_proxy_row { grid-template-columns: 1fr 1fr; } }", self.html)
         self.assertIn("@media (max-width: 760px) { #add_proxy_row { grid-template-columns: 1fr; }", self.html)
-        self.assertIn("#add_proxy_opts .btn { width: 100%; margin-left: 0; }", self.html)
+        self.assertIn("#add_proxy_opts .btn { width: 100%; }", self.html)
 
     def test_ids_unchanged_for_js(self):
         """addProxy() 按 id 取值 —— 重排 DOM 后这些 id 一个都不能少"""
