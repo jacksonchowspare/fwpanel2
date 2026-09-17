@@ -510,6 +510,7 @@ mkdir -p /tmp/fwupg-cur /tmp/fwupg-tmp
 echo 'CURRENT_VERSION = "2.1.33"' > /tmp/fwupg-cur/panel.py
 head -n -1 "$SCRIPT" | sed 's|readonly APP_DIR="/usr/local/lib/fwpanel"|readonly APP_DIR="/tmp/fwupg-cur"|' > /tmp/install_funcs_ug.sh
 mkdir -p /tmp/fwupg-cwd        # 受控工作目录：升级不得在 CWD 造垃圾文件
+mkdir -p /tmp/fwupg-sd         # systemd 单元目录也隔离（FW_SYSTEMD_DIR），不写真 /etc
 # curl 桩必须是「可执行文件 + PATH」：do_upgrade 的下载走 run_with_timeout（timeout 是外部命令），
 # shell 函数桩会被绕过而真的联网
 mkdir -p /tmp/fakebin_ug
@@ -523,7 +524,8 @@ fi
 exit 1
 UGCURL
 chmod +x /tmp/fakebin_ug/curl
-( cd /tmp/fwupg-cwd && PATH=/tmp/fakebin_ug:$PATH bash -c '
+# 用脚本文件而不是 inline bash -c：嵌套多行命令在某些沙箱/终端监控下会被直接 SIGTERM（实测）
+cat > /tmp/fwupg-inner.sh <<'UGINNER'
 source /tmp/install_funcs_ug.sh
 VERSION_TAG=""; BETA=1; SRC_TAG="v9.9.9"
 mktemp() { echo /tmp/fwupg-tmp; }
@@ -533,8 +535,9 @@ echo "$out" | grep -q "升级 v2.1.33 → v3.2.13" && echo "  ✓ 正式版 → 
 grep -q "3.2.13" /tmp/fwupg-cur/panel.py && echo "  ✓ 磁盘 panel.py 已变成 3.2.13" || { echo "  ✗ 磁盘未更新"; exit 1; }
 ls /tmp/fwupg-cur/panel.py.bak.* >/dev/null 2>&1 && echo "  ✓ 升级前已备份旧版本（可回滚）" || { echo "  ✗ 没有备份"; exit 1; }
 [ -e bash ] && { echo "  ✗ CWD 里被写入了垃圾文件 bash"; exit 1; } || echo "  ✓ 管道模式不会在 CWD 造出名为 bash 的垃圾文件（\$0 非实体文件时跳过）"
-' )
-rm -rf /tmp/fwupg-cur /tmp/fwupg-tmp /tmp/fwupg-cwd /tmp/install_funcs_ug.sh /tmp/fakebin_ug
+UGINNER
+( cd /tmp/fwupg-cwd && PATH=/tmp/fakebin_ug:$PATH FW_SYSTEMD_DIR=/tmp/fwupg-sd bash /tmp/fwupg-inner.sh )
+rm -rf /tmp/fwupg-cur /tmp/fwupg-tmp /tmp/fwupg-cwd /tmp/fwupg-sd /tmp/install_funcs_ug.sh /tmp/fakebin_ug /tmp/fwupg-inner.sh
 
 echo "== 首次安装：自定义凭据询问（yes 自定义 / no 随机） =="
 # FW_MENU=1 让 prompt_read 从 stdin 读；真实场景由 menu_can_read 决定 /dev/tty 或 stdin
@@ -998,6 +1001,184 @@ env -i PATH=/usr/bin:/bin HOME=/tmp bash -c 'source "$1"; check_root() { :; }; s
 [ -e /tmp/fwtest/bin/fwp ] && bad "卸载后快捷命令仍在" || ok "卸载会删除快捷命令 fwp"
 [ -e /tmp/fwtest/app ] && bad "卸载后程序目录仍在" || ok "卸载会删除程序目录（缓存一并清掉）"
 rm -rf /tmp/fwtest /tmp/fakebin_fwp /tmp/fwtest_hang.sh
+
+echo "== gen_initial_rules：已有 rules.json 必须幂等补齐面板端口（v3.2.40 修「重装后端口没放行」） =="
+RTMP=$(mktemp -u); rm -f "$RTMP"
+printf '%s' '[{"id":"old1","type":"port_allow","proto":"tcp","port":42606,"comment":"旧 SSH 规则","protected":true}]' > "$RTMP"
+gen_initial_rules 42606 18935 "$RTMP" >/dev/null 2>&1
+PORTS=$(python3 -c "import json;print(','.join(sorted(str(r['port']) for r in json.load(open('$RTMP')))))")
+if [ "$PORTS" = "18935,42606" ]; then ok "补齐面板端口且不重复旧 SSH 规则（$PORTS）"; else bad "端口列表异常: $PORTS"; fi
+SUM1=$(md5sum "$RTMP" | awk '{print $1}')
+gen_initial_rules 42606 18935 "$RTMP" >/dev/null 2>&1
+SUM2=$(md5sum "$RTMP" | awk '{print $1}')
+if [ "$SUM1" = "$SUM2" ]; then ok "幂等：重复执行不改动规则文件"; else bad "重复执行改动了规则文件"; fi
+printf '%s' '{坏掉的 json' > "$RTMP"
+gen_initial_rules 42606 18935 "$RTMP" >/dev/null 2>&1
+if python3 -c "import json;json.load(open('$RTMP'))" 2>/dev/null; then ok "损坏的 rules.json 已重建为合法 JSON"; else bad "损坏的 rules.json 未重建"; fi
+if ls "$RTMP".broken.* >/dev/null 2>&1; then ok "损坏文件已备份（.broken.*）"; else bad "损坏文件未备份"; fi
+rm -f "$RTMP" "$RTMP".broken.*
+
+echo "== write_config：已有 config.json 时端口/账号/密码哈希/自定义字段都不被覆盖（v3.2.40） =="
+WTMP=$(mktemp -d); mkdir -p "$WTMP/etc" "$WTMP/app"
+head -n -1 "$SCRIPT" \
+    | sed -e "s|^readonly APP_DIR=\"/usr/local/lib/fwpanel\"|readonly APP_DIR=\"$WTMP/app\"|" \
+          -e "s|^readonly ETC_DIR=\"/etc/fwpanel\"|readonly ETC_DIR=\"$WTMP/etc\"|" \
+          -e "s|^readonly LOG_FILE=\"/var/log/fwpanel-install.log\"|readonly LOG_FILE=\"$WTMP/install.log\"|" \
+    > "$WTMP/install.sh"
+cat > "$WTMP/etc/config.json" <<'JSON'
+{"username":"huoshen2877","password_hash":"saltXhashY","port":42608,"bind":"0.0.0.0",
+ "mode":"strict","ssh_port":42606,"ssh_port_auto":true,"dns_creds":{"cf":{"CF_Token":"T"}},"theme":"vibes-dark"}
+JSON
+WC_OUT=$(bash -c "
+source '$WTMP/install.sh'
+PANEL_USER=newuser; PANEL_PASS=NewPass12345; PANEL_PORT=19999; PANEL_BIND=127.0.0.1
+write_config >/dev/null 2>&1
+python3 -c \"import json;d=json.load(open('$WTMP/etc/config.json'));print(d['username'],d['port'],d['bind'],d['password_hash'],bool(d.get('dns_creds')),d.get('theme'))\"
+")
+if [ "$WC_OUT" = "huoshen2877 42608 0.0.0.0 saltXhashY True vibes-dark" ]; then
+    ok "端口/账号/密码哈希/dns_creds/主题全部保留（未被安装脚本覆盖）"
+else
+    bad "配置被覆盖: $WC_OUT"
+fi
+rm -f "$WTMP/etc/config.json"
+WC_OUT2=$(bash -c "
+source '$WTMP/install.sh'
+PANEL_USER=freshuser; PANEL_PASS=FreshPass12345; PANEL_PORT=19999; PANEL_BIND=0.0.0.0
+write_config >/dev/null 2>&1
+python3 -c \"import json;d=json.load(open('$WTMP/etc/config.json'));print(d['username'],d['port'],len(d['password_hash']) > 10)\"
+")
+if [ "$WC_OUT2" = "freshuser 19999 True" ]; then ok "无配置时按参数写入新端口与新账号"; else bad "首次安装写入异常: $WC_OUT2"; fi
+rm -rf "$WTMP"
+
+echo "== stop_panel_service：孤儿进程必须被真杀（v3.2.40 修「卸载假成功、进程占着端口」） =="
+OTMP=$(mktemp -d); mkdir -p "$OTMP/app" "$OTMP/bin"
+# 生成被测脚本副本（APP_DIR 指向临时目录）
+head -n -1 "$SCRIPT" | sed -e "s|^readonly APP_DIR=\"/usr/local/lib/fwpanel\"|readonly APP_DIR=\"$OTMP/app\"|" > "$OTMP/install.sh"
+cat > "$OTMP/app/panel.py" <<'PYBODY'
+import time
+time.sleep(300)
+PYBODY
+cat > "$OTMP/bin/systemctl" <<'SHSTUB'
+#!/usr/bin/env bash
+exit 0      # 模拟「systemctl stop 静默无效」：只信 systemctl 会误判已停止
+SHSTUB
+chmod +x "$OTMP/bin/systemctl"
+cat > "$OTMP/run1.sh" <<'RUNBODY'
+source @DIR@/install.sh
+python3 '@APP@/panel.py' serve >/dev/null 2>&1 &
+p=$!
+sleep 1
+stop_panel_service >/dev/null 2>&1
+rc=$?
+if kill -0 $p 2>/dev/null; then echo "ALIVE rc=$rc"; else echo "GONE rc=$rc"; fi
+RUNBODY
+sed -i -e "s|@APP@|$OTMP/app|g" -e "s|@DIR@|$OTMP|g" "$OTMP/run1.sh"
+SP_OUT=$(PATH="$OTMP/bin:$PATH" bash "$OTMP/run1.sh" 2>&1 | tail -1 || true)
+if [ "$SP_OUT" = "GONE rc=0" ]; then ok "systemctl 无效时仍把进程杀掉并返回成功"; else bad "孤儿进程未清理: $SP_OUT"; fi
+
+OTMP2=$(mktemp -d); mkdir -p "$OTMP2/app" "$OTMP2/bin"
+head -n -1 "$SCRIPT" | sed -e "s|^readonly APP_DIR=\"/usr/local/lib/fwpanel\"|readonly APP_DIR=\"$OTMP2/app\"|" > "$OTMP2/install.sh"
+cat > "$OTMP2/app/panel.py" <<'PYBODY'
+import signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+time.sleep(300)
+PYBODY
+cp "$OTMP/bin/systemctl" "$OTMP2/bin/systemctl"
+cat > "$OTMP2/run2.sh" <<'RUNBODY'
+source @DIR@/install.sh
+python3 '@APP@/panel.py' serve >/dev/null 2>&1 &
+p=$!
+sleep 1
+stop_panel_service >/dev/null 2>&1
+rc=$?
+if kill -0 $p 2>/dev/null; then echo "ALIVE rc=$rc"; else echo "GONE rc=$rc"; fi
+RUNBODY
+sed -i -e "s|@APP@|$OTMP2/app|g" -e "s|@DIR@|$OTMP2|g" "$OTMP2/run2.sh"
+SP2_OUT=$(PATH="$OTMP2/bin:$PATH" bash "$OTMP2/run2.sh" 2>&1 | tail -1 || true)
+if [ "$SP2_OUT" = "GONE rc=0" ]; then ok "忽略 TERM 的顽固进程被 SIGKILL 结束"; else bad "顽固进程未清理: $SP2_OUT"; fi
+
+echo "== start_panel_service：启动前必须清掉已在跑的旧进程（否则新代码/新端口不生效） =="
+cat > "$OTMP/run3.sh" <<'RUNBODY'
+source @DIR@/install.sh
+python3 '@APP@/panel.py' serve >/dev/null 2>&1 &
+old=$!
+sleep 1
+start_panel_service >/dev/null 2>&1
+rc=$?
+if kill -0 $old 2>/dev/null; then echo "OLD_ALIVE rc=$rc"; else echo "OLD_GONE rc=$rc"; fi
+RUNBODY
+sed -i -e "s|@APP@|$OTMP/app|g" -e "s|@DIR@|$OTMP|g" "$OTMP/run3.sh"
+ST_OUT=$(PATH="$OTMP/bin:$PATH" bash "$OTMP/run3.sh" 2>&1 | tail -1 || true)
+if [ "$ST_OUT" = "OLD_GONE rc=0" ]; then ok "旧进程被停掉后重启（新配置才会生效）"; else bad "旧进程仍在: $ST_OUT"; fi
+
+echo "== panel_http_ok：本机 HTTP 自检（真正监听才算通过，安装摘要靠它说真话） =="
+HPORT=$(python3 -c "import socket;s=socket.socket();s.bind(('127.0.0.1',0));print(s.getsockname()[1]);s.close()")
+python3 -m http.server "$HPORT" --bind 127.0.0.1 >/dev/null 2>&1 &
+HPID=$!
+sleep 1
+cat > "$OTMP/httpok.sh" <<'RUNBODY'
+source @TMPF@
+panel_http_ok "$1" "$2"
+RUNBODY
+sed -i "s|@TMPF@|$TMPF|g" "$OTMP/httpok.sh"
+if bash "$OTMP/httpok.sh" "$HPORT" 2 >/dev/null 2>&1; then ok "监听中的端口返回 200 判定通过"; else bad "监听中的端口未通过自检"; fi
+if bash "$OTMP/httpok.sh" 1 1 >/dev/null 2>&1; then bad "未监听端口被误判为可用"; else ok "未监听端口正确判失败"; fi
+kill "$HPID" 2>/dev/null || true
+rm -rf "$OTMP" "$OTMP2"
+
+echo "== do_upgrade：服务单元缺失（卸载后重装）必须补装并启动服务（v3.2.40） =="
+UTMP=$(mktemp -d); mkdir -p "$UTMP/app" "$UTMP/etc"
+# 预置「已装旧版」的 panel.py：do_upgrade 的防降级检查要读它（读不到时 grep 退出码 2 会被 set -e 杀掉）
+echo 'CURRENT_VERSION = "2.1.33"' > "$UTMP/app/panel.py"
+head -n -1 "$SCRIPT" \
+    | sed -e "s|^readonly APP_DIR=\"/usr/local/lib/fwpanel\"|readonly APP_DIR=\"$UTMP/app\"|" \
+          -e "s|^readonly ETC_DIR=\"/etc/fwpanel\"|readonly ETC_DIR=\"$UTMP/etc\"|" \
+          -e "s|^readonly LOG_FILE=\"/var/log/fwpanel-install.log\"|readonly LOG_FILE=\"$UTMP/install.log\"|" \
+          -e "s|^readonly SERVICE_NAME=\"fwpanel.service\"|readonly SERVICE_NAME=\"fwpanel_utest.service\"|" \
+    > "$UTMP/install.sh"
+cat > "$UTMP/inner1.sh" <<'UGI1'
+source @UTMP@/install.sh
+VERSION_TAG=""; BETA=1
+resolve_src_tag() { SRC_TAG=v9.9.9; }
+fetch_source() { printf 'CURRENT_VERSION = "9.9.9"\n' > "$1"; return 0; }
+install_shortcut() { return 0; }
+atomic_put() { mkdir -p "$(dirname "$2")"; cp "$1" "$2"; }
+atomic_put_dir() { return 0; }
+sshd() { echo 'port 42606'; }
+gen_initial_rules() { echo GEN_RULES_CALLED; }
+install_service() { echo INSTALL_SERVICE_CALLED; }
+do_upgrade
+UGI1
+sed -i "s|@UTMP@|$UTMP|g" "$UTMP/inner1.sh"
+UP_OUT=$(FW_SYSTEMD_DIR="$UTMP/sd" bash "$UTMP/inner1.sh" 2>&1 || true)
+case "$UP_OUT" in
+    *INSTALL_SERVICE_CALLED*) ok "单元缺失 → 补装服务（不再静默只喊升级完成）" ;;
+    *) bad "未补装服务: $(printf '%s' "$UP_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+# 单元存在时走 restart + 自检分支（不再用 enable --now 空操作）
+mkdir -p "$UTMP/sd"; touch "$UTMP/sd/fwpanel_utest.service"
+# 上面那条用例已把磁盘 panel.py 升到 9.9.9，这里重置成旧版本，否则防降级直接跳过
+echo 'CURRENT_VERSION = "2.1.33"' > "$UTMP/app/panel.py"
+cat > "$UTMP/inner2.sh" <<'UGI2'
+source @UTMP@/install.sh
+VERSION_TAG=""; BETA=1
+resolve_src_tag() { SRC_TAG=v9.9.9; }
+fetch_source() { printf 'CURRENT_VERSION = "9.9.9"\n' > "$1"; return 0; }
+install_shortcut() { return 0; }
+atomic_put() { mkdir -p "$(dirname "$2")"; cp "$1" "$2"; }
+atomic_put_dir() { return 0; }
+install_service() { echo INSTALL_SERVICE_UNEXPECTED; }
+start_panel_service() { echo START_CALLED; return 0; }
+verify_panel_http() { echo VERIFY_CALLED; return 0; }
+do_upgrade
+UGI2
+sed -i "s|@UTMP@|$UTMP|g" "$UTMP/inner2.sh"
+UP2_OUT=$(FW_SYSTEMD_DIR="$UTMP/sd" bash "$UTMP/inner2.sh" 2>&1 || true)
+case "$UP2_OUT" in
+    *START_CALLED*) ok "单元存在 → 显式 restart + 回读自检（替代 enable --now）" ;;
+    *) bad "未走 restart 分支: $(printf '%s' "$UP2_OUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+rm -rf "$UTMP"
 
 echo "== 前端行为测试（node；机器上没有 node 就跳过） =="
 NODE_BIN="$(command -v node || command -v /home/saxon/.local/bin/node || true)"

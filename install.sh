@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.39"
+readonly SCRIPT_VERSION="3.2.40"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -30,6 +30,8 @@ readonly LOG_FILE="/var/log/fwpanel-install.log"
 readonly APP_DIR="/usr/local/lib/fwpanel"
 readonly ETC_DIR="/etc/fwpanel"
 readonly SERVICE_NAME="fwpanel.service"
+# systemd 单元目录（可用 FW_SYSTEMD_DIR 覆盖——测试/沙箱里不希望真写 /etc）
+readonly SYSTEMD_DIR="${FW_SYSTEMD_DIR:-/etc/systemd/system}"
 readonly MIN_DEBIAN_VERSION=11
 readonly SUPPORTED_DISTROS="debian ubuntu arch fedora centos rocky alma rhel manjaro endeavouros"
 
@@ -163,14 +165,17 @@ check_tools() {
 }
 
 check_existing() {
-    if [ -f "$APP_DIR/panel.py" ] || systemctl list-unit-files 2>/dev/null | grep -q "$SERVICE_NAME"; then
+    # ⚠ v3.2.40：/etc/fwpanel/config.json 存在也算「已安装」——卸载保留配置后再重装，
+    # 旧逻辑只看程序文件与 service 单元，会误判为「首次安装」：重新随机端口、重问账号密码、
+    # 覆盖 config.json，装完给出的地址与实际监听的进程对不上（阿基雷机实测）
+    if [ -f "$APP_DIR/panel.py" ] || [ -f "$ETC_DIR/config.json" ] || systemctl list-unit-files 2>/dev/null | grep -q "$SERVICE_NAME"; then
         if [ "${1:-}" = "check" ]; then
             log_warn "检测到 fwpanel 已安装（体检模式跳过安装）。"
             log_info "重跑安装脚本可升级到最新正式版: curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash"
             log_info "想尝鲜测试版请在命令后加 --beta"
             exit 0
         fi
-        log_info "检测到 fwpanel 已安装，执行升级（保留配置/规则/代理）..."
+        log_info "检测到 fwpanel 已安装，执行升级/重装（保留面板端口、账号、规则与代理）..."
         do_upgrade
         exit 0
     fi
@@ -266,14 +271,31 @@ do_upgrade() {
         cp "$bak" "$APP_DIR/panel.py" 2>/dev/null
         exit 1
     fi
-    # 重启服务（尝试常见服务名，兼容旧版安装的命名差异）
-    if systemctl restart fwpanel 2>/dev/null || systemctl restart fwpanel.service 2>/dev/null; then
-        log_info "服务已重启: fwpanel"
-    else
-        log_warn "未能自动重启面板服务，请手动执行: systemctl restart fwpanel"
-        log_warn "（若服务名不同，可先查看: systemctl list-unit-files | grep -i fw）"
+    # 服务单元可能不存在（卸载保留配置后再重装、或旧版安装方式）→ 按当前配置补装并启动
+    if [ ! -f "$SYSTEMD_DIR/$SERVICE_NAME" ]; then
+        log_info "未找到 systemd 服务单元，按现有配置补装服务..."
+        local _sshp _panelp
+        _sshp="$({ sshd -T 2>/dev/null || true; } | awk '/^port /{print $2; exit}' || true)"
+        [[ "$_sshp" =~ ^[0-9]{1,5}$ ]] || _sshp=22
+        _panelp="$(cfg_field port)"
+        if [[ "$_panelp" =~ ^[0-9]{1,5}$ ]]; then
+            gen_initial_rules "$_sshp" "$_panelp" "$ETC_DIR/rules.json"
+        fi
+        install_service
+        log_info "升级完成 ✓ 配置/规则已保留；页面请强制刷新（Ctrl+F5）"
+        _print_panel_url
+        return 0
     fi
+    # 重启服务（v3.2.40：显式 restart + 回读校验，取代旧版只看 restart 返回码的逻辑；
+    # 旧逻辑对「服务原本就在跑」的情况可能重启不生效，升级后仍是旧代码）
+    if ! start_panel_service; then
+        log_error "服务未启动成功，请检查: journalctl -u $SERVICE_NAME -n 50 --no-pager"
+        exit 1
+    fi
+    verify_panel_http || true
+    log_info "服务已重启（v$(installed_panel_version)）"
     log_info "升级完成 ✓ 配置/规则已保留；页面请强制刷新（Ctrl+F5）"
+    _print_panel_url
 }
 
 do_check() {
@@ -377,6 +399,107 @@ gen_user() {
 
 port_in_use() {
     ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}$"
+}
+
+# ------------------ 面板进程/服务：状态判定与彻底停止（v3.2.40） ------------------
+# 安装/升级/卸载都必须能确认「面板进程是否真的在跑、端口是否真的在听」。
+# 旧版只看 systemctl 的返回码与 is-active：遇到孤儿进程（systemd 已不跟踪、进程还活着）
+# 就会误判——卸载「成功」却留着进程占端口，安装「成功」却没人监听新端口，
+# 于是重装后安装脚本打印的地址打不开（2026-09-17 阿基雷机实测）。
+# 注意：全部用 if 判断，不用 `A && B`（set -e 下判定失败会直接退出脚本）。
+
+panel_pids() {   # 运行中的面板进程 PID（按面板程序路径匹配，含 systemd 之外的孤儿进程）
+    if command -v pgrep >/dev/null 2>&1; then
+        pgrep -f "$APP_DIR/panel.py" 2>/dev/null || true
+    else
+        ps -eo pid,args 2>/dev/null | grep -F "$APP_DIR/panel.py" | grep -v grep | awk '{print $1}' || true
+    fi
+}
+
+port_listening() {   # $1=端口 → 0 = 本机有进程在 LISTEN
+    if [ -z "${1:-}" ]; then
+        return 1
+    fi
+    ss -tlnH 2>/dev/null | awk '{print $4}' | grep -qE "[:.]${1}$"
+}
+
+panel_http_ok() {   # $1=端口 $2=重试次数(默认15) → 0 = 本机 HTTP 返回 200
+    local port="${1:-}" tries="${2:-15}" i=0 code=""
+    if [ -z "$port" ]; then
+        return 1
+    fi
+    while [ "$i" -lt "$tries" ]; do
+        code="$(curl -s -o /dev/null -m 2 -w '%{http_code}' "http://127.0.0.1:${port}/" 2>/dev/null || true)"
+        if [ "$code" = "200" ]; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    return 1
+}
+
+stop_panel_service() {   # 彻底停止：systemd → TERM → KILL，逐级校验；返回 1 = 仍有进程
+    local pids="" i=0
+    systemctl stop "$SERVICE_NAME" 2>/dev/null || true
+    while [ "$i" -lt 10 ]; do
+        pids="$(panel_pids)"
+        if [ -z "$pids" ]; then
+            break
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    pids="$(panel_pids)"
+    if [ -n "$pids" ]; then
+        log_warn "systemd 停止未生效（孤儿进程），强制结束: $pids"
+        printf '%s\n' "$pids" | xargs -r kill 2>/dev/null || true
+        sleep 2
+    fi
+    pids="$(panel_pids)"
+    if [ -n "$pids" ]; then
+        log_warn "TERM 无效，改用 SIGKILL: $pids"
+        printf '%s\n' "$pids" | xargs -r kill -9 2>/dev/null || true
+        sleep 1
+    fi
+    pids="$(panel_pids)"
+    if [ -n "$pids" ]; then
+        log_error "面板进程无法结束（PID: $pids）——请手动执行: kill -9 $pids"
+        return 1
+    fi
+    return 0
+}
+
+start_panel_service() {   # 停旧 → restart → 等 active；返回 1 = 没起来（日志已打印）
+    local i=0
+    if [ -n "$(panel_pids)" ]; then
+        log_warn "检测到面板进程已在运行，先停止以便加载新代码/新配置..."
+        stop_panel_service || true
+    fi
+    systemctl restart "$SERVICE_NAME" >/dev/null 2>&1 || true
+    while [ "$i" -lt 20 ]; do
+        if systemctl is-active --quiet "$SERVICE_NAME"; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    log_error "服务未进入 active 状态，最近日志："
+    journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null | tail -20 || true
+    return 1
+}
+
+verify_panel_http() {   # 回读校验：config.json 里的端口必须真的能访问；返回 1 = 没通过
+    local rport=""
+    rport="$(cfg_field port)"
+    if panel_http_ok "$rport" 15; then
+        log_info "自检通过：面板正在监听 http://127.0.0.1:${rport}（本机 HTTP 200）"
+        return 0
+    fi
+    log_warn "自检未通过：端口 ${rport:-?} 本机未返回 200"
+    log_warn "  占用检查: ss -tlnp | grep ${rport:-端口}"
+    log_warn "  看日志  : journalctl -u $SERVICE_NAME -n 50 --no-pager"
+    return 1
 }
 
 resolve_params() {
@@ -966,7 +1089,7 @@ do_show_login_info() {
     [ -f "$ETC_DIR/config.json" ] || error "面板未安装，无法查看登录信息"
 
     local ip port bind user domain ans
-    ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)"
+    ip="$({ ip route get 1.1.1.1 2>/dev/null || true; } | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1 || true)"
     [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
     [ -n "$ip" ] || ip="<服务器IP>"
     port="$(cfg_field port)"
@@ -1120,7 +1243,7 @@ interactive_channel_menu() {
         echo "    ------------------------------------------------------------"
         echo "    4) 环境体检      只检查系统环境与依赖，不改动任何东西"
         echo "    5) 改用户名密码  交互式修改面板登录用户名和/或密码（回车 = 该项不改）"
-        echo "    6) 卸载          停止服务并删除程序文件（保留 /etc/fwpanel 配置与规则）"
+        echo "    6) 卸载          停止服务（含孤儿进程）+ 删程序文件（保留 /etc/fwpanel 配置与规则）"
         echo "    7) 查看登录信息  显示面板登录地址和用户名（需 root；密码不保存，只能重设）"
         echo "    8) 退出脚本      不做任何改动直接退出"
         echo "    9) 升级脚本      把 fwp 用的那份脚本更新到最新（更新完立刻用新脚本重开菜单）"
@@ -1297,16 +1420,22 @@ deploy_files() {
 }
 
 write_config() {
-    log_info "初始化配置 /etc/fwpanel ..."
+    log_info "初始化/更新配置 $ETC_DIR ..."
     mkdir -p "$ETC_DIR"
     # 由 Python 生成密码哈希，明文密码只打印一次，绝不落盘；
     # ssh_port 自动检测系统实际 SSH 端口（防锁死保护跟随真实端口，不固定 22）
-    local ssh_detected
-    ssh_detected="$(python3 - "$PANEL_USER" "$PANEL_PASS" "$PANEL_PORT" "$PANEL_BIND" <<'EOF'
+    # ⚠ v3.2.40 修复：已有 config.json 时，面板端口/账号/密码哈希/自定义字段（dns_creds 等）
+    #   一律沿用。旧版无条件重写——重装或升级后端口随机变、账号被重置、DNS 凭据丢失，
+    #   而运行中的服务未必重启，于是「安装完成给出的地址」打不开（阿基雷机实测）。
+    local cfg_out ssh_detected pass_kept
+    if [ -f "$ETC_DIR/config.json" ]; then
+        log_info "检测到已有配置：面板端口/登录账号沿用（改端口请用面板内「系统 → 面板端口」）"
+    fi
+    cfg_out="$(python3 - "$PANEL_USER" "$PANEL_PASS" "$PANEL_PORT" "$PANEL_BIND" "$ETC_DIR/config.json" <<'EOF'
 import sys, json, hashlib, secrets, os, subprocess
-user, pwd, port, bind = sys.argv[1:5]
-salt = secrets.token_hex(16)
-dk = hashlib.pbkdf2_hmac("sha256", pwd.encode(), bytes.fromhex(salt), 120_000)
+
+user, pwd, port, bind, path = sys.argv[1:6]
+
 
 def detect_ssh_port():
     try:
@@ -1318,49 +1447,144 @@ def detect_ssh_port():
         pass
     return 22
 
+
 ssh_port = detect_ssh_port()
-cfg = {
-    "username": user,
-    "password_hash": f"{salt}${dk.hex()}",
-    "port": int(port),
-    "bind": bind,
-    "mode": "strict",
-    "ssh_port": ssh_port,
-    "ssh_port_auto": True,      # 自动跟随系统 SSH 端口；面板手动设置后关闭
-}
-path = "/etc/fwpanel/config.json"
+existing = {}
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            existing = data
+    except Exception:
+        existing = {}
+
+cfg = dict(existing)          # 保留全部已有字段（dns_creds / ssh_allow_ips / firewall_enabled …）
+had_password = bool(cfg.get("password_hash"))
+if not cfg.get("username"):
+    cfg["username"] = user
+if not had_password:
+    salt = secrets.token_hex(16)
+    dk = hashlib.pbkdf2_hmac("sha256", pwd.encode(), bytes.fromhex(salt), 120_000)
+    cfg["password_hash"] = f"{salt}${dk.hex()}"
+if not cfg.get("port"):
+    cfg["port"] = int(port)
+if not cfg.get("bind"):
+    cfg["bind"] = bind
+cfg.setdefault("mode", "strict")     # 默认严格模式（v1.20.0 定稿）
+if cfg.get("ssh_port_auto", True):
+    cfg["ssh_port"] = ssh_port
+    cfg["ssh_port_auto"] = True
+else:
+    cfg["ssh_port"] = int(cfg.get("ssh_port") or ssh_port)
+
 tmp = path + ".tmp"
-with open(tmp, "w") as f:
+with open(tmp, "w", encoding="utf-8") as f:
     json.dump(cfg, f, indent=2, ensure_ascii=False)
 os.chmod(tmp, 0o600)
 os.replace(tmp, path)
 print(ssh_port)
+print(cfg["port"])
+print(cfg["username"])
+print(1 if had_password else 0)
 EOF
 )"
+    local _cfg=()
+    mapfile -t _cfg <<< "$cfg_out"
+    ssh_detected="${_cfg[0]:-22}"
+    PANEL_PORT="${_cfg[1]:-$PANEL_PORT}"
+    PANEL_USER="${_cfg[2]:-$PANEL_USER}"
+    pass_kept="${_cfg[3]:-0}"
     [[ "$ssh_detected" =~ ^[0-9]{1,5}$ ]] || ssh_detected=22
-    # 初始规则：自动放行实际 SSH 端口 + 面板端口（防锁死，装完即可访问，不覆盖已有规则）
+    if [ "$pass_kept" = "1" ]; then
+        PANEL_PASS=""     # 沿用原有密码：本次没有设密码，结尾不能打印（打印了就是假信息）
+    fi
+    # 初始规则：自动放行实际 SSH 端口 + 面板端口（防锁死，装完即可访问；幂等，不覆盖已有规则）
     gen_initial_rules "$ssh_detected" "$PANEL_PORT" "$ETC_DIR/rules.json"
 }
 
-# 生成初始放行规则：SSH 端口 + 面板端口（均 protected 不可删除，防锁死）
+# 生成/补齐初始放行规则：SSH 端口 + 面板端口（均 protected 不可删除，防锁死）
 gen_initial_rules() {
-    local ssh_port="$1" panel_port="$2" rules_file="$3"
-    [ -f "$rules_file" ] && return 0
-    local id1 id2
-    id1="$(printf '%04x%04x%04x' $((RANDOM % 65536)) $((RANDOM % 65536)) $((RANDOM % 65536)))"
-    id2="$(printf '%04x%04x%04x' $((RANDOM % 65536)) $((RANDOM % 65536)) $((RANDOM % 65536)))"
-    cat > "$rules_file" <<EOF
+    local ssh_port="$1" panel_port="$2" rules_file="$3" added=""
+    [[ "$ssh_port" =~ ^[0-9]{1,5}$ ]] || ssh_port=22
+    if ! [[ "$panel_port" =~ ^[0-9]{1,5}$ ]]; then
+        log_warn "面板端口未知（config.json 无 port 字段），跳过放行规则补齐"
+        return 0
+    fi
+    if [ ! -f "$rules_file" ]; then
+        local id1 id2
+        id1="$(printf '%04x%04x%04x' $((RANDOM % 65536)) $((RANDOM % 65536)) $((RANDOM % 65536)))"
+        id2="$(printf '%04x%04x%04x' $((RANDOM % 65536)) $((RANDOM % 65536)) $((RANDOM % 65536)))"
+        cat > "$rules_file" <<EOF
 [
   {"id": "$id1", "type": "port_allow", "proto": "tcp", "port": $ssh_port, "comment": "SSH保护(安装自动放行)", "protected": true},
   {"id": "$id2", "type": "port_allow", "proto": "tcp", "port": $panel_port, "comment": "面板端口(安装自动放行)", "protected": true}
 ]
 EOF
-    chmod 600 "$rules_file"
-    log_info "已自动放行 SSH($ssh_port) 与面板端口($panel_port)"
+        chmod 600 "$rules_file"
+        log_info "已自动放行 SSH($ssh_port) 与面板端口($panel_port)"
+        return 0
+    fi
+    # 已有 rules.json：幂等补齐（⚠ v3.2.40 修复：旧版直接 return，一旦面板端口变了
+    # ——重装、面板内改端口、换机器恢复配置——严格模式（policy drop）下面板端口没有任何
+    # 放行规则，公网会被自己的防火墙挡死，安装打印的地址自然也打不开）
+    added="$(python3 - "$rules_file" "$ssh_port" "$panel_port" <<'EOF'
+import json, os, secrets, sys
+
+path, ssh_port, panel_port = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+try:
+    with open(path, encoding="utf-8") as f:
+        rules = json.load(f)
+    if not isinstance(rules, list):
+        raise ValueError("rules.json 不是数组")
+except Exception as e:
+    bak = "%s.broken.%s" % (path, secrets.token_hex(4))
+    try:
+        os.replace(path, bak)
+        print("规则文件损坏（%s），已备份到 %s 并按初始规则重建" % (e, bak), file=sys.stderr)
+    except Exception:
+        print("规则文件损坏且备份失败（%s），按初始规则重建" % e, file=sys.stderr)
+    rules = []
+
+
+def ensure_allow(items, port, comment):
+    for r in items:
+        if not isinstance(r, dict) or r.get("type") != "port_allow":
+            continue
+        try:
+            if int(r.get("port") or 0) == port and r.get("proto") in ("tcp", "both"):
+                return False
+        except Exception:
+            continue
+    items.append({"id": secrets.token_hex(6), "type": "port_allow", "proto": "tcp",
+                  "port": port, "comment": comment, "protected": True})
+    return True
+
+
+changed = 0
+if ensure_allow(rules, ssh_port, "SSH保护(安装自动放行)"):
+    changed += 1
+if ensure_allow(rules, panel_port, "面板端口(安装自动放行)"):
+    changed += 1
+if changed:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rules, f, indent=2, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+print(changed)
+EOF
+)" || added=""
+    [[ "$added" =~ ^[0-9]+$ ]] || added=0
+    if [ "$added" != "0" ]; then
+        log_info "已补齐放行规则（SSH $ssh_port / 面板端口 $panel_port，新增 ${added} 条）"
+    else
+        log_info "放行规则已存在（SSH $ssh_port / 面板端口 $panel_port），未改动"
+    fi
 }
 
 install_service() {
-    cat > "/etc/systemd/system/$SERVICE_NAME" <<EOF
+    cat > "$SYSTEMD_DIR/$SERVICE_NAME" <<EOF
 [Unit]
 Description=fwpanel Firewall Panel (nftables)
 After=network.target
@@ -1375,15 +1599,16 @@ RestartSec=3
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now "$SERVICE_NAME" >/dev/null 2>&1
-    sleep 1
-    if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-        log_error "服务启动失败，日志如下："
-        journalctl -u "$SERVICE_NAME" -n 20 --no-pager 2>/dev/null | tail -20 || true
-        error "fwpanel 服务启动失败"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    # ⚠ v3.2.40 修复：原为 `systemctl enable --now`——服务已在运行时它是空操作，
+    # 刚部署的代码与刚写入的 config.json 都不会生效，脚本却照样打印「服务已启动」+ 新端口地址
+    # （孤儿进程仍占着旧端口 → 地址打不开）。现在显式 restart，并回读校验真实监听端口。
+    if ! start_panel_service; then
+        error "fwpanel 服务启动失败（详见上方日志）"
     fi
     log_info "服务已启动并设为开机自启（$SERVICE_NAME）"
+    verify_panel_http || true
 
     # 安装时顺带开放端口（--open-port "80,443,53/udp"）
     if [ -n "$OPEN_PORTS" ]; then
@@ -1396,31 +1621,112 @@ EOF
     fi
 }
 
+_panel_access_hint() {   # $1=面板端口 → 若有启用的反代指向它，输出该域名（公网入口）
+    local panel_port="$1"
+    [ -n "$panel_port" ] || return 0
+    [ -f "$ETC_DIR/proxies.json" ] || return 0
+    python3 - "$ETC_DIR/proxies.json" "$panel_port" <<'EOF' 2>/dev/null || true
+import json, sys
+path, port = sys.argv[1], int(sys.argv[2])
+try:
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    data = []
+for p in (data if isinstance(data, list) else []):
+    if not isinstance(p, dict) or not p.get("enabled", True):
+        continue
+    try:
+        if int(p.get("target_port") or 0) == port:
+            print(p.get("domain", ""))
+            break
+    except Exception:
+        continue
+EOF
+}
+
+_print_panel_url() {   # 升级/重装收尾打印真实地址（取自 config.json，不靠命令行变量）
+    local ip rport rbind user
+    ip="$({ ip route get 1.1.1.1 2>/dev/null || true; } | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1 || true)"
+    if [ -z "$ip" ]; then
+        ip="$({ hostname -I 2>/dev/null || true; } | awk '{print $1}' || true)"
+    fi
+    rport="$(cfg_field port)"
+    rbind="$(cfg_field bind)"
+    user="$(cfg_field username)"
+    echo "------------------------------------------------------------------"
+    if [ "$rbind" = "127.0.0.1" ]; then
+        echo "  面板地址 : http://127.0.0.1:${rport}  （仅本机；远程: ssh -L ${rport}:127.0.0.1:${rport} <用户>@${ip:-服务器IP}）"
+    else
+        echo "  面板地址 : http://${ip:-<服务器IP>}:${rport}"
+    fi
+    if panel_http_ok "$rport" 3; then
+        echo "  自检结果 : 本机 http://127.0.0.1:${rport} 返回 200 ✓"
+    else
+        echo "  自检结果 : 本机访问未返回 200 ✗（看日志: journalctl -u $SERVICE_NAME -n 50 --no-pager）"
+    fi
+    local pdomain
+    pdomain="$(_panel_access_hint "$rport")"
+    if [ -n "$pdomain" ]; then
+        echo "  公网入口 : https://${pdomain}/  （$panel_port 已被反代接管，直接用 IP:端口 访问不通是正常的）"
+    fi
+    if [ -n "$user" ]; then
+        echo "  登录用户 : ${user}（密码沿用原设置，未改动）"
+    fi
+    echo "  面板版本 : v$(installed_panel_version)"
+}
+
 print_summary() {
-    local ip pv
-    ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1)"
-    [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    local ip pv _pdomain
+    ip="$({ ip route get 1.1.1.1 2>/dev/null || true; } | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1 || true)"
+    if [ -z "$ip" ]; then
+        ip="$({ hostname -I 2>/dev/null || true; } | awk '{print $1}' || true)"
+    fi
     [ -n "$ip" ] || ip="<服务器IP>"
 
     echo ""
     echo "=================================================================="
     echo "${C_GREEN}  🎉 fwpanel2 简易VPS管理面板2.0 安装完成！${C_RESET}"
     echo "=================================================================="
-    if [ "$PANEL_BIND" = "0.0.0.0" ]; then
-        echo "  面板地址 : ${C_BOLD}http://${ip}:${PANEL_PORT}${C_RESET}"
+    # 地址一律以 config.json 为准（v3.2.40：重装/升级时端口沿用旧配置，
+    # 用命令行变量打印会和真实监听端口错位——用户按地址访问必然打不开）
+    local rport rbind
+    rport="$(cfg_field port)"
+    [[ "$rport" =~ ^[0-9]{1,5}$ ]] || rport="$PANEL_PORT"
+    rbind="$(cfg_field bind)"
+    [ -n "$rbind" ] || rbind="$PANEL_BIND"
+    if [ "$rbind" = "0.0.0.0" ]; then
+        echo "  面板地址 : ${C_BOLD}http://${ip}:${rport}${C_RESET}"
     else
-        echo "  面板地址 : ${C_BOLD}http://127.0.0.1:${PANEL_PORT}${C_RESET}  （仅本机）"
-        echo "  远程访问 : 在本机执行 ssh -L ${PANEL_PORT}:127.0.0.1:${PANEL_PORT} root@${ip}"
-        echo "             然后浏览器打开 http://127.0.0.1:${PANEL_PORT}"
+        echo "  面板地址 : ${C_BOLD}http://127.0.0.1:${rport}${C_RESET}  （仅本机）"
+        echo "  远程访问 : 在本机执行 ssh -L ${rport}:127.0.0.1:${rport} root@${ip}"
+        echo "             然后浏览器打开 http://127.0.0.1:${rport}"
+    fi
+    # 自检结论：地址必须和真实监听端口一致且本机可访问（v3.2.40 —— 不再只喊「安装完成」）
+    if panel_http_ok "$rport" 3; then
+        echo "  自检结果 : ${C_GREEN}本机 http://127.0.0.1:${rport} 返回 200 ✓${C_RESET}"
+    else
+        echo "  自检结果 : ${C_RED}本机访问未返回 200 ✗（面板可能没起来）${C_RESET}"
+        echo "             看日志: journalctl -u $SERVICE_NAME -n 50 --no-pager"
+    fi
+    _pdomain="$(_panel_access_hint "$rport")"
+    if [ -n "$_pdomain" ]; then
+        echo "  公网入口 : https://${_pdomain}/  （${rport} 已被反代接管，直接用 IP:端口 访问不通是正常的）"
     fi
     pv="$(installed_panel_version)"
     if [ -n "$pv" ]; then
         echo "  面板版本 : v$pv"
     fi
     echo "  登录用户 : ${PANEL_USER}"
-    echo "  登录密码 : ${PANEL_PASS}"
-    echo "------------------------------------------------------------------"
-    echo "  ${C_RED}⚠ 凭据仅显示这一次，不会写入任何文件，请立即记下！${C_RESET}"
+    if [ -n "$PANEL_PASS" ]; then
+        echo "  登录密码 : ${PANEL_PASS}"
+        echo "------------------------------------------------------------------"
+        echo "  ${C_RED}⚠ 凭据仅显示这一次，不会写入任何文件，请立即记下！${C_RESET}"
+    else
+        echo "  登录密码 : （沿用原有密码，本次未改动）"
+        echo "------------------------------------------------------------------"
+        echo "  重装/升级不会重置密码；忘记密码：重跑安装命令 → 菜单 5) 改用户名密码"
+    fi
     if [ -x "$WRAPPER_PATH" ]; then
         echo "  快捷入口 : 以后直接输入 ${C_BOLD}fwp${C_RESET} 打开管理菜单（改凭据 / 升级 / 体检 / 查看信息）"
     fi
@@ -1461,23 +1767,55 @@ do_uninstall() {
     echo "================== $SCRIPT_NAME 卸载模式 =================="
     check_root
     cleanup_plaintext_credentials    # 任何需要 root 的入口都顺手清掉旧版明文凭据文件（幂等）
-    if systemctl list-unit-files 2>/dev/null | grep -q "$SERVICE_NAME"; then
-        log_info "停止并禁用服务..."
-        systemctl stop "$SERVICE_NAME" 2>/dev/null || true
-        systemctl disable "$SERVICE_NAME" 2>/dev/null || true
-        rm -f "/etc/systemd/system/$SERVICE_NAME"
-        systemctl daemon-reload
+    local rport pids
+    rport="$(cfg_field port)"
+
+    log_info "停止面板服务（含孤儿进程检测）..."
+    if ! stop_panel_service; then
+        error "面板进程仍在运行，未继续卸载——请按上面提示手动结束后重试（残留进程占着端口，重装必然失败）"
     fi
+    log_info "禁用并移除 systemd 服务..."
+    systemctl disable "$SERVICE_NAME" >/dev/null 2>&1 || true
+    rm -f "$SYSTEMD_DIR/$SERVICE_NAME"
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+
     log_info "删除程序文件 $APP_DIR ..."
     rm -rf "$APP_DIR"
     if [ -e "$WRAPPER_PATH" ]; then
         rm -f "$WRAPPER_PATH"
         log_info "已删除快捷命令 $WRAPPER_PATH"
     fi
+
+    # 卸载彻底性自检：逐项确认「没有残留」，而不是只喊一句卸载完成
     echo "------------------------------------------------------------------"
-    log_warn "配置与规则位于 $ETC_DIR，删除即丢失面板账号和防火墙规则:"
-    echo "  rm -rf $ETC_DIR"
-    echo "  （若面板已添加规则，卸载前请先在面板中恢复，或手动整理 nft 规则）"
+    pids="$(panel_pids)"
+    if [ -n "$pids" ]; then
+        log_warn "仍有面板进程残留: $pids"
+    else
+        echo "  ✓ 无残留面板进程"
+    fi
+    if [ -f "$APP_DIR/panel.py" ]; then
+        log_warn "程序文件仍存在: $APP_DIR/panel.py"
+    else
+        echo "  ✓ 程序文件已删除（$APP_DIR）"
+    fi
+    if systemctl list-unit-files 2>/dev/null | grep -q "$SERVICE_NAME"; then
+        log_warn "service 单元仍存在: $SYSTEMD_DIR/$SERVICE_NAME"
+    else
+        echo "  ✓ systemd 服务已移除（$SERVICE_NAME）"
+    fi
+    if [ -n "$rport" ] && port_listening "$rport"; then
+        log_warn "端口 $rport 仍在监听——可能被其他服务占用，重装前请确认"
+    fi
+    echo "------------------------------------------------------------------"
+    log_info "以下内容按设计保留，重装会自动复用（端口/账号/规则都不变）："
+    echo "  配置与规则   : $ETC_DIR（面板端口 / 账号哈希 / 防火墙规则 / 反代与证书记录）"
+    echo "  防火墙规则表 : table inet fwpanel 仍在内核生效，重装后由面板继续管理"
+    echo ""
+    echo "  想彻底清空、装一个全新面板（账号需重新设置）："
+    echo "    sudo rm -rf $ETC_DIR"
+    echo "    sudo nft delete table inet fwpanel"
     echo "------------------------------------------------------------------"
     log_info "卸载完成"
 }

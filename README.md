@@ -305,6 +305,18 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
 curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh | sudo bash -s -- --uninstall
 ```
 
+卸载会：停止面板服务（含 systemd 之外的**孤儿进程**，逐级 TERM → SIGKILL 并逐项自检）、移除 systemd 服务单元、删除程序文件与 `fwp` 快捷命令。收尾会逐条报告「无残留进程 / 程序文件已删 / 服务单元已移除 / 端口是否仍被占用」。
+
+**默认保留配置与规则**，重装会自动复用（面板端口、登录账号、防火墙规则、反代与证书记录都不变）；想装一个全新的面板再执行：
+
+```bash
+sudo rm -rf /etc/fwpanel              # 清配置与规则（账号需重新设置）
+sudo nft delete table inet fwpanel    # 清防火墙规则（回到无规则状态，慎用）
+```
+
+重装/升级**不会**重置面板端口与密码；忘记密码：重跑安装命令 → 菜单 `5) 改用户名密码`。
+安装与升级结束都会回读 `config.json` 打印**真实**地址，并做本机 HTTP 200 自检——自检没过会直接提示查看哪条日志，不会只喊一句「安装完成」。
+
 ## 安全说明
 
 - 凭据只打印一次不落盘；忘记密码用 `--change-password` 重置

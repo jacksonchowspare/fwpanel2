@@ -3529,6 +3529,130 @@ class TestProxyEntryPorts(unittest.TestCase):
         self.assertEqual(ports.count(443), 1)
         self.assertEqual(ports.count(80), 1)
 
+    # ---------------- v3.2.40：证书文件存在但 ssl/cert_ref 都没置位（单独申请证书的路径） ----------------
+
+    def _with_cert(self, domain, ref=None):
+        """把 LE_LIVE 指向临时目录，并在其中放一张 <ref 或 domain> 的假证书"""
+        tmp = tempfile.mkdtemp(prefix="fwpanel-le-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        name = ref or domain
+        os.makedirs(os.path.join(tmp, name), exist_ok=True)
+        for f in ("fullchain.pem", "privkey.pem"):
+            with open(os.path.join(tmp, name, f), "w") as fh:
+                fh.write("x")
+        old = panel.LE_LIVE
+        panel.LE_LIVE = tmp
+        self.addCleanup(lambda: setattr(panel, "LE_LIVE", old))
+
+    def _with_config_port(self, port):
+        """把 CONFIG_FILE 指向临时配置文件（面板端口防锁死自检要用）"""
+        tmp = tempfile.mkdtemp(prefix="fwpanel-cfg-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "config.json")
+        with open(path, "w") as f:
+            json.dump({"port": port}, f)
+        old = panel.CONFIG_FILE
+        panel.CONFIG_FILE = path
+        self.addCleanup(lambda: setattr(panel, "CONFIG_FILE", old))
+
+    def _fake_nginx(self, available=True, active=True):
+        oa, oc = panel.nginx_available, panel.nginx_active
+        panel.nginx_available = lambda: available
+        panel.nginx_active = lambda: active
+
+        def _restore():
+            panel.nginx_available, panel.nginx_active = oa, oc
+
+        self.addCleanup(_restore)
+
+    def test_cert_file_without_ssl_flag_gets_443(self):
+        """v3.2.40 真机实测的漏网路径：反代 ssl:false + cert_ref 空，但域名证书已单独签发。
+
+        render_proxy_conf（看证书文件）会让 nginx 监听 443 + 301 跳转，防火墙却只按
+        ssl/cert_ref 字段放行了 80 → 严格模式（policy drop）下公网 https 被自己挡死：
+        浏览器 80 收到 301 → 443 超时一直转圈、面板彻底进不去（2026-09-17 阿基雷机实测）
+        """
+        p = self._proxy()          # ssl False, cert_ref ""
+        panel.ProxyStore._load = lambda self: [p]
+        self._with_cert(p["domain"])
+        self.assertTrue(panel.ensure_proxy_entry_ports(self.store))
+        ports = [r["port"] for r in self.store.rules if r["type"] == "port_allow"]
+        self.assertIn(443, ports, "证书已签发就必须放行 443（与 nginx 渲染口径一致）")
+        self.assertIn(80, ports)
+
+    def test_no_cert_no_443(self):
+        """证书文件不存在且 ssl/cert_ref 都空 → 仍然只放 80（别过度放行）"""
+        p = self._proxy()
+        panel.ProxyStore._load = lambda self: [p]
+        tmp = tempfile.mkdtemp(prefix="fwpanel-le-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        old = panel.LE_LIVE
+        panel.LE_LIVE = tmp
+        self.addCleanup(lambda: setattr(panel, "LE_LIVE", old))
+        panel.ensure_proxy_entry_ports(self.store)
+        ports = [r["port"] for r in self.store.rules if r["type"] == "port_allow"]
+        self.assertEqual(ports, [80])
+
+    def test_returns_changed_flag(self):
+        """返回值 = 是否有改动（启动自愈/证书签发后靠它决定要不要 apply）"""
+        p = self._proxy(cert_ref="*.example.com")
+        panel.ProxyStore._load = lambda self: [p]
+        self.assertTrue(panel.ensure_proxy_entry_ports(self.store))
+        self.assertFalse(panel.ensure_proxy_entry_ports(self.store))
+
+    def test_sync_entry_ports_after_cert_applies_nft(self):
+        """证书签发后的对齐：有改动才 apply 防火墙规则"""
+        p = self._proxy()
+        panel.ProxyStore._load = lambda self: [p]
+        self._with_cert(p["domain"])
+
+        class _Nft:
+            def __init__(self):
+                self.calls = 0
+
+            def apply(self):
+                self.calls += 1
+                return True, "ok"
+
+        nft = _Nft()
+        self.assertTrue(panel.sync_entry_ports_after_cert(self.store, nft))
+        self.assertEqual(nft.calls, 1)
+        self.assertFalse(panel.sync_entry_ports_after_cert(self.store, nft))
+        self.assertEqual(nft.calls, 1, "无改动不应重复 apply")
+
+    # ---------------- v3.2.40：面板端口防锁死自检 ----------------
+
+    def test_panel_port_deny_released_when_no_proxy_serves_it(self):
+        """面板端口被「禁止公网直连」deny 挡着，但已没有反代指向它 → 解除 deny（防锁死）"""
+        panel.ProxyStore._load = lambda self: []
+        self._with_config_port(42608)
+        self._fake_nginx(active=False)
+        self.store.rules = [
+            {"id": "d1", "type": "port_deny", "proto": "tcp", "port": 42608,
+             "comment": panel.PROXY_TARGET_DENY_COMMENT},
+            {"id": "p1", "type": "port_allow", "proto": "tcp", "port": 42608,
+             "comment": panel.PANEL_PORT_COMMENT},
+        ]
+        self.assertTrue(panel.ensure_proxy_entry_ports(self.store))
+        self.assertFalse(any(r.get("type") == "port_deny" for r in self.store.rules),
+                         "没有反代接管面板端口时必须解除 deny，否则公网只剩 SSH")
+        self.assertTrue(any(r.get("type") == "port_allow" and r["port"] == 42608
+                            for r in self.store.rules))
+
+    def test_panel_port_deny_kept_when_proxy_serves_it(self):
+        """反代确实在接管面板端口（nginx 正常）→ 保留 deny（面板只走域名，设计如此）"""
+        p = self._proxy(target_port=42608, cert_ref="*.example.com")
+        panel.ProxyStore._load = lambda self: [p]
+        self._with_config_port(42608)
+        self._fake_nginx()
+        self.store.rules = [
+            {"id": "d1", "type": "port_deny", "proto": "tcp", "port": 42608,
+             "comment": panel.PROXY_TARGET_DENY_COMMENT},
+        ]
+        panel.ensure_proxy_entry_ports(self.store)
+        self.assertTrue(any(r.get("type") == "port_deny" for r in self.store.rules),
+                        "反代在接管面板端口时 deny 要保留")
+
 
 class TestCertHttp01Port(unittest.TestCase):
     """v1.25.8：HTTP-01 证书申请自动放行 80（严格模式下防火墙不再挡死 webroot 验证）"""

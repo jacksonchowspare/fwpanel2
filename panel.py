@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.39"
+CURRENT_VERSION = "3.2.40"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -9203,6 +9203,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             else:
                 merged = saved
 
+            fw_store = self.server.store
+            fw_nft = self.server.nft
+
             def _issue_dns_work():
                 ok, msg = issue_cert_dns(domain, email, provider, merged)
                 if not ok:
@@ -9210,6 +9213,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                 store = load_cert_store()
                 store[domain] = {"email": email, "method": "dns", "provider": provider}
                 save_cert_store(store)
+                # v3.2.40：同上——证书签发后立刻对齐入口端口
+                sync_entry_ports_after_cert(fw_store, fw_nft)
                 return True, f"{domain} 证书已签发（DNS 验证）"
 
             self._run_long_task("cert/issue-dns", _issue_dns_work)
@@ -9226,6 +9231,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._send(500, {"error": msg})
             return
 
+        fw_store = self.server.store
+        fw_nft = self.server.nft
+
         def _issue_http_work():
             ok, msg = issue_cert(domain, email)
             if not ok:
@@ -9233,6 +9241,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             store = load_cert_store()
             store[domain] = {"email": email, "method": "http"}
             save_cert_store(store)
+            # v3.2.40：证书签发后立刻对齐入口端口（nginx 会上 443，防火墙必须同步放行）
+            sync_entry_ports_after_cert(fw_store, fw_nft)
             return True, f"{domain} 证书已签发"
 
         self._run_long_task("cert/issue", _issue_http_work)
@@ -9360,7 +9370,16 @@ class PanelHandler(BaseHTTPRequestHandler):
         # 旧逻辑只看 ssl 字段漏放 443，严格模式下公网 https 被防火墙挡死（伦敦新机实测）
         store = self.server.store
         changed = False
-        https_on = bool(p.get("ssl") or p.get("cert_ref"))
+        # ⚠ v3.2.40：放行判定必须与 nginx 渲染口径一致——render_proxy_conf 用 _proxy_cert()
+        # 看「证书文件是否存在」决定要不要监听 443（与 ssl 字段无关）。只按 ssl/cert_ref 判断，
+        # 就会在「先建 http 反代 → 再单独申请证书」这条路径上漏放 443：
+        # nginx 已上 443 + 301 跳转、防火墙没放 443，严格模式（policy drop）下公网 https
+        # 被自己挡死（2026-09-17 阿基雷机实测：浏览器 80 收到 301 → 443 超时一直转圈）
+        try:
+            cert_on = _proxy_cert(p["domain"], p.get("cert_ref"))[0]
+        except Exception:
+            cert_on = False
+        https_on = bool(p.get("ssl") or p.get("cert_ref")) or cert_on
         for entry_port in ([443, 80] if https_on else [80]):
             entry_comment = "反代:HTTPS" if entry_port == 443 else "反代:HTTP"
             if not any(r.get("type") == "port_allow" and r.get("port") == entry_port
@@ -9404,6 +9423,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             ok, msg = apply_proxies(pstore)
             self._send(200, {"ok": True, "msg": f"代理 {p['domain']} 已{'启用' if p['enabled'] else '停用'}（{msg}）"})
         elif action == "ssl":
+            fw_store = self.server.store
+            fw_nft = self.server.nft
+
             def _ssl_work():
                 ok, msg = issue_cert(p["domain"], str(data.get("email", "")).strip())
                 if not ok:
@@ -9418,6 +9440,8 @@ class PanelHandler(BaseHTTPRequestHandler):
                     store[p["domain"]] = {"email": str(data.get("email", "")).strip(),
                                           "method": "http", "source": "proxy"}
                 save_cert_store(store)
+                # v3.2.40：证书签发后立刻对齐入口端口（nginx 会上 443，防火墙必须同步放行）
+                sync_entry_ports_after_cert(fw_store, fw_nft)
                 ok2, msg2 = apply_proxies(pstore)
                 tail = f"；{msg2}" if ok2 else f"；配置应用失败: {msg2}"
                 return True, msg + tail
@@ -9935,24 +9959,41 @@ def resume_ssh_switch_watch(store, config):
     return True
 
 
-def ensure_proxy_entry_ports(store):
-    """v1.25.7：启动时补齐反代入口端口放行（修复存量 https 反代漏放 443）。
+def _panel_config_port():
+    """读 /etc/fwpanel/config.json 的面板端口（失败返回 0，不抛异常）"""
+    try:
+        with open(CONFIG_FILE, encoding="utf-8") as f:
+            return int(json.load(f).get("port") or 0)
+    except Exception:
+        return 0
 
-    背景：v1.25.2 引入「复用证书」功能（cert_ref）后，ssl:false + cert_ref 有值的
-    反代 nginx 会监听 443，但旧版创建逻辑只看 ssl 字段，只放行了 80、漏放 443；
-    严格模式（policy drop）下公网 https 被防火墙挡死（2026-08-26 伦敦新机实测）。
-    此处幂等补齐：有证书（ssl 或 cert_ref）的反代缺 80/443 放行则补上，
-    http 反代缺 80 则补上。升级后无需手动操作，重启服务即自愈。"""
+
+def ensure_proxy_entry_ports(store):
+    """补齐反代入口端口放行，口径与 nginx 实际监听一致（返回值 = 是否有改动）。
+
+    背景：render_proxy_conf 用 _proxy_cert() 看「证书文件是否存在」决定 nginx 要不要
+    监听 443；而放行逻辑早期只看 proxies.json 的 ssl/cert_ref 字段。两者口径不一致就漏放：
+      · v1.25.7：ssl:false + cert_ref 有值 → 漏放 443（2026-08-26 伦敦机实测）
+      · v3.2.40：ssl:false + cert_ref 空，但证书已通过「单独申请 SSL 证书」签发 → 漏放 443
+    漏放的后果：nginx 上了 443 + 301 跳转，防火墙（严格模式 policy drop）却没放 443，
+    公网 https 被自己的防火墙挡死——浏览器 80 收到 301 后一直转圈，面板彻底进不去
+    （2026-09-17 阿基雷机实测）。现统一为「ssl 字段 or cert_ref 字段 or 证书文件存在」，
+    幂等补齐，重启/任意反代操作即自愈。另附面板端口防锁死自检（_release_panel_port_deny）。
+    """
+    changed = False
     try:
         pstore = ProxyStore()
     except Exception as e:
         log(f"[ensure_proxy_entry_ports] 读取代理列表失败: {e}")
-        return
-    changed = False
+        return False
     for p in pstore.proxies:
         if not p.get("enabled", True):
             continue
-        https_on = bool(p.get("ssl") or p.get("cert_ref"))
+        try:
+            cert_on = _proxy_cert(p["domain"], p.get("cert_ref"))[0]
+        except Exception:
+            cert_on = False
+        https_on = bool(p.get("ssl") or p.get("cert_ref")) or cert_on
         for entry_port in ([443, 80] if https_on else [80]):
             if any(r.get("type") == "port_allow" and r.get("port") == entry_port
                    for r in store.rules):
@@ -9961,8 +10002,77 @@ def ensure_proxy_entry_ports(store):
                        "comment": "反代:HTTPS" if entry_port == 443 else "反代:HTTP"})
             changed = True
             log(f"[ensure_proxy_entry_ports] 反代 {p['domain']} 补放行入口端口 {entry_port}")
+    if _release_panel_port_deny(pstore, store):
+        changed = True
     if changed:
         store.save()
+    return changed
+
+
+def _release_panel_port_deny(pstore, store):
+    """面板端口防锁死自检（v3.2.40）。
+
+    面板自己走反代时，创建反代会顺手加一条「反代目标端口-禁止公网直连」的 deny 指着面板端口
+    ——deny 渲染在所有 accept 之前（黑名单优先，防 SSH 被绕过），所以「严格模式自动放行面板端口」
+    那条规则实际是死的，公网只剩「反代域名」这一条路。
+    风险：反代一旦不成立（被删/停用、nginx 没装或没起来），公网就彻底进不来面板，只剩 SSH。
+    兜底：没有启用的反代指向面板端口、或 nginx 不可用/未运行 → 解除该 deny 并确保面板端口放行。
+    返回值 = 是否有改动。
+    """
+    panel_port = _panel_config_port()
+    if not panel_port:
+        return False
+    deny = None
+    for r in store.rules:
+        if r.get("type") != "port_deny" or r.get("comment") != PROXY_TARGET_DENY_COMMENT:
+            continue
+        try:
+            if int(r.get("port") or 0) == panel_port:
+                deny = r
+                break
+        except Exception:
+            continue
+    if deny is None:
+        return False
+    try:
+        serving = any(q.get("enabled", True) and int(q.get("target_port") or 0) == panel_port
+                      for q in pstore.proxies)
+    except Exception:
+        serving = False
+    try:
+        nginx_ok = nginx_available() and nginx_active()
+    except Exception:
+        nginx_ok = False
+    if serving and nginx_ok:
+        return False          # 反代确实在接管面板端口 → 保留 deny（设计如此）
+    store.remove(deny["id"])
+    log(f"[ensure_proxy_entry_ports] 反代未接管面板端口 {panel_port}"
+        f"（有反代指向它={serving} / nginx 可用={nginx_ok}），已解除「禁止公网直连」保护，"
+        f"避免公网彻底连不上面板")
+    if not any(r.get("type") == "port_allow"
+               and str(r.get("port")) == str(panel_port) for r in store.rules):
+        store.add({"type": "port_allow", "proto": "tcp", "port": panel_port,
+                   "comment": PANEL_PORT_COMMENT})
+    return True
+
+
+def sync_entry_ports_after_cert(store, nft=None):
+    """证书签发成功后的入口端口对齐（v3.2.40）。
+
+    证书一签发，nginx 立刻会给用到它的反代上 443（+80 跳转）；防火墙入口端口必须同步放行，
+    否则严格模式（policy drop）下公网 https 被自己挡死（阿基雷机实测的「转圈圈」）。
+    返回值 = 是否有改动。"""
+    try:
+        changed = ensure_proxy_entry_ports(store)
+    except Exception as e:
+        log(f"[sync_entry_ports_after_cert] 入口端口对齐失败: {e}")
+        return False
+    if changed and nft is not None:
+        try:
+            nft.apply()
+        except Exception as e:
+            log(f"[sync_entry_ports_after_cert] 应用防火墙规则失败: {e}")
+    return changed
 
 
 def main():
