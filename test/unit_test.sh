@@ -1226,6 +1226,54 @@ else
     echo "  - 跳过（未安装 node）"
 fi
 
+echo "== 收尾打印：有反代接管面板端口时也必须完整跑完（v3.2.43 修 unbound variable） =="
+# 真机踩过：_print_panel_url 里把 $rport 写成了 $panel_port → set -u 当场中断，
+# 升级虽然成功，但「登录用户 / 面板版本」没打印、脚本带错误码退出（用户日志里那行报错）
+PTMP="$(mktemp -d)"
+mkdir -p "$PTMP/etc" "$PTMP/app"
+sed -e "s|^readonly ETC_DIR=.*|readonly ETC_DIR=\"$PTMP/etc\"|" \
+    -e "s|^readonly APP_DIR=.*|readonly APP_DIR=\"$PTMP/app\"|" \
+    -e "s|^readonly LOG_FILE=.*|readonly LOG_FILE=\"$PTMP/install.log\"|" \
+    "$SCRIPT" | head -n -1 > "$PTMP/install.sh"   # 去掉末行 main 调用，只留函数定义（与既有测试同款）
+echo 'CURRENT_VERSION = "9.9.9"' > "$PTMP/app/panel.py"
+cat > "$PTMP/etc/config.json" <<'PWCFG'
+{"username":"u1","password_hash":"h","port":42608,"bind":"0.0.0.0","mode":"strict","ssh_port":42606}
+PWCFG
+cat > "$PTMP/etc/proxies.json" <<'PWPXY'
+[{"id":"p1","domain":"panel.example.com","target_host":"127.0.0.1","target_port":42608,"scheme":"http","ssl":false,"cert_ref":"","enabled":true}]
+PWPXY
+cat > "$PTMP/run.sh" <<PWRUN
+source "$PTMP/install.sh"
+_print_panel_url
+print_summary
+echo "PRINT_DONE"
+PWRUN
+POUT="$(bash "$PTMP/run.sh" 2>&1 || true)"
+case "$POUT" in
+    *PRINT_DONE*) ok "两个打印函数都跑完了（没有中途中断）" ;;
+    *) bad "打印函数中断: $(printf '%s' "$POUT" | tail -2 | tr '\n' ' ')" ;;
+esac
+case "$POUT" in
+    *"公网入口 : https://panel.example.com/"*) ok "有反代接管面板端口 → 打印出公网入口" ;;
+    *) bad "没打印公网入口: $(printf '%s' "$POUT" | tail -3 | tr '\n' ' ')" ;;
+esac
+case "$POUT" in
+    *"登录用户"*"面板版本"*) ok "收尾信息完整（登录用户 + 面板版本都打出来了）" ;;
+    *) bad "收尾信息不全（真机上就是这么丢的）" ;;
+esac
+case "$POUT" in
+    *"unbound variable"*) bad "出现 unbound variable（set -u 未定义变量）" ;;
+    *) ok "无 unbound variable" ;;
+esac
+# 反代没指向面板端口时（大多数机器）也不能报错
+rm -f "$PTMP/etc/proxies.json"
+POUT2="$(bash "$PTMP/run.sh" 2>&1 || true)"
+case "$POUT2" in
+    *PRINT_DONE*) ok "无反代接管时同样跑完（不打印公网入口）" ;;
+    *) bad "无反代时中断: $(printf '%s' "$POUT2" | tail -2 | tr '\n' ' ')" ;;
+esac
+rm -rf "$PTMP"
+
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
 rm -f "$TMPF" /tmp/install_funcs_fw.sh

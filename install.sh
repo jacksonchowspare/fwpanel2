@@ -22,7 +22,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.2.42"
+readonly SCRIPT_VERSION="3.2.43"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="/usr/local/bin/fwp"          # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -1678,7 +1678,7 @@ _print_panel_url() {   # 升级/重装收尾打印真实地址（取自 config.j
     local pdomain
     pdomain="$(_panel_access_hint "$rport")"
     if [ -n "$pdomain" ]; then
-        echo "  公网入口 : https://${pdomain}/  （$panel_port 已被反代接管，直接用 IP:端口 访问不通是正常的）"
+        echo "  公网入口 : https://${pdomain}/  （${rport} 已被反代接管，直接用 IP:端口 访问不通是正常的）"
     fi
     if [ -n "$user" ]; then
         echo "  登录用户 : ${user}（密码沿用原设置，未改动）"
