@@ -363,9 +363,24 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
 #add_rule_row { display: grid; grid-template-columns: 150px 100px 130px 1fr 170px auto; gap: 8px; align-items: center; }
 @media (max-width: 1080px) { #add_rule_row { grid-template-columns: 1fr 1fr; } }
 /* 添加代理表单：网格等分布局 */
-#add_proxy_row { display: grid; grid-template-columns: 1fr 1fr 90px 100px auto auto auto; gap: 8px; align-items: center; margin-bottom: 8px; }
+/* 添加反代表单（v3.3.6 方案A）：第一行只放地址类字段，第二行放选项与动作。
+   原来 grid 只定义 7 列却有 8 个子元素 → 「添加代理」被迫换行、还落进 1fr 列被拉成输入框那么宽；
+   WebSocket/HSTS 是 auto 列、紧贴行尾，原生复选框在深色主题下就是一粒白块 → 显得零散。 */
+#add_proxy_row { display: grid; grid-template-columns: minmax(180px, 1.6fr) minmax(160px, 1.4fr) 92px 96px minmax(200px, 1.3fr); gap: 8px; align-items: center; margin-bottom: 8px; }
 #add_proxy_row input, #add_proxy_row select { width: 100%; box-sizing: border-box; }
+#add_proxy_opts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+#add_proxy_opts .btn { width: 120px; flex: none; margin-left: auto; }
+/* 选项胶囊：带描边与输入框底色，勾选后整体高亮（勾选框自绘，避免深色主题下的原生白块） */
+.opt-chip { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border: 1px solid var(--border); border-radius: 999px; background: var(--input-bg); color: var(--muted); font-size: 12px; line-height: 1.2; cursor: pointer; user-select: none; transition: border-color .15s ease, color .15s ease, box-shadow .15s ease; }
+.opt-chip:hover { border-color: var(--accent); color: var(--text); }
+.opt-chip input { color: inherit; appearance: none; -webkit-appearance: none; width: 14px; height: 14px; margin: 0; flex: none; border: 1.5px solid currentColor; border-radius: 4px; background: transparent; position: relative; cursor: pointer; transition: background .15s ease, border-color .15s ease; }
+.opt-chip input:checked { background: var(--accent2); border-color: var(--accent2); }
+.opt-chip input:checked::after { content: ""; position: absolute; left: 3.5px; top: 0.5px; width: 4px; height: 8px; border: solid #fff; border-width: 0 2px 2px 0; transform: rotate(45deg); }
+.opt-chip input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+/* 勾选态高亮：:has() 为主，同时保留 JS 打的 .on 类兜底 */
+.opt-chip.on, .opt-chip:has(input:checked) { border-color: var(--accent2); color: var(--accent2); }
 @media (max-width: 1080px) { #add_proxy_row { grid-template-columns: 1fr 1fr; } }
+@media (max-width: 760px) { #add_proxy_row { grid-template-columns: 1fr; } #add_proxy_opts .btn { width: 100%; margin-left: 0; } }
 .panel h2 { display: flex; align-items: center; font-size: 15px; font-weight: 600; margin-bottom: 12px; }
 /* 单色标题图标（stroke 风格，跟随文字颜色） */
 .h-ico { width: 16px; height: 16px; vertical-align: -3px; margin-right: 6px; flex: none; }
@@ -1007,8 +1022,10 @@ window.addEventListener("error", function (ev) {
         <input id="px_port" placeholder="端口" inputmode="numeric">
         <select id="px_scheme"><option value="http">http</option><option value="https">https</option></select>
         <select id="px_cert" title="选择已申请的证书复用（泛域名也可），或自动申请"><option value="">自动申请</option></select>
-        <label style="display:flex;align-items:center;gap:4px;justify-self:center;font-size:12px;color:var(--muted);cursor:pointer"><input type="checkbox" id="px_ws"> WebSocket</label>
-        <label style="display:flex;align-items:center;gap:4px;justify-self:center;font-size:12px;color:var(--muted);cursor:pointer" title="HTTP Strict Transport Security：强制浏览器 HTTPS 访问（仅 HTTPS 代理生效）"><input type="checkbox" id="px_hsts"> HSTS</label>
+      </div>
+      <div id="add_proxy_opts">
+        <label class="opt-chip" title="保持 WebSocket 长连接（聊天/推送类应用需要）"><input type="checkbox" id="px_ws" onchange="optChipSync(this)">WebSocket</label>
+        <label class="opt-chip" title="HTTP Strict Transport Security：强制浏览器 HTTPS 访问（仅 HTTPS 代理生效）"><input type="checkbox" id="px_hsts" onchange="optChipSync(this)">HSTS</label>
         <button class="btn" onclick="addProxy()">添加代理</button>
       </div>
       <div style="color:var(--muted);font-size:12px;margin-bottom:12px">自动放行 443、自动禁止公网直连目标端口（80 需自行放行，证书申请需要）</div>
@@ -2235,7 +2252,7 @@ async function bootLoad() {
   netBanner("面板无响应，可能正在重启或升级。恢复后点右侧按钮即可（不需要清理浏览器缓存）");
 }
 function showLogin() { window.__FW_UI_READY__ = true; closeAllFloating(); fedUiReset(); $("login").classList.remove("hidden"); $("main").classList.add("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "inline-block"; }
-function showMain()  { window.__FW_UI_READY__ = true; $("login").classList.add("hidden"); $("main").classList.remove("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "none"; }
+function showMain()  { window.__FW_UI_READY__ = true; optChipInit(); $("login").classList.add("hidden"); $("main").classList.remove("hidden"); const f = $("btn_theme_fab"); if (f) f.style.display = "none"; }
 async function login() {
   try {
     const d = await api("POST", "/api/login", { username: $("lg_user").value, password: $("lg_pass").value });
@@ -5038,6 +5055,13 @@ async function installNginx() {
     }).catch(e => { toast(e.message, "err"); if (btn) { btn.disabled = false; btn.textContent = old; } });
   }, "⚙️ 安装确认");
 }
+// v3.3.6：选项胶囊的勾选高亮（:has() 之外再打一个 .on 类，老内核也能亮）
+function optChipSync(el) {
+  const lab = el && el.closest ? el.closest(".opt-chip") : null;
+  if (lab) lab.classList.toggle("on", !!el.checked);
+}
+function optChipInit() { document.querySelectorAll(".opt-chip input").forEach(i => optChipSync(i)); }
+
 async function addProxy() {
   try {
     const d = await api("POST", "/api/proxy", {

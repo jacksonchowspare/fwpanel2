@@ -7683,6 +7683,85 @@ class TestUiViewportGuard(unittest.TestCase):
             self.fail("未限高的 <pre>（行内与 CSS 都没有 max-height）：" + tag[:120])
 
 
+class TestAddProxyFormLayout(unittest.TestCase):
+    """添加反代表单（v3.3.6 方案A）：地址类一行 + 选项/动作一行 + 勾选胶囊化"""
+
+    def setUp(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "static", "index.html"), encoding="utf-8") as f:
+            self.html = f.read()
+
+    def _grid_tracks(self, selector):
+        """数出某个选择器 grid-template-columns 的轨道数（minmax(a, b) 里的逗号不算分隔）"""
+        m = re.search(re.escape(selector) + r"\s*\{[^}]*grid-template-columns\s*:\s*([^;]+);", self.html)
+        self.assertIsNotNone(m, "%s 没有 grid-template-columns" % selector)
+        val, depth, tracks, cur = m.group(1), 0, 0, False
+        for ch in val:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+            if ch.isspace():
+                if cur and depth == 0:
+                    tracks += 1
+                    cur = False
+                continue
+            cur = True
+        if cur:
+            tracks += 1
+        return tracks
+
+    def _child_count(self, div_id):
+        """数出该 div 的顶层子元素个数"""
+        m = re.search(r'<div id="%s">(.*?)\n      </div>' % div_id, self.html, re.S)
+        self.assertIsNotNone(m, "找不到 #%s 的内容" % div_id)
+        return len(re.findall(r"<input |<select |<label ", m.group(1)))
+
+    def test_grid_tracks_match_children(self):
+        """根因守卫：grid 定义的列数必须等于子元素数量
+
+        v3.3.6 的 bug 正是这里：只定义 7 列却有 8 个子元素 → 「添加代理」被挤到第二行，
+        还落进 1fr 列被拉成输入框那么宽（用户截图："按钮很突兀地单独一行"）。
+        """
+        tracks = self._grid_tracks("#add_proxy_row")
+        kids = self._child_count("add_proxy_row")
+        self.assertEqual(tracks, kids,
+                         "地址行 grid 列数(%d) 与子元素数(%d) 不一致 —— 多出来的元素会换行并被拉宽" % (tracks, kids))
+        self.assertIn("minmax(180px, 1.6fr)", self.html, "域名列应有合理最小宽度")
+
+    def test_options_row_holds_chips_and_button(self):
+        """选项与按钮独立成行：胶囊靠左、按钮定宽靠右"""
+        self.assertIn('<div id="add_proxy_opts">', self.html, "缺少选项行容器")
+        self.assertIn("#add_proxy_opts { display: flex; align-items: center; gap: 8px; flex-wrap: wrap;", self.html)
+        self.assertIn("#add_proxy_opts .btn { width: 120px; flex: none; margin-left: auto; }", self.html,
+                      "按钮必须定宽且靠右（否则会像 1fr 列那样被拉宽）")
+
+    def test_option_chips_styled_and_wired(self):
+        """胶囊：自绘勾选框 + 勾选态高亮 + onchange/启动初始化都接上"""
+        self.assertIn(".opt-chip { display: inline-flex;", self.html)
+        self.assertIn("appearance: none", self.html, "原生复选框在深色主题下是一粒白块，必须自绘")
+        self.assertIn(".opt-chip.on, .opt-chip:has(input:checked) { border-color: var(--accent2); color: var(--accent2); }",
+                      self.html, "勾选态高亮规则缺失（:has 为主 + .on 兜底）")
+        self.assertIn(".opt-chip input:checked { background: var(--accent2); border-color: var(--accent2); }", self.html)
+        self.assertEqual(self.html.count('onchange="optChipSync(this)"'), 2, "两枚胶囊都要挂 optChipSync")
+        self.assertIn("function optChipSync(el) {", self.html)
+        self.assertIn("optChipInit();", self.html, "启动时必须初始化一次（预置勾选态）")
+        self.assertIn("showMain()  { window.__FW_UI_READY__ = true; optChipInit();", self.html)
+
+    def test_narrow_screen_fallbacks(self):
+        """窄屏降级：1080px 以下两列、760px 以下单列且按钮占满"""
+        self.assertIn("@media (max-width: 1080px) { #add_proxy_row { grid-template-columns: 1fr 1fr; } }", self.html)
+        self.assertIn("@media (max-width: 760px) { #add_proxy_row { grid-template-columns: 1fr; }", self.html)
+        self.assertIn("#add_proxy_opts .btn { width: 100%; margin-left: 0; }", self.html)
+
+    def test_ids_unchanged_for_js(self):
+        """addProxy() 按 id 取值 —— 重排 DOM 后这些 id 一个都不能少"""
+        for i in ("px_domain", "px_host", "px_port", "px_scheme", "px_cert", "px_ws", "px_hsts"):
+            self.assertIn('id="%s"' % i, self.html, "缺少 %s（addProxy 靠它取值）" % i)
+        self.assertIn('websocket: $("px_ws").checked', self.html)
+        self.assertIn('hsts: $("px_hsts").checked', self.html)
+
+
 class TestProxyCertTabWiring(unittest.TestCase):
     """反代证书页：证书列表操作列对齐 + 安装依赖后状态自动刷新"""
 
