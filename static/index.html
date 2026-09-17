@@ -1019,7 +1019,7 @@ window.addEventListener("error", function (ev) {
       </div>
       <div class="table-wrap">
       <table>
-        <thead><tr><th>域名</th><th>目标</th><th>SSL 证书</th><th>功能</th><th>状态</th><th>操作</th></tr></thead>
+        <thead><tr><th>域名</th><th>目标</th><th style="min-width:200px">SSL 证书</th><th>功能</th><th>状态</th><th style="text-align:right;width:1px;white-space:nowrap">操作</th></tr></thead>
         <tbody id="proxy_rows"><tr><td colspan="6" style="color:var(--muted)">暂无代理</td></tr></tbody>
       </table>
       </div>
@@ -4979,10 +4979,27 @@ async function loadProxy() {
         ? (p.cert_expiry ? `有效至 ${new Date(p.cert_expiry * 1000).toLocaleDateString()}` : "已签发")
         : (p.ssl ? "未签发" : "未申请");
       const certRefTag = p.cert_ref ? `<span style="color:#4da3ff;font-size:11px;margin-right:6px">使用证书 ${p.cert_ref}</span>` : "";
-      const certCell = p.cert_exists
-        ? `${certRefTag}${cert} <span style="display:inline-flex;gap:6px;margin-left:8px;vertical-align:middle"><button class="btn mini ghost" onclick="renewCert('${p.id}')">手动续期</button><button class="btn mini ghost" onclick="showCertPaths('${p.id}')">显示路径</button></span>`
-        : (p.cert_ref ? `${certRefTag}<span style="color:var(--danger)">⚠ 证书缺失</span> <button class="btn mini ghost" onclick="editProxy('${p.id}')">更换</button>`
-           : (p.ssl ? "未签发" : `<button class="btn mini" onclick="issueSsl('${p.id}')">申请证书</button>`));
+      // v3.3.5：文本与按钮分成两段渲染（文本可伸缩 + 按钮钉在列右边缘），
+      // 否则按钮跟在变长文本后面 → 每行位置都不同（用户反馈：看着乱、还会顶到「功能」列）
+      let certText = "", certBtns = "";
+      if (p.cert_exists) {
+        certText = `${certRefTag}${cert}`;
+        certBtns = `<button class="btn mini ghost" onclick="renewCert('${p.id}')">手动续期</button>`
+                 + `<button class="btn mini ghost" onclick="showCertPaths('${p.id}')">显示路径</button>`;
+      } else if (p.cert_ref) {
+        certText = `${certRefTag}<span style="color:var(--danger)">⚠ 证书缺失</span>`;
+        certBtns = `<button class="btn mini ghost" onclick="editProxy('${p.id}')">更换</button>`;
+      } else if (p.ssl) {
+        certText = "未签发";
+      } else {
+        certBtns = `<button class="btn mini" onclick="issueSsl('${p.id}')">申请证书</button>`;
+      }
+      // 窄窗口下文本会用省略号截断 → 加 title 让鼠标悬停能看全
+      const certTitle = (p.cert_ref ? "使用证书 " + p.cert_ref + " " : "") + cert;
+      const certCell = `<div style="display:flex;align-items:center;gap:10px">`
+        + `<span title="${certTitle}" style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${certText}</span>`
+        + (certBtns ? `<span style="flex:0 0 auto;display:inline-flex;gap:6px">${certBtns}</span>` : "")
+        + `</div>`;
       const ipBtn = p.block_ip
         ? `<button class="btn mini" style="background:var(--accent2)" onclick="toggleBlockIp('${p.id}', false)">禁止IP访问中</button>`
         : `<button class="btn mini ghost" onclick="toggleBlockIp('${p.id}', true)">禁止IP+端口访问</button>`;
@@ -4991,7 +5008,7 @@ async function loadProxy() {
         <td style="color:var(--muted);font-size:12px">${certCell}</td>
         <td style="font-size:12px">${feats}</td>
         <td><label class="switch"><input type="checkbox" ${p.enabled ? "checked" : ""} onchange="toggleProxy('${p.id}', this.checked)"><span class="slider"></span></label></td>
-        <td>${ipBtn}<button class="btn mini" style="background:var(--accent)" onclick="editProxy('${p.id}')">编辑</button><button class="btn mini danger" onclick="delProxy('${p.id}')">删除</button></td>`;
+        <td style="text-align:right;white-space:nowrap"><span style="display:inline-flex;gap:6px;justify-content:flex-end;align-items:center">${ipBtn}<button class="btn mini" style="background:var(--accent)" onclick="editProxy('${p.id}')">编辑</button><button class="btn mini danger" onclick="delProxy('${p.id}')">删除</button></span></td>`;
       tbody.appendChild(tr);
     }
     const pager = $("px_pager");

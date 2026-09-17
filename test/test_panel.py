@@ -7710,6 +7710,24 @@ class TestProxyCertTabWiring(unittest.TestCase):
         self.assertIn("loadProxy()", body)
         self.assertIn("loadCerts()", body, "装完必须刷新证书段状态")
 
+    def test_proxy_cert_cell_two_part_layout(self):
+        """代理列表「SSL 证书」列必须是「文本可伸缩 + 按钮钉右」两段结构
+
+        v3.3.5：按钮原本跟在变长文本后面 → 每行位置都不同、还会顶到「功能」列（用户实测反馈）。
+        真浏览器复刻页实测（1680px 宽）：两行「手动续期」按钮左边缘都是 892px ✓，且不越过证书列右边界。
+        """
+        self.assertIn("display:flex;align-items:center;gap:10px", self.html, "证书单元格应为 flex 两段")
+        self.assertIn("flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap", self.html,
+                      "证书文本必须可伸缩并在窄窗口下省略号截断")
+        self.assertIn("flex:0 0 auto;display:inline-flex;gap:6px", self.html, "按钮组必须钉在列右侧不参与伸缩")
+        self.assertIn("title=\"${certTitle}\"", self.html, "被截断时要有悬浮提示")
+
+    def test_proxy_ops_column_right_aligned(self):
+        """代理列表「操作」列右对齐（与「已申请证书」表一致）"""
+        self.assertEqual(self.html.count('<th style="text-align:right;width:1px;white-space:nowrap">操作</th>'), 2,
+                         "两张表的操作列表头都应右对齐并按内容收缩")
+        self.assertIn("display:inline-flex;gap:6px;justify-content:flex-end;align-items:center", self.html)
+
     def test_renew_and_paths_handlers_exist(self):
         for fn in ("renewCertSolo", "showCertPathsSolo", "renewCert", "showCertPaths"):
             self.assertIn("function " + fn + "(", self.html)
