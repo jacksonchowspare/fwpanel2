@@ -1978,7 +1978,7 @@ function bkTable(items) {
     return '<tr>' +
       '<td style="white-space:nowrap">' + new Date(it.time * 1000).toLocaleString() +
         (it.pre_restore ? ' <span class="tag">快照</span>' : '') + '</td>' +
-      '<td><span style="cursor:pointer;color:var(--accent2)" onclick="bkDownload(' + qjs(it.name) + ')">' + esc(it.name) + '</span></td>' +
+      '<td><span style="cursor:pointer;color:var(--accent2)" onclick="bkDownload(' + attrEsc(qjs(it.name)) + ')">' + esc(it.name) + '</span></td>' +
       '<td style="white-space:nowrap">' + bkFmt(it.size) + '</td>' +
       '<td style="white-space:nowrap">' + esc(it.hostname || "-") + (it.panel_version ? " · v" + esc(it.panel_version) : '') + '</td>' +
       '<td style="font-size:12px;color:var(--muted)">' + esc(mods || "-") + (it.note ? ' ｜ ' + esc(it.note) : '') + '</td>' +
@@ -4061,7 +4061,7 @@ async function sysPanelPortSave() {
 
 /* ---------- 应用（一键部署，v3.1.0） ---------- */
 let appTpls = [], appList = [], appsLoaded = false, appMem = {};
-let appw = { step: 0, tpl: "", port: null, domain: "", expose: false, name: "", upload: 32,
+let appw = { failed: false, step: 0, tpl: "", port: null, domain: "", expose: false, name: "", upload: 32,
              imgMain: "", imgDb: "", task: "", result: null, checking: false };
 
 async function loadApps() {
@@ -4160,7 +4160,8 @@ function appOpen(url) { if (url) window.open(url, "_blank"); }
 function openAppWizard() {
   if (!appTpls.length) { toast("应用模板未加载，请先刷新", "err"); return; }
   appw = { step: 0, tpl: appTpls[0].id, port: null, domain: "", expose: false, name: "",
-           upload: 32, imgMain: "", imgDb: "", task: "", result: null, checking: false };
+           upload: 32, imgMain: "", imgDb: "", task: "", result: null, checking: false,
+           failed: false };
   const t = appTpls[0];
   appw.port = t.default_port; appw.upload = t.upload_mb || 32;
   $("appw_modal").classList.remove("hidden");
@@ -4185,9 +4186,23 @@ function appwDots() {
   [...document.querySelectorAll("#appw_dots .wz-dot")].forEach((d, i) => {
     d.classList.toggle("active", i <= appw.step);
   });
-  $("appw_back").style.display = appw.step === 1 ? "" : "none";
-  $("appw_next").style.display = (appw.step === 0 || appw.step === 1) ? "" : "none";
-  $("appw_next").textContent = appw.step === 1 ? "开始部署" : "下一步";
+  // ⚠ v3.3.1：按钮的文案与行为必须每帧从状态重算。
+  // 旧实现用 setAttribute("onclick","appDeploy()") 就地改写「下一步」，关掉向导再打开也不还原
+  // → 用户实测：重新打开后随便点一下，就按上次残留的模板直接开始部署（而且模板选不中，永远 WordPress）
+  const nx = $("appw_next"), bk = $("appw_back");
+  if (nx) {
+    nx.setAttribute("onclick", "appwStep(1)");
+    nx.textContent = appw.step === 2
+      ? (appw.failed ? "重试" : "部署中…")
+      : (appw.step === 1 ? "开始部署" : (appw.step === 3 ? "完成" : "下一步"));
+    const busy = appw.step === 2 && !appw.failed;
+    nx.disabled = busy;
+    nx.style.display = busy ? "none" : "";
+  }
+  if (bk) {
+    bk.setAttribute("onclick", "appwStep(-1)");
+    bk.style.display = appw.step === 1 ? "" : "none";
+  }
 }
 
 function appwRender() {
@@ -4197,7 +4212,7 @@ function appwRender() {
   if (appw.step === 0) {
     b.innerHTML = '<div class="form-row" style="display:block">'
       + appTpls.map(x => '<label class="wz-radio"><input type="radio" name="appw_tpl" value="' + esc(x.id) + '"'
-          + (appw.tpl === x.id ? " checked" : "") + ' onchange="appwPick(' + qjs(x.id) + ')">'
+          + (appw.tpl === x.id ? " checked" : "") + ' onchange="appwPick(' + attrEsc(qjs(x.id)) + ')">'
           + "<span><b>" + esc(x.icon + " " + x.name) + "</b>"
           + "<span>" + esc(x.desc) + "　·　默认端口 " + esc(String(x.default_port))
           + (x.require_domain ? "　·　需要域名" : "")
@@ -4263,9 +4278,8 @@ function appwRender() {
     + '<div style="color:var(--muted);font-size:12px;margin-bottom:10px">下面这些凭据<b>只显示这一次</b>，请现在复制保存。</div>'
     + rows.map(x => '<div class="form-row" style="align-items:center"><label style="min-width:120px">' + esc(x[0]) + "</label>"
         + '<code style="font-family:\'0xProto\',ui-monospace,monospace;font-size:12px;word-break:break-all">' + esc(x[1]) + "</code></div>").join("")
-    + '<div style="margin-top:12px"><button class="btn mini" onclick="appOpen(' + qjs(r.url || "") + ')">打开应用</button></div>';
-  $("appw_next").textContent = "完成";
-  $("appw_next").setAttribute("onclick", "closeAppWizard();loadApps()");
+    + '<div style="margin-top:12px">' + btnHtml("打开应用", "appOpen(" + qjs(r.url || "") + ")", "mini") + "</div>";
+  appw.failed = false;   // 文案/行为由 appwDots 统一按状态算（v3.3.1）
 }
 
 async function appwPortCheck() {
@@ -4314,6 +4328,12 @@ function appwDomainTyped() {
 function appwExposeTyped() { appw.expose = !!($("aw_expose") && $("aw_expose").checked); }
 
 function appwStep(d) {
+  // ⚠ v3.3.1：旧实现完全不用 d —— 点「上一步」也会走"校验 → 开始部署"，用户实测就是这个现象
+  if (!appw) return;
+  if (d < 0) {
+    if (appw.step === 1) { appw.step = 0; appwRender(); }   // 部署中/完成页不后退
+    return;
+  }
   if (appw.step === 0) {
     const t = appwTpl();
     appw.port = t.default_port; appw.upload = t.upload_mb || 32;
@@ -4330,7 +4350,12 @@ function appwStep(d) {
     appw.imgDb = ($("aw_img_db") ? $("aw_img_db").value || "" : "").trim();
     appw.expose = !!($("aw_expose") && $("aw_expose").checked);
     if (appwTpl().require_domain && !appw.domain) { toast("该应用必须绑定域名", "err"); return; }
+    appw.failed = false;
     appw.step = 2; appwRender(); appDeploy(); return;
+  }
+  if (appw.step === 2) {                    // 部署失败后按钮变「重试」，点它才重新部署
+    if (appw.failed) { appw.failed = false; appwRender(); appDeploy(); }
+    return;
   }
   if (appw.step === 3) { closeAppWizard(); loadApps(); }
 }
@@ -4385,9 +4410,8 @@ async function appDeploy(acceptMem) {
     $("aw_progress").innerHTML = '<span style="color:var(--danger)">部署失败：' + esc(msg) + "</span>"
       + '<div style="color:var(--muted);font-size:12px;margin-top:8px">修正后可以再点「开始部署」重试（同名目录已存在时请改端口）。</div>'
       + '<div style="margin-top:8px"><button class="btn mini ghost" onclick="appwShowLogs()">查看容器日志</button></div>';
-    $("appw_next").textContent = "重试";
-    $("appw_next").setAttribute("onclick", "appDeploy()");
-    $("appw_next").style.display = "";
+    appw.failed = true;    // 按钮文案与行为交给 appwDots 按状态重算（v3.3.1）
+    appwRender();
   }
 }
 

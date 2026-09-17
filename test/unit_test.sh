@@ -1227,7 +1227,8 @@ rm -rf "$UTMP"
 echo "== 前端行为测试（node；机器上没有 node 就跳过） =="
 NODE_BIN="$(command -v node || command -v /home/saxon/.local/bin/node || true)"
 if [ -n "$NODE_BIN" ]; then
-    for t in frontend_port_redirect_test.js frontend_bbr_ui_test.js frontend_sys_controls_test.js; do
+    for t in frontend_port_redirect_test.js frontend_bbr_ui_test.js frontend_sys_controls_test.js \
+             frontend_app_wizard_test.js test_frontend_handlers.js; do
         if out=$("$NODE_BIN" "$(dirname "$SCRIPT")/test/$t" 2>&1); then
             ok "$t 全部通过"
         else

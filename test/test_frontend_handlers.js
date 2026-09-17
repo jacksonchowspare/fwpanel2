@@ -38,7 +38,10 @@ function extractFn(name) {
 }
 
 const needed = ["esc", "qjs", "attrEsc", "btnHtml", "siteCardHtml", "sfRenderCrumb", "sfRenderRows",
-                "fmtBytes", "fmtSpeed", "fmtTime"];
+                "fmtBytes", "fmtSpeed", "fmtTime",
+                // v3.3.1：应用向导与备份表格的渲染产物也要过这道闸门
+                // （旧版只覆盖站点卡片/文件管理 → 应用向导的 onchange 引号截断与备份表格的下载链接都漏了过去）
+                "appwRender", "appwDots", "appwTpl", "bkTable", "bkFmt"];
 const chunks = [];
 const missing = [];
 for (const n of needed) {
@@ -47,11 +50,33 @@ for (const n of needed) {
 }
 // 允许缺失（旧版本没有 attrEsc/siteCardHtml），但要在报告里说明
 const sandbox = {
-  $: id => sandbox.__els[id] || (sandbox.__els[id] = { innerHTML: "", textContent: "", style: {}, classList: { add(){}, remove(){} } }),
+  $: id => sandbox.__els[id] || (sandbox.__els[id] = {
+    innerHTML: "", textContent: "", value: "", checked: false, disabled: false,
+    style: {}, attrs: {}, classList: { add() {}, remove() {}, toggle() {} },
+    setAttribute(k, v) { this.attrs[k] = String(v); },
+    getAttribute(k) { return this.attrs[k]; },
+    querySelector: () => ({ innerHTML: "" }),
+    querySelectorAll: () => [],
+    appendChild() {}, remove() {}, addEventListener() {},
+  }),
   __els: {},
   sfSite: { id: "abc123456789", domain: "demo.example.com", port: 8080 },
   sfPath: "",
+  document: { getElementById: id => sandbox.$(id), querySelectorAll: () => [], createElement: () => sandbox.$("__tmp") },
+  // v3.3.1：应用向导渲染需要的最小状态
+  appTpls: [
+    { id: "wordpress", name: "WordPress", icon: "📝", desc: "博客建站", default_port: 8080, upload_mb: 32, min_mem_mb: 900, images: { main: "wordpress:latest", db: "mariadb:11" }, notes: ["注意 A"] },
+    { id: "nextcloud", name: "Nextcloud", icon: "☁", desc: "网盘", default_port: 8081, upload_mb: 512, min_mem_mb: 1024, images: { main: "nextcloud:latest", db: "mariadb:11" } },
+    { id: "vaultwarden", name: "Vaultwarden", icon: "🔐", desc: "密码库", default_port: 8082, upload_mb: 32, min_mem_mb: 512, images: { main: "vaultwarden/server:latest" }, require_domain: true },
+  ],
+  appMem: { total_mb: 2048 },
+  appw: { failed: false, step: 0, tpl: "wordpress", port: 8080, upload: 32, domain: "", name: "", expose: false, imgMain: "", imgDb: "", result: null },
+  siteRoot: "/var/www",
+  toast: () => {},
+  // 备份表格：模块名映射要用到 bkInfo
+  bkInfo: { modules: [{ id: "config", name: "面板配置与规则" }, { id: "nginx", name: "nginx 配置" }] },
 };
+sandbox.document.getElementById = id => sandbox.$(id);
 vm.createContext(sandbox);
 vm.runInContext(chunks.join("\n"), sandbox);
 
@@ -147,6 +172,38 @@ if (typeof sandbox.sfRenderRows === "function") {
     ] });
     checkHtml("sfRenderRows", sandbox.__els["sf_rows"] ? sandbox.__els["sf_rows"].innerHTML : "");
   } catch (e) { problems.push("sfRenderRows 抛错: " + e.message); }
+}
+
+// ---------- 3b. 应用向导与备份表格（v3.3.1 纳入闸门） ----------
+if (typeof sandbox.appwRender === "function") {
+  try {
+    sandbox.appw.step = 0;
+    sandbox.appwRender();
+    checkHtml("appwRender(step0 模板列表)", sandbox.__els["appw_body"] ? sandbox.__els["appw_body"].innerHTML : "");
+    sandbox.appw.step = 4;
+    sandbox.appwRender();
+    checkHtml("appwRender(step4 完成页)", sandbox.__els["appw_body"] ? sandbox.__els["appw_body"].innerHTML : "");
+  } catch (e) {
+    problems.push("appwRender 抛错: " + e.message);
+  }
+} else {
+  problems.push("未找到 appwRender（无法验证应用向导）");
+}
+
+if (typeof sandbox.bkTable === "function") {
+  try {
+    sandbox.$("bk_table");
+    sandbox.bkTable([
+      { name: "fwpanel-host-v3.3.0-20260917-210000.tar.gz", size: 24576, time: 1758100000,
+        modules: ["config", "nginx"], hostname: "ak", panel_version: "3.3.0", note: "换机前", pre_restore: false },
+      { name: "pre-restore-fwpanel-host-20260917-205900.tar.gz", size: 20480, time: 1758099000,
+        modules: ["config"], hostname: "ak", panel_version: "3.3.0", note: "", pre_restore: true },
+    ]);
+    const tb = sandbox.__els["bk_table"] && sandbox.__els["bk_table"].querySelector("tbody");
+    checkHtml("bkTable", tb && tb.innerHTML ? tb.innerHTML : "");
+  } catch (e) {
+    problems.push("bkTable 抛错: " + e.message);
+  }
 }
 
 // ---------- 4. 结果 ----------
