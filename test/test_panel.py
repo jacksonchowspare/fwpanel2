@@ -7642,16 +7642,32 @@ class TestUiViewportGuard(unittest.TestCase):
             self.html = f.read()
 
     def test_modal_has_viewport_cap(self):
-        self.assertIn(".modal { max-height: 92vh; overflow-y: auto; }", self.html,
-                      "所有弹窗必须有视口上限，否则内容一长按钮就点不到")
+        self.assertIn(".modal { max-height: calc(92vh / var(--ui-zoom, 1)); overflow-y: auto; }", self.html,
+                      "所有弹窗必须有视口上限（且必须除以缩放系数，否则宽屏自动 zoom 下仍会超出屏幕）")
 
     def test_log_areas_are_height_capped(self):
         # 应用日志弹窗（日志本体）
-        self.assertIn("#applog_body { max-height: 50vh; overflow: auto; }", self.html)
+        self.assertIn("#applog_body { max-height: calc(50vh / var(--ui-zoom, 1)); overflow: auto; }", self.html)
         # 部署进度日志（向导第 2 步）
-        self.assertIn("max-height:26vh;overflow:auto", self.html)
+        self.assertIn("max-height:calc(26vh / var(--ui-zoom, 1));overflow:auto", self.html)
         # SSH 密钥等长文本区
-        self.assertIn("max-height:52vh", self.html)
+        self.assertIn("max-height:calc(52vh / var(--ui-zoom, 1))", self.html)
+
+    def test_zoom_factor_exposed_to_css(self):
+        """缩放系数必须写进 --ui-zoom，否则 calc(NNvh / var(--ui-zoom)) 永远是 1（等于没修）"""
+        self.assertIn('setProperty("--ui-zoom"', self.html)
+
+    def test_no_bare_viewport_units(self):
+        """禁止裸 vh/vw 尺寸：缩放元素里的 vh 会再乘一次 zoom → 宽屏/4K 下弹窗超出屏幕
+
+        v3.3.3 真机复现：3840×800 窗口 + 自动档 1.5 时，55vh 的日志区渲染成 82vh，
+        整个弹窗 825px > 屏高 800 → 上下各切一截、底部按钮点不到。
+        """
+        import re as _re
+        for m in _re.finditer(r"(?:max-|min-)?(?:width|height):\s*[\d.]+v[hw]\b", self.html):
+            before = self.html[max(0, m.start() - 10):m.start()]
+            self.assertIn("calc(", before, "发现裸 vh/vw 尺寸（必须写成 calc(NNvh / var(--ui-zoom, 1)))）：" + m.group(0))
+
 
     def test_no_uncapped_pre_blocks(self):
         """页面里每个 <pre> 都必须有限高：行内写，或存在针对该 id 的 CSS 规则（长文本容器最容易把弹窗顶长）"""

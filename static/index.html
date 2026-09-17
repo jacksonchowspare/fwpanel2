@@ -345,7 +345,7 @@ h1 .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accen
   .table-wrap table { white-space: nowrap; }
   th, td { padding: 6px 8px; font-size: 12px; }
   /* 弹窗自适应屏幕（覆盖内联固定宽度） */
-  .modal { width: calc(100vw - 24px) !important; padding: 16px; }
+  .modal { width: calc((100vw - 24px) / var(--ui-zoom, 1)) !important; padding: 16px; }
   .modal h3 { font-size: 15px; }
   /* 添加规则按钮跨整行 */
   #add_rule_row .btn { grid-column: span 2; }
@@ -520,8 +520,8 @@ tr:hover td { background: var(--panel-solid); }
 /* v3.3.2：弹窗永不超出视口 —— 「应用日志」曾因日志很长把弹窗顶高，底部关闭按钮被挤出屏幕。
    ① 弹窗最高 92vh 且自身可滚动（按钮始终可达，任何主题/视口都成立）
    ② 日志类内容另有独立限高（见 #applog_body），正常情况根本不需要滚动 */
-.modal { max-height: 92vh; overflow-y: auto; }
-#applog_body { max-height: 50vh; overflow: auto; }
+.modal { max-height: calc(92vh / var(--ui-zoom, 1)); overflow-y: auto; }
+#applog_body { max-height: calc(50vh / var(--ui-zoom, 1)); overflow: auto; }
   /* ---- Web 终端多窗口系统（v2.1.23）---- */
   #term_dock { position: fixed; left: 8px; top: 50%; transform: translateY(-50%); z-index: 46;
     display: flex; flex-direction: column; gap: 8px; }
@@ -562,7 +562,7 @@ tr:hover td { background: var(--panel-solid); }
   .tt-host { flex: 1; min-width: 0; min-height: 0; padding: 6px 8px;
     background: #11141a; overflow: hidden; position: relative; }
   .twin.maxed { left: 0 !important; top: 0 !important; }
-  .twin.maxed .twin-frame { width: 100vw !important; height: 100vh !important; border-radius: 0; }
+  .twin.maxed .twin-frame { width: calc(100vw / var(--ui-zoom, 1)) !important; height: calc(100vh / var(--ui-zoom, 1)) !important; border-radius: 0; }
   .twin-pop { position: absolute; right: 6px; top: 34px; z-index: 70; display: none;
     width: 224px; padding: 10px; background: var(--card); border: var(--bdw) solid var(--border);
     border-radius: var(--r-panel, 10px); box-shadow: var(--shadow-modal); }
@@ -965,7 +965,7 @@ window.addEventListener("error", function (ev) {
   <div id="applog_modal" class="modal-mask hidden">
     <div class="modal" style="max-width:900px">
       <h3 id="applog_title">应用日志</h3>
-      <div class="table-wrap" style="max-height:55vh;overflow:auto;background:var(--input-bg);border-radius:var(--r-sm);padding:10px">
+      <div class="table-wrap" style="max-height:calc(55vh / var(--ui-zoom, 1));overflow:auto;background:var(--input-bg);border-radius:var(--r-sm);padding:10px">
         <pre id="applog_body" style="margin:0;font-size:12px;line-height:1.5;white-space:pre-wrap;word-break:break-all"></pre>
       </div>
       <div class="btnrow" style="margin-top:14px">
@@ -1539,7 +1539,7 @@ window.addEventListener("error", function (ev) {
 <!-- 服务器节点弹窗（添加/编辑） -->
 <!-- 流量统计:自绘日期选择浮层(随缩放) -->
     <div id="tr_cal" style="display:none;position:fixed;z-index:9999;left:-9999px;top:-9999px">
-      <div id="tr_cal_box" style="width:252px;max-width:calc(100vw - 24px);background:var(--panel-solid);border:1px solid var(--hover-border);border-radius:10px;box-shadow:0 10px 36px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);padding:10px">
+      <div id="tr_cal_box" style="width:252px;max-width:calc((100vw - 24px) / var(--ui-zoom, 1));background:var(--panel-solid);border:1px solid var(--hover-border);border-radius:10px;box-shadow:0 10px 36px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.05);backdrop-filter:blur(14px);-webkit-backdrop-filter:blur(14px);padding:10px">
       <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
         <button class="btn mini ghost" onclick="trCal.month(-1)">◀</button>
         <span id="tr_cal_title" style="display:flex;align-items:center;font-size:13px;font-weight:600"></span>
@@ -1685,7 +1685,7 @@ window.addEventListener("error", function (ev) {
 <!-- 通用确认弹窗（面板风格） -->
 <!-- ===== 网站模块弹窗 ===== -->
 <div id="snew_modal" class="modal-mask hidden">
-  <div class="modal" style="max-width:580px;width:94vw">
+  <div class="modal" style="max-width:580px;width:calc(94vw / var(--ui-zoom, 1))">
     <h3>新建网站</h3>
     <div class="wz-dots" id="wz_dots"></div>
     <div id="wz_body"></div>
@@ -1698,7 +1698,7 @@ window.addEventListener("error", function (ev) {
 </div>
 
 <div id="sroot_modal" class="modal-mask hidden">
-  <div class="modal" style="max-width:520px;width:94vw">
+  <div class="modal" style="max-width:520px;width:calc(94vw / var(--ui-zoom, 1))">
     <h3>站点根目录</h3>
     <div class="form-row"><input id="sroot_input" placeholder="/var/www" style="font-family:'0xProto',ui-monospace,monospace"></div>
     <div style="color:var(--muted);font-size:12px;margin-bottom:10px">新建的静态站会放在 <code style="font-family:'0xProto',ui-monospace,monospace">&lt;根目录&gt;/&lt;域名&gt;</code>，端口站放在 <code style="font-family:'0xProto',ui-monospace,monospace">&lt;根目录&gt;/port-&lt;端口&gt;</code>。修改只影响之后新建的站点，已有网站不受影响</div>
@@ -1710,7 +1710,7 @@ window.addEventListener("error", function (ev) {
 </div>
 
 <div id="sset_modal" class="modal-mask hidden">
-  <div class="modal" style="max-width:540px;width:94vw">
+  <div class="modal" style="max-width:540px;width:calc(94vw / var(--ui-zoom, 1))">
     <h3>网站设置</h3>
     <div id="sset_body"></div>
     <div class="btnrow" style="margin-top:14px">
@@ -1721,7 +1721,7 @@ window.addEventListener("error", function (ev) {
 </div>
 
 <div id="sfile_modal" class="modal-mask hidden">
-  <div class="modal" style="max-width:900px;width:94vw">
+  <div class="modal" style="max-width:900px;width:calc(94vw / var(--ui-zoom, 1))">
     <h3 id="sf_title">文件管理</h3>
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:8px">
       <div class="sf-crumb" id="sf_crumb"></div>
@@ -1734,7 +1734,7 @@ window.addEventListener("error", function (ev) {
     </div>
     <input type="file" id="sf_upload" multiple style="display:none" onchange="sfUploadDo(this.files)">
     <div class="sf-drop" id="sf_drop">
-      <div class="table-wrap" style="max-height:50vh;overflow:auto">
+      <div class="table-wrap" style="max-height:calc(50vh / var(--ui-zoom, 1));overflow:auto">
         <table>
           <thead><tr><th>名称</th><th>大小</th><th>权限</th><th>修改时间</th><th style="width:1px;white-space:nowrap">操作</th></tr></thead>
           <tbody id="sf_rows"><tr><td colspan="5" style="color:var(--muted)">加载中...</td></tr></tbody>
@@ -1747,10 +1747,10 @@ window.addEventListener("error", function (ev) {
 </div>
 
 <div id="sedit_modal" class="modal-mask hidden">
-  <div class="modal" style="max-width:900px;width:94vw">
+  <div class="modal" style="max-width:900px;width:calc(94vw / var(--ui-zoom, 1))">
     <h3 id="se_title">编辑文件</h3>
     <div id="se_path" style="color:var(--muted);font-size:12px;margin-bottom:6px;word-break:break-all"></div>
-    <textarea id="se_text" spellcheck="false" style="width:100%;height:50vh;font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.55;resize:vertical;box-sizing:border-box"></textarea>
+    <textarea id="se_text" spellcheck="false" style="width:100%;height:calc(50vh / var(--ui-zoom, 1));font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;line-height:1.55;resize:vertical;box-sizing:border-box"></textarea>
     <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;margin-top:10px">
       <span id="se_info" style="color:var(--muted);font-size:12px"></span>
       <div style="display:flex;gap:8px">
@@ -1762,7 +1762,7 @@ window.addEventListener("error", function (ev) {
 </div>
 
 <div id="slog_modal" class="modal-mask hidden">
-  <div class="modal" style="max-width:920px;width:94vw">
+  <div class="modal" style="max-width:920px;width:calc(94vw / var(--ui-zoom, 1))">
     <h3 id="sl_title">站点日志</h3>
     <div style="display:flex;gap:6px;margin-bottom:12px">
       <button class="btn mini" id="sl_btn_log" onclick="slShow('log')">访问日志</button>
@@ -1776,7 +1776,7 @@ window.addEventListener("error", function (ev) {
         <button class="btn mini ghost" onclick="slCopy()">复制</button>
         <span id="sl_file" style="color:var(--muted);font-size:12px;word-break:break-all"></span>
       </div>
-      <pre id="sl_text" style="background:var(--input-bg);border:1px solid var(--border);border-radius:var(--r-sm);padding:10px;max-height:52vh;overflow:auto;margin:0;font-family:'0xProto',ui-monospace,monospace;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all"></pre>
+      <pre id="sl_text" style="background:var(--input-bg);border:1px solid var(--border);border-radius:var(--r-sm);padding:10px;max-height:calc(52vh / var(--ui-zoom, 1));overflow:auto;margin:0;font-family:'0xProto',ui-monospace,monospace;font-size:12px;line-height:1.6;white-space:pre-wrap;word-break:break-all"></pre>
     </div>
     <div id="sl_stat_pane" style="display:none">
       <div class="cards" style="margin-bottom:14px">
@@ -2850,6 +2850,9 @@ function applyZoomForce() {
   // 元素级缩放:只放大面板内容与自有浮层,不缩放整个 html——
   // 浏览器插件注入的浮层(如 Bitwarden)挂在页面根,不受 zoom 影响,不会错位
   document.documentElement.style.zoom = "1";
+  // v3.3.3：把缩放系数暴露给 CSS —— 缩放元素里的 vh 会再乘一次 zoom，
+  // 所以所有 vh 限高必须写成 calc(NNvh / var(--ui-zoom, 1))，否则宽屏自动缩放时弹窗仍会超出屏幕
+  document.documentElement.style.setProperty("--ui-zoom", String(z));
   const w = document.querySelector(".wrap");
   if (w) w.style.zoom = z;
   document.querySelectorAll(".modal-mask > .modal").forEach(e => { e.style.zoom = z; });
@@ -4265,7 +4268,7 @@ function appwRender() {
       + '<div id="aw_progress_meta" style="color:var(--muted);font-size:12px;margin-top:6px">'
       + '首次部署要拉取镜像（几百 MB），通常 5-20 分钟；这段时间可以直接关掉页面，稍后回来点「刷新」看结果。</div>'
       + '<div id="aw_progress_log" style="color:var(--muted);font-size:12px;margin-top:8px;white-space:pre-wrap;'
-      + 'font-family:\'0xProto\',ui-monospace,monospace;max-height:26vh;overflow:auto"></div>'
+      + 'font-family:\'0xProto\',ui-monospace,monospace;max-height:calc(26vh / var(--ui-zoom, 1));overflow:auto"></div>'
       + '<div style="margin-top:10px"><button class="btn mini ghost" onclick="appwShowLogs()">查看容器日志</button>'
       + ' <span style="color:var(--muted);font-size:12px">（容器起来了才有日志，可随时点）</span></div>';
     return;
