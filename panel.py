@@ -54,7 +54,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.2.41"
+CURRENT_VERSION = "3.2.42"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -5691,10 +5691,20 @@ def set_timezone(tz):
 
 
 NTP_VIRT_BLOCKED = ("lxc", "lxc-libvirt", "openvz", "docker", "podman", "systemd-nspawn", "wsl", "proot")
+# NTP 实现的候选单元：必须与 systemd-timedated 内部认的那份一致，漏一个就会误判
+# （Ubuntu/Debian 新镜像与 Arch 用的是 chrony.service，旧清单只有 chronyd.service → 落到"unknown"）
+NTP_UNIT_CANDIDATES = ("systemd-timesyncd.service", "chrony.service", "chronyd.service",
+                       "ntp.service", "ntpsec.service", "openntpd.service")
+# 这些是「不归 timedatectl 管」的 NTP 守护进程（timedatectl set-ntp 只驱动 systemd-timesyncd）
+NTP_OTHER_DAEMONS = ("chrony.service", "chronyd.service", "ntp.service", "ntpsec.service", "openntpd.service")
 
 
 def ntp_unit_files():
-    """系统里存在的 NTP 实现（systemd 单元名 + 状态），用来诊断 timedatectl 为什么开不起来。"""
+    """磁盘上存在的 NTP 实现（systemd 单元名 + 单元文件状态）。
+
+    ⚠ 这是**读磁盘**（list-unit-files 不需要管理器），systemd 管理器可能还没加载它 ——
+    两者不一致正是 timedatectl 回 "NTP not supported" 的常见原因（见 ntp_manager_state）。
+    """
     try:
         r = subprocess.run(["systemctl", "list-unit-files", "--no-pager", "--type=service"],
                            capture_output=True, text=True, timeout=15)
@@ -5705,17 +5715,69 @@ def ntp_unit_files():
             f = ln.split()
             if not f:
                 continue
-            if f[0] in ("systemd-timesyncd.service", "chronyd.service", "ntp.service", "ntpsec.service"):
+            if f[0] in NTP_UNIT_CANDIDATES:
                 found.append((f[0], f[1] if len(f) > 1 else ""))
         return found
     except Exception:
         return []
 
 
+def ntp_manager_state(unit):
+    """systemd **管理器**眼中的单元状态（LoadState / UnitFileState / ActiveState / FragmentPath）。
+
+    ⚠ 与 list-unit-files（读磁盘）是两回事：文件在磁盘上、但管理器没加载它
+    （缓存过期没 daemon-reload、单元文件损坏、/etc 下同名 .d/ 里留了坏 drop-in）时，
+    systemd-timedated 找不到 NTP 单元 → `timedatectl set-ntp true` 直接回
+    "Failed to set ntp: NTP not supported"，而磁盘上明明有服务。
+    这正是 v3.2.40 面板只能丢一句「系统里有 NTP 服务，但 timedatectl 仍无法启用（可能被其它配置覆盖）」
+    的原因 —— 用户真机实测（2026-09-17）。
+    """
+    out = {}
+    try:
+        r = subprocess.run(["systemctl", "show", "-p", "LoadState", "-p", "UnitFileState",
+                            "-p", "ActiveState", "-p", "FragmentPath", "--", unit],
+                           capture_output=True, text=True, timeout=15)
+        for ln in (r.stdout or "").splitlines():
+            if "=" in ln:
+                k, v = ln.split("=", 1)
+                out[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return out
+
+
+def _ntp_unit_on_disk(unit):
+    """单元文件是否真的在磁盘上（含 /etc 下的符号链接；坏单元/被 mask 的也会命中）"""
+    for d in ("/etc/systemd/system/", "/run/systemd/system/",
+              "/usr/lib/systemd/system/", "/lib/systemd/system/"):
+        p = d + unit
+        if os.path.isfile(p) or os.path.islink(p):
+            return True
+    return False
+
+
+def ntp_other_daemon_active():
+    """正在运行的「非 systemd-timesyncd」NTP 守护进程（chrony / ntpd / ntpsec / openntpd）。
+
+    timedatectl set-ntp 只驱动 systemd-timesyncd：这类机器上开关报"不支持"并不代表时间没同步，
+    旧版却把它当失败报给用户（时间其实一直是准的）。
+    """
+    for unit in NTP_OTHER_DAEMONS:
+        try:
+            r = subprocess.run(["systemctl", "is-active", "--", unit],
+                               capture_output=True, text=True, timeout=10)
+            if (r.stdout or "").strip() == "active":
+                return unit
+        except Exception:
+            continue
+    return ""
+
+
 def ntp_diagnose():
     """NTP 设置失败时给出真正的原因和可执行的下一步。
 
-    返回 (code, message, can_fix)；can_fix=True 表示面板能一键搞定（装服务 / 解除 mask）。
+    返回 (code, message, can_fix)；can_fix=True 表示面板能一键搞定
+    （装服务 / 解除 mask / 重载 systemd 并直接启动 / 重建坏单元）。
     """
     virt = ""
     try:
@@ -5738,9 +5800,32 @@ def ntp_diagnose():
     masked = [n for n, st in units if st == "masked"]
     if masked:
         return ("masked", "NTP 服务被屏蔽（" + "、".join(masked) + "）。面板可以一键解除屏蔽并开启", True)
+    other = ntp_other_daemon_active()
+    if other:
+        return ("other_active",
+                f"这台机器用的是 {other}（已在运行）——timedatectl 的 NTP 开关只对 systemd-timesyncd 生效，"
+                f"时间同步由 {other} 负责，不需要开这个开关", False)
+    bad, stale = [], []
+    for unit, _st in units:
+        ms = ntp_manager_state(unit)
+        load = (ms.get("LoadState") or "").strip()
+        if load == "bad":
+            frag = ms.get("FragmentPath") or ""
+            bad.append(unit + (f"（{frag}）" if frag else ""))
+        elif load in ("", "not-found"):
+            if _ntp_unit_on_disk(unit):
+                stale.append(unit)
+    if bad:
+        return ("bad_unit",
+                "NTP 服务的 systemd 单元加载失败（单元文件损坏，或 /etc/systemd/system/ 下同名 .d/ 里有问题的 drop-in）："
+                + "、".join(bad) + "。面板可以重载 systemd 配置并重建/重启该服务", True)
+    if stale:
+        return ("stale",
+                "系统里有 NTP 服务，但 systemd 管理器还没加载它（缓存过期，缺一次 daemon-reload）："
+                + "、".join(stale) + "。面板可以重载 systemd 配置并直接启动这个服务（不用动 timedatectl 的开关）", True)
     return ("unknown",
-            "系统里有 NTP 服务，但 timedatectl 仍无法启用（可能被其它配置覆盖）：" + "、".join(n for n, _ in units),
-            False)
+            "timedatectl 没能启用这台机器的 NTP 服务（候选实现：" + "、".join(n for n, _ in units)
+            + "）。面板可以重载 systemd 配置并直接启动该服务（绕开 timedatectl 的开关）", True)
 
 
 def ntp_pkg_candidates():
@@ -5753,6 +5838,41 @@ def ntp_pkg_candidates():
     return []
 
 
+def ntp_repair_service():
+    """不走 timedatectl，直接把 NTP 拉起来：重载 systemd 配置 → 解除屏蔽 → 直接 enable --now。
+
+    为什么需要：systemd-timedated 的 set-ntp 只认它自己扫到的单元，遇到
+    「单元文件在、管理器没加载」（缓存过期 / 单元损坏）就直接回 "NTP not supported"；
+    这个时候真正能让时间同步起来的是 `systemctl enable --now`，而不是继续折腾那个开关。
+    返回 (ok, msg)：msg 里带实际启动的单元名。
+    """
+    if DRY_RUN:
+        return True, "DRY_RUN: 重载 systemd 并直接启动 NTP 服务"
+    try:
+        subprocess.run(["systemctl", "daemon-reload"], capture_output=True, text=True, timeout=30)
+    except Exception as e:
+        return False, f"重载 systemd 配置失败：{e}"
+    started, tried, errs = [], [], []
+    for unit in NTP_UNIT_CANDIDATES:
+        ms = ntp_manager_state(unit)
+        if not (ms.get("FragmentPath") or _ntp_unit_on_disk(unit)):
+            continue
+        tried.append(unit)
+        subprocess.run(["systemctl", "unmask", "--", unit], capture_output=True, text=True, timeout=20)
+        r = subprocess.run(["systemctl", "enable", "--now", "--", unit],
+                           capture_output=True, text=True, timeout=60)
+        if r.returncode == 0:
+            started.append(unit)
+        else:
+            detail = (r.stderr or r.stdout or "").strip().splitlines()
+            errs.append(unit + ": " + (detail[-1][:120] if detail else f"退出码 {r.returncode}"))
+    if started:
+        return True, "、".join(started)
+    if tried:
+        return False, "尝试启动 " + "、".join(tried) + " 失败：" + "；".join(errs)[:200]
+    return False, "没找到可启动的 NTP 服务单元"
+
+
 def install_ntp_service():
     """安装（缺则装）并启动 NTP 服务，返回 (ok, msg)"""
     if DRY_RUN:
@@ -5762,41 +5882,56 @@ def install_ntp_service():
         ok, msg = install_pkgs(pkgs)
         if not ok:
             return False, "安装 NTP 服务失败：" + msg
-    started = []
-    for unit in ("systemd-timesyncd.service", "chronyd.service", "ntp.service", "ntpsec.service"):
-        if not (os.path.isfile("/lib/systemd/system/" + unit) or os.path.isfile("/usr/lib/systemd/system/" + unit)):
-            continue
-        subprocess.run(["systemctl", "unmask", unit], capture_output=True, text=True, timeout=20)
-        r = subprocess.run(["systemctl", "enable", "--now", unit], capture_output=True, text=True, timeout=60)
-        if r.returncode == 0:
-            started.append(unit)
-    if not started:
-        return False, "NTP 服务装上了但没能启动，请手动执行：systemctl enable --now systemd-timesyncd"
-    return True, "NTP 服务已就绪（" + "、".join(started) + "）"
+    dok, dmsg = ntp_repair_service()
+    if dok:
+        return True, "NTP 服务已就绪（" + dmsg + "）"
+    return False, "NTP 服务装上了但没能启动（" + dmsg + "），请手动执行：systemctl enable --now systemd-timesyncd"
 
 
 def set_ntp(enable, install=False):
-    """$install=True 时先确保系统有 NTP 服务（装/解 mask），再 set-ntp。
+    """$install=True 时先确保系统有 NTP 服务（装 / 解 mask / 重载并直启），再 set-ntp。
 
-    返回 (ok, msg, fix)：fix 非空时前端给出「一键修复」入口（install_ntp）。
+    返回 (ok, msg, fix)：fix 非空时前端给出「一键修复」入口
+    （install_ntp = 需要先装服务；repair_ntp = 服务在但系统不认，需要重载 systemd 并直接启动）。
     """
-    fix = ""
+    if enable:
+        other = ntp_other_daemon_active()
+        if other:
+            st = time_status()
+            note = "（已同步）" if st.get("ntp_synced") else "（服务在运行，时间由它同步）"
+            return True, (f"这台机器用 {other} 同步时间{note}；timedatectl 的 NTP 开关只对 "
+                          f"systemd-timesyncd 生效，这里不需要开它"), ""
     if install and enable:
         ok, msg = install_ntp_service()
         if not ok:
             return False, msg, ""
+    raw = ""
     try:
         r = subprocess.run(["timedatectl", "set-ntp", "true" if enable else "false"],
                            capture_output=True, text=True, timeout=30)
-        if r.returncode != 0:
-            raw = (r.stderr or r.stdout).strip()[:160]
-            _code, hint, can = ntp_diagnose()
-            return False, (raw + "｜" + hint if raw else hint), ("install_ntp" if (can and not install) else "")
-        st = time_status()
-        note = "（已同步）" if st.get("ntp_synced") else "（刚开启，稍等片刻才会同步）"
-        return True, f"NTP 自动同步已{'开启' if enable else '关闭'}{note}", fix
+        rc = r.returncode
+        raw = (r.stderr or r.stdout or "").strip()[:160]
     except Exception as e:
-        return False, f"设置 NTP 异常：{e}", ""
+        rc, raw = 1, f"设置 NTP 异常：{e}"
+    if rc != 0:
+        code, hint, can = ntp_diagnose()
+        if enable:
+            # v3.2.42：timedatectl 不认这个服务时，直接启动 NTP 单元（绕开 timedated 那个开关）
+            dok, dmsg = ntp_repair_service()
+            if dok:
+                subprocess.run(["timedatectl", "set-ntp", "true"],
+                               capture_output=True, text=True, timeout=30)
+                st = time_status()
+                note = "（已同步）" if st.get("ntp_synced") else "（服务已启动，首次同步通常几秒到几十秒）"
+                tip = f"；timedatectl 原本报「{raw}」，已改为直接启用 {dmsg}" if raw else ""
+                return True, f"NTP 自动同步已开启{note}{tip}", ""
+        fix = ""
+        if can and not install:
+            fix = "install_ntp" if code == "missing" else "repair_ntp"
+        return False, (raw + "｜" + hint if raw else hint), fix
+    st = time_status()
+    note = "（已同步）" if st.get("ntp_synced") else "（刚开启，稍等片刻才会同步）"
+    return True, f"NTP 自动同步已{'开启' if enable else '关闭'}{note}", ""
 
 
 # ---------- 主机名 ----------
@@ -7948,7 +8083,8 @@ class PanelHandler(BaseHTTPRequestHandler):
         data = self._read_json()
         fix = ""
         if str(data.get("action", "")).lower() == "ntp":
-            ok, msg, fix = set_ntp(bool(data.get("enable")), install=bool(data.get("install")))
+            ok, msg, fix = set_ntp(bool(data.get("enable")),
+                               install=bool(data.get("install") or data.get("repair")))
         else:
             ok, msg = set_timezone(data.get("tz"))
         self._send(200 if ok else 400, {"ok": ok, "msg": msg, "fix": fix, "error": "" if ok else msg})

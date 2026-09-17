@@ -3704,20 +3704,23 @@ async function sysTimeSave() {
   sysRun("/api/system/time", { tz });
 }
 
-/* NTP 开关（v3.2.38）
+/* NTP 开关（v3.2.38；v3.2.42 起区分「装」与「修」）
    最小化 Debian/Ubuntu 镜像常常连 systemd-timesyncd 都没装，timedatectl 会直接回
-   "Failed to set ntp: NTP not supported"（用户伦敦那台 Debian 13 实测）。
-   现在后端会先诊断原因，前端据此给「一键安装并开启」入口，而不是只报一句失败。 */
+   "Failed to set ntp: NTP not supported"（伦敦那台 Debian 13 实测）；
+   另一种同样报这句、但服务其实在磁盘上的情况：systemd 管理器没加载那个单元（缓存过期/单元损坏）
+   —— 阿基雷那台 Debian 13 实测。后端会把这两种分开诊断，前端分别给「安装 NTP 服务」/「修复 NTP 服务」入口。 */
 async function sysNtpSet(on, install) {
   try {
     const d = await api("POST", "/api/system/time", { action: "ntp", enable: !!on, install: !!install });
     toast(d.msg || "完成", "okk");
     loadSystem();
   } catch (e) {
-    if (e.fix === "install_ntp") {
-      confirmPanel((e.message || "系统里没有 NTP 服务") + "\n\n要现在装一个并开启吗？"
-                   + "\n（Debian/Ubuntu 装轻量的 systemd-timesyncd，RHEL 系装 chrony，约几十秒）",
-                   () => sysNtpSet(true, true), "🔧 安装 NTP 服务");
+    if (e.fix === "install_ntp" || e.fix === "repair_ntp") {
+      const repair = (e.fix === "repair_ntp");
+      confirmPanel((e.message || "NTP 服务开不起来") + "\n\n要现在让面板处理一下并开启吗？"
+                   + (repair ? "\n（做法：重载 systemd 配置 → 解除屏蔽 → 直接启动 NTP 服务，绕开 timedatectl 的开关）"
+                             : "\n（Debian/Ubuntu 装轻量的 systemd-timesyncd，RHEL 系装 chrony，约几十秒）"),
+                   () => sysNtpSet(true, true), repair ? "🔧 修复 NTP 服务" : "🔧 安装 NTP 服务");
       return;
     }
     toast(e.message || "设置失败", "err");

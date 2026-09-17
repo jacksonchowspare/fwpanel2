@@ -6815,6 +6815,8 @@ class TestSystemNtp(unittest.TestCase):
 
         with unittest.mock.patch("subprocess.run", side_effect=fake_run), \
              unittest.mock.patch.object(panel, "ntp_unit_files", return_value=[]), \
+             unittest.mock.patch.object(panel, "_ntp_unit_on_disk", return_value=False), \
+             unittest.mock.patch.object(panel, "ntp_repair_service", return_value=(False, "没找到可启动的 NTP 服务单元")), \
              unittest.mock.patch.object(panel, "ntp_pkg_candidates", return_value=["systemd-timesyncd"]):
             ok, msg, fix = panel.set_ntp(True)
         self.assertFalse(ok)
@@ -6851,11 +6853,127 @@ class TestSystemNtp(unittest.TestCase):
         with unittest.mock.patch.object(panel, "pkg_mgr", return_value="pacman"):
             self.assertEqual(panel.ntp_pkg_candidates(), [], "Arch 的 timesyncd 随 systemd 提供，不该装包")
 
+    def _run_stub(self, virt="none", timedatectl_rc=1, timedatectl_err="Failed to set ntp: NTP not supported"):
+        """subprocess.run 替身：只让 timedatectl set-ntp 失败，其余命令成功"""
+        def fake_run(cmd, **kw):
+            c = list(cmd)
+            if c[:2] == ["timedatectl", "set-ntp"]:
+                return types.SimpleNamespace(returncode=timedatectl_rc, stdout="",
+                                             stderr=timedatectl_err)
+            if c[:1] == ["systemd-detect-virt"]:
+                return types.SimpleNamespace(returncode=0, stdout=virt + "\n", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+        return fake_run
+
+    def test_unit_candidates_match_systemd(self):
+        """候选单元必须与 systemd-timedated 认的一致（漏 chrony.service/openntpd.service 会误判）"""
+        for u in ("systemd-timesyncd.service", "chrony.service", "chronyd.service",
+                  "ntp.service", "ntpsec.service", "openntpd.service"):
+            self.assertIn(u, panel.NTP_UNIT_CANDIDATES, u)
+
+    def test_diagnose_stale_manager_cache(self):
+        """磁盘上有单元、但 systemd 管理器没加载它（缺 daemon-reload）→ 可一键修
+
+        真机形态：timedatectl 回 'NTP not supported'，list-unit-files 却有 systemd-timesyncd.service
+        """
+        with unittest.mock.patch("subprocess.run", side_effect=self._run_stub()), \
+             unittest.mock.patch.object(panel, "ntp_unit_files",
+                                        return_value=[("systemd-timesyncd.service", "enabled")]), \
+             unittest.mock.patch.object(panel, "ntp_manager_state",
+                                        return_value={"LoadState": "not-found", "FragmentPath": ""}), \
+             unittest.mock.patch.object(panel, "_ntp_unit_on_disk", return_value=True):
+            code, msg, can = panel.ntp_diagnose()
+        self.assertEqual(code, "stale")
+        self.assertTrue(can, "缓存过期是可修的（重载 systemd 再直启）")
+        self.assertIn("daemon-reload", msg)
+        self.assertIn("systemd-timesyncd.service", msg)
+
+    def test_diagnose_bad_unit(self):
+        """单元加载失败（坏单元/坏 drop-in）→ 说清路径并可一键修"""
+        with unittest.mock.patch("subprocess.run", side_effect=self._run_stub()), \
+             unittest.mock.patch.object(panel, "ntp_unit_files",
+                                        return_value=[("systemd-timesyncd.service", "enabled")]), \
+             unittest.mock.patch.object(panel, "ntp_manager_state",
+                                        return_value={"LoadState": "bad",
+                                                      "FragmentPath": "/etc/systemd/system/systemd-timesyncd.service"}):
+            code, msg, can = panel.ntp_diagnose()
+        self.assertEqual(code, "bad_unit")
+        self.assertTrue(can)
+        self.assertIn("/etc/systemd/system/systemd-timesyncd.service", msg)
+
+    def test_diagnose_other_daemon_active(self):
+        """机器用 chrony 同步 → 不该当成失败报给用户"""
+        with unittest.mock.patch("subprocess.run", side_effect=self._run_stub()), \
+             unittest.mock.patch.object(panel, "ntp_unit_files",
+                                        return_value=[("chrony.service", "enabled")]), \
+             unittest.mock.patch.object(panel, "ntp_other_daemon_active",
+                                        return_value="chrony.service"):
+            code, msg, can = panel.ntp_diagnose()
+        self.assertEqual(code, "other_active")
+        self.assertFalse(can, "chrony 在跑就不用面板去改什么")
+        self.assertIn("chrony.service", msg)
+
+    def test_set_ntp_repairs_when_timedatectl_unsupported(self):
+        """timedatectl 不认这个服务时，直接启用单元也算成功（阿基雷机实测的形态）"""
+        with unittest.mock.patch("subprocess.run", side_effect=self._run_stub()), \
+             unittest.mock.patch.object(panel, "ntp_repair_service",
+                                        return_value=(True, "systemd-timesyncd.service")), \
+             unittest.mock.patch.object(panel, "time_status", return_value={"ntp_synced": False}):
+            ok, msg, fix = panel.set_ntp(True)
+        self.assertTrue(ok, "直启成功就不能再报失败")
+        self.assertEqual(fix, "")
+        self.assertIn("直接启用 systemd-timesyncd.service", msg)
+        self.assertIn("NTP not supported", msg, "要把原始报错一起说清楚")
+
+    def test_set_ntp_repair_failure_offers_repair_fix(self):
+        """直启也失败 → 带回 repair_ntp 修复入口（而不是只有一句失败）"""
+        with unittest.mock.patch("subprocess.run", side_effect=self._run_stub()), \
+             unittest.mock.patch.object(panel, "ntp_unit_files",
+                                        return_value=[("systemd-timesyncd.service", "enabled")]), \
+             unittest.mock.patch.object(panel, "ntp_manager_state",
+                                        return_value={"LoadState": "not-found", "FragmentPath": ""}), \
+             unittest.mock.patch.object(panel, "_ntp_unit_on_disk", return_value=True), \
+             unittest.mock.patch.object(panel, "ntp_repair_service",
+                                        return_value=(False, "尝试启动 systemd-timesyncd.service 失败")):
+            ok, msg, fix = panel.set_ntp(True)
+        self.assertFalse(ok)
+        self.assertEqual(fix, "repair_ntp")
+        self.assertIn("daemon-reload", msg)
+
+    def test_set_ntp_chrony_machine_reports_success(self):
+        """chrony 在跑时点「开启 NTP」应当是成功（时间本来就在同步）"""
+        with unittest.mock.patch("subprocess.run", side_effect=self._run_stub()), \
+             unittest.mock.patch.object(panel, "ntp_other_daemon_active", return_value="chrony.service"), \
+             unittest.mock.patch.object(panel, "time_status", return_value={"ntp_synced": True}):
+            ok, msg, fix = panel.set_ntp(True)
+        self.assertTrue(ok)
+        self.assertIn("chrony.service", msg)
+        self.assertIn("已同步", msg)
+
+    def test_repair_service_dry_run(self):
+        ok, msg = panel.ntp_repair_service()      # FW_DRY_RUN=1
+        self.assertTrue(ok)
+        self.assertIn("DRY_RUN", msg)
+
+    def test_diagnose_unknown_still_fixable(self):
+        """兜底分支也要给可执行的下一步（旧版这里只说「可能被其它配置覆盖」）"""
+        with unittest.mock.patch("subprocess.run", side_effect=self._run_stub()), \
+             unittest.mock.patch.object(panel, "ntp_unit_files",
+                                        return_value=[("systemd-timesyncd.service", "enabled")]), \
+             unittest.mock.patch.object(panel, "ntp_manager_state", return_value={"LoadState": "loaded"}), \
+             unittest.mock.patch.object(panel, "ntp_other_daemon_active", return_value=""):
+            code, msg, can = panel.ntp_diagnose()
+        self.assertEqual(code, "unknown")
+        self.assertTrue(can, "说不清也不能让用户没路走")
+        self.assertIn("重载 systemd 配置", msg)
+
     def test_frontend_offers_one_click_install(self):
         with open(os.path.join(self.__class__.root, "static", "index.html"), encoding="utf-8") as f:
             html = f.read()
         self.assertIn("err.fix = data.fix", html, "api() 要把修复建议带出来")
         self.assertIn('e.fix === "install_ntp"', html)
+        self.assertIn('e.fix === "repair_ntp"', html, "v3.2.42：服务在但系统不认时给「修复」入口")
+        self.assertIn("🔧 修复 NTP 服务", html)
         self.assertIn("function sysNtpSet(", html)
         self.assertIn("install: !!install", html)
         self.assertIn("function sysNtpToggle(", html, "菜单里的 onclick 目标必须还在")

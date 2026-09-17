@@ -229,6 +229,22 @@ function isOpen() { return els.tz_pop.classList.contains("show"); }
     check(toasts.some(x => /NTP 自动同步已开启/.test(x[0])), "装完提示成功", JSON.stringify(toasts.slice(-1)));
     check(loaded >= 1, "操作完会刷新系统页状态");
 
-    console.log(failures === 0 ? "\n全部通过 ✓" : "\n失败 " + failures + " 项 ✗");
-    process.exit(failures === 0 ? 0 : 1);
+    console.log("⑫ NTP：服务在系统里但 timedatectl 不认 → 给「修复 NTP 服务」入口（阿基雷机实测）");
+    posted = []; toasts.length = 0; cfm = null;
+    global.api = async (m, p, body) => {
+        posted.push([p, body]);
+        if (body && body.install) return { ok: true, msg: "NTP 自动同步已开启（服务已启动，首次同步通常几秒到几十秒）" };
+        const e = new Error("Failed to set ntp: NTP not supported｜系统里有 NTP 服务，但 systemd 管理器还没加载它（缓存过期，缺一次 daemon-reload）：systemd-timesyncd.service");
+        e.fix = "repair_ntp";
+        throw e;
+    };
+    await F.sysNtpToggle(true);
+    check(posted.length === 1 && posted[0][1].install === false, "先原样试一次（install=false）", JSON.stringify(posted));
+    check(cfm !== null && /修复 NTP 服务/.test(cfm.title), "失败后弹出「修复 NTP 服务」确认框", cfm ? cfm.title : "未弹框");
+    check(cfm && /daemon-reload/.test(cfm.msg), "说明里讲清楚修复做法", cfm ? cfm.msg.slice(0, 60) : "");
+    if (cfm) cfm.onOk();
+    await new Promise(r => setTimeout(r, 10));
+    check(posted.length === 2 && posted[1][1].install === true, "确认后带 install=true 再请求（后端重载并直启）", JSON.stringify(posted[1]));
+    check(toasts.some(x => /NTP 自动同步已开启/.test(x[0])), "修复后提示成功", JSON.stringify(toasts.slice(-1)));
+
 })();
