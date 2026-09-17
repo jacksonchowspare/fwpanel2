@@ -55,7 +55,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.9"
+CURRENT_VERSION = "3.3.10"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -2576,7 +2576,7 @@ BACKUP_RECORD_FILES = ("config.json", "rules.json", "proxies.json", "sites.json"
 BACKUP_MODULES = [
     {"id": "config", "name": "面板配置与规则", "desc": "面板设置、防火墙规则、反代/站点/证书/应用记录", "on": True, "ready": True},
     {"id": "nginx", "name": "nginx 配置", "desc": "面板写的反代/站点/兜底守卫配置", "on": True, "ready": True},
-    {"id": "certs", "name": "证书（含私钥）", "desc": "面板管理域名的证书与续期配置", "on": True, "ready": False},
+    {"id": "certs", "name": "证书（含私钥）", "desc": "面板管理/引用的证书与续期配置；⚠ 包内含私钥，请妥善保管（恢复后写回 /etc/letsencrypt 并按需 reload nginx）", "on": True, "ready": True},
     {"id": "sites", "name": "站点文件", "desc": "/var/www 下的站点目录（可能较大）", "on": False, "ready": False},
     {"id": "apps", "name": "Docker 应用数据", "desc": "应用数据与数据库 dump（可能很大）", "on": False, "ready": False},
 ]
@@ -2590,6 +2590,7 @@ RESTORE_ITEMS = [
     {"id": "cert_records", "name": "证书记录", "desc": "到期时间等记录（不含证书文件）", "on": True},
     {"id": "apps", "name": "应用记录", "desc": "Docker 应用记录（不含容器与数据）", "on": True},
     {"id": "fed", "name": "联邦节点令牌", "desc": "⚠ 含明文令牌，恢复后建议 rotate", "on": True},
+    {"id": "cert_files", "name": "证书文件（含私钥）", "desc": "⚠ 写回 /etc/letsencrypt（私钥 0600）；有 archive 时按 certbot 结构生成新修订，续期不受影响", "on": True},
     {"id": "nginx", "name": "nginx 重新渲染", "desc": "按恢复后的记录重生成配置并 reload", "on": True},
 ]
 
@@ -2703,6 +2704,185 @@ def _backup_conf_files():
     return out
 
 
+LE_RENEWAL_NAME = "renewal"          # /etc/letsencrypt/renewal/<域名>.conf（自动续期靠它）
+BACKUP_CERT_FILES = ("fullchain.pem", "privkey.pem", "chain.pem", "cert.pem")
+CERT_DOMAIN_RE = re.compile(r"^[A-Za-z0-9*][A-Za-z0-9.*_-]*$")
+
+
+def le_archive_dir():
+    """/etc/letsencrypt/archive（跟着 LE_LIVE 走，便于测试覆盖）"""
+    return os.path.join(os.path.dirname(LE_LIVE), "archive")
+
+
+def le_renewal_dir():
+    return os.path.join(os.path.dirname(LE_LIVE), LE_RENEWAL_NAME)
+
+
+def cert_domain_safe(domain):
+    """域名要能安全地当目录名用（防路径穿越 / 防绝对路径）"""
+    d = str(domain or "").strip()
+    if not d or len(d) > 253 or d in (".", ".."):
+        return False
+    if "/" in d or "\\" in d or d.startswith("-") or ".." in d:
+        return False
+    return bool(CERT_DOMAIN_RE.match(d))
+
+
+def backup_cert_domains():
+    """要备份证书的域名：面板记录 ∪ 磁盘已签发 ∪ 反代引用（只收确实有证书文件的）"""
+    doms = set()
+    try:
+        doms |= set(load_cert_store().keys())
+    except Exception:
+        pass
+    try:
+        doms |= set(discover_disk_certs())
+    except Exception:
+        pass
+    try:
+        for p in ProxyStore().proxies:
+            ref = str((p or {}).get("cert_ref") or "").strip() or str((p or {}).get("domain") or "").strip()
+            if ref:
+                doms.add(ref)
+    except Exception:
+        pass
+    return [d for d in sorted(doms) if cert_domain_safe(d) and cert_files_exist(d)]
+
+
+def _copy_file_perm(src, dst, mode):
+    """按指定权限复制（证书私钥必须 0600）"""
+    with open(src, "rb") as f:
+        data = f.read()
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    try:
+        os.write(fd, data)
+    finally:
+        os.close(fd)
+    try:
+        os.chmod(dst, mode)
+    except OSError:
+        pass
+    return len(data)
+
+
+def _manifest_sha(man, arc):
+    for e in (man or {}).get("files") or []:
+        if e.get("arc") == arc:
+            return e.get("sha256")
+    return None
+
+
+def restore_cert_files(src_root, man):
+    """把包内证书写回系统。返回 (ok, 说明)
+
+    有 archive 目录 → 写新修订（certN.pem 等）+ 更新 live 软链接（certbot 认可的结构，续期不受影响）；
+    没有 archive → 直接写 live/<域名>/<文件> 普通文件。
+    """
+    live_root = os.path.join(src_root, "live")
+    if not os.path.isdir(live_root):
+        return False, "包内没有证书内容"
+    doms_ok, skipped, files_n, renewed = [], [], 0, 0
+    name_map = {"fullchain.pem": "fullchain%d.pem", "privkey.pem": "privkey%d.pem",
+                "chain.pem": "chain%d.pem", "cert.pem": "cert%d.pem"}
+    for dom in sorted(os.listdir(live_root)):
+        src_dir = os.path.join(live_root, dom)
+        if not os.path.isdir(src_dir):
+            continue
+        if not cert_domain_safe(dom):
+            skipped.append("%s(域名非法)" % dom)
+            continue
+        payload = {}
+        bad = ""
+        for fn in BACKUP_CERT_FILES:
+            sp = os.path.join(src_dir, fn)
+            if not os.path.isfile(sp):
+                continue
+            want = _manifest_sha(man, "data/certs/live/%s/%s" % (dom, fn))
+            if want and want != _sha256_file(sp):
+                bad = "%s/%s 校验和不符" % (dom, fn)
+                break
+            payload[fn] = sp
+        if bad:
+            skipped.append(bad)
+            continue
+        if not payload:
+            continue
+        if DRY_RUN:                     # 演练模式：只统计，不落盘
+            files_n += len(payload)
+            doms_ok.append(dom)
+            continue
+        if True:
+            arch_dir = os.path.join(le_archive_dir(), dom)
+            live_dir = os.path.join(LE_LIVE, dom)
+            if os.path.isdir(arch_dir):
+                # 新修订：避免覆盖现有证书，续期链不被打断
+                rev = 1
+                try:
+                    for f2 in os.listdir(arch_dir):
+                        m2 = re.match(r"^(?:cert|chain|fullchain|privkey)(\d+)\.pem$", f2)
+                        if m2:
+                            rev = max(rev, int(m2.group(1)) + 1)
+                except OSError:
+                    pass
+                for fn, sp in payload.items():
+                    mode = 0o600 if fn == "privkey.pem" else 0o644
+                    _copy_file_perm(sp, os.path.join(arch_dir, name_map[fn] % rev), mode)
+                    try:
+                        os.chmod(os.path.join(arch_dir, name_map[fn] % rev), mode)
+                    except OSError:
+                        pass
+                    files_n += 1
+                os.makedirs(live_dir, exist_ok=True)
+                for fn in payload:
+                    link = os.path.join(live_dir, fn)
+                    tgt = os.path.join("..", "..", "archive", dom, name_map[fn] % rev)
+                    try:
+                        if os.path.islink(link) or os.path.exists(link):
+                            os.remove(link)
+                    except OSError:
+                        pass
+                    os.symlink(tgt, link)
+            else:
+                os.makedirs(live_dir, exist_ok=True)
+                for fn, sp in payload.items():
+                    dst = os.path.join(live_dir, fn)
+                    try:
+                        if os.path.islink(dst):
+                            os.remove(dst)
+                    except OSError:
+                        pass
+                    _copy_file_perm(sp, dst, 0o600 if fn == "privkey.pem" else 0o644)
+                    files_n += 1
+        doms_ok.append(dom)
+    # renewal 配置（自动续期用）
+    ren_src = os.path.join(src_root, "renewal")
+    if os.path.isdir(ren_src):
+        for fn in sorted(os.listdir(ren_src)):
+            dom = fn[:-5] if fn.endswith(".conf") else ""
+            if not dom or not cert_domain_safe(dom) or not fn.endswith(".conf"):
+                skipped.append("%s(renewal 名字非法)" % fn)
+                continue
+            if not DRY_RUN:
+                os.makedirs(le_renewal_dir(), exist_ok=True)
+                _copy_file_perm(os.path.join(ren_src, fn), os.path.join(le_renewal_dir(), fn), 0o644)
+            renewed += 1
+    msg = "证书 %d 个域名 / %d 个文件%s%s" % (
+        len(doms_ok), files_n, ("，renewal 配置 %d 个" % renewed) if renewed else "",
+        ("；跳过：%s" % "、".join(skipped[:4])) if skipped else "")
+    return bool(doms_ok or renewed), msg
+
+
+def backup_snapshot_modules():
+    """恢复前快照要覆盖的模块（有证书就把证书一起快照，否则恢复坏了没得回滚）"""
+    mods = ["config", "nginx"]
+    try:
+        if backup_cert_domains():
+            mods.append("certs")
+    except Exception:
+        pass
+    return mods
+
+
 def backup_collect(modules):
     """按模块收集 (绝对路径, 归档内相对路径)；只认名单内 / 形状能识别的文件"""
     mods = set(modules or [])
@@ -2715,7 +2895,16 @@ def backup_collect(modules):
     if "nginx" in mods:
         for p in _backup_conf_files():
             files.append((p, "data/nginx/" + os.path.basename(p)))
-    # v3.3.1 起：certs / sites / apps 的实物内容在这里补（当前模块列表里标 ready=False）
+    if "certs" in mods:
+        for dom in backup_cert_domains():
+            for fn in BACKUP_CERT_FILES:
+                p = os.path.join(LE_LIVE, dom, fn)
+                if os.path.isfile(p):
+                    files.append((p, "data/certs/live/%s/%s" % (dom, fn)))
+            rp = os.path.join(le_renewal_dir(), dom + ".conf")
+            if os.path.isfile(rp):
+                files.append((rp, "data/certs/renewal/%s.conf" % dom))
+    # v3.3.10 起：certs 已实现；sites / apps 的实物内容在这里补（模块列表里仍标 ready=False）
     return files
 
 
@@ -2777,7 +2966,8 @@ def backup_create_work(modules, note="", name_prefix=""):
     ready = set(m["id"] for m in BACKUP_MODULES if m.get("ready"))
     mods = [m for m in (modules or []) if m in ready]
     if not mods:
-        return False, "没有可备份的模块（当前版本支持：面板配置与规则、nginx 配置）"
+        names = "、".join(m["name"] for m in BACKUP_MODULES if m.get("ready"))
+        return False, "没有可备份的模块（当前版本支持：%s）" % names
     files = backup_collect(mods)
     if not files:
         return False, "没有可备份的内容（面板记录文件为空？）"
@@ -2792,6 +2982,7 @@ def backup_create_work(modules, note="", name_prefix=""):
     data = json.dumps(man, ensure_ascii=False, indent=2).encode()
     try:
         with tarfile.open(tmp, "w:gz") as tf:
+            tf.dereference = True   # v3.3.10：live/ 下的证书是 archive 的软链接，必须存内容（否则恢复出来是断链）
             ti = tarfile.TarInfo("manifest.json")
             ti.size = len(data)
             ti.mode = 0o600
@@ -2964,7 +3155,7 @@ def backup_restore_work(pkg_name, items, opts=None):
     snapshot_name = ""
     if opts.get("snapshot", True):
         task_progress("恢复前自动快照...")
-        ok, msg = backup_create_work(["config", "nginx"], note="pre-restore 自动快照",
+        ok, msg = backup_create_work(backup_snapshot_modules(), note="pre-restore 自动快照",
                                      name_prefix="pre-restore-")
         if ok:
             snapshot_name = msg.split("：", 1)[-1].split("（", 1)[0].strip()
@@ -3026,6 +3217,19 @@ def backup_restore_work(pkg_name, items, opts=None):
                     _atomic_write_json(os.path.join(BASE_DIR, fn), data)
                     restored.append(fn)
 
+        if items.get("cert_files"):
+            task_progress("恢复证书与私钥...")
+            try:
+                ok_c, msg_c = restore_cert_files(os.path.join(tmp, "data", "certs"), man)
+                restored.append(msg_c if ok_c else ("证书：%s" % msg_c))
+                if ok_c and not items.get("nginx") and nginx_available() and not DRY_RUN:
+                    ok_rl, msg_rl = reload_nginx()
+                    restored.append("证书生效（nginx reload：%s）" % ("成功" if ok_rl else msg_rl))
+                elif ok_c and DRY_RUN:
+                    restored.append("证书生效（DRY_RUN 跳过 reload）")
+            except Exception as e:
+                restored.append("证书恢复异常：%s" % e)
+
         if items.get("nginx"):
             task_progress("按恢复后的记录重新渲染 nginx...")
             try:
@@ -3078,6 +3282,7 @@ def backup_rollback_work(pkg_name):
     """从快照回滚（等价于用该包做一次全量记录恢复，端口仍走护栏）"""
     items = {k: True for k in RESTORE_ITEM_FILE}
     items["nginx"] = True
+    items["cert_files"] = True
     items["port"] = False          # 端口永远走护栏：不覆盖
     return backup_restore_work(pkg_name, items, {"snapshot": False, "restart": True})
 

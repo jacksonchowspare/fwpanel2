@@ -7202,9 +7202,14 @@ class TestBackup(unittest.TestCase):
                          panel._sha256_file(os.path.join(self.etc, "config.json")))
 
     def test_create_rejects_unknown_modules(self):
-        ok, msg = panel.backup_create_work(["certs", "sites"], note="")
+        """未实现的模块与不存在的模块都要被拒（证书档 v3.3.10 起已转正，不再属于这一类）"""
+        ok, msg = panel.backup_create_work(["sites", "apps"], note="")
         self.assertFalse(ok)
         self.assertIn("没有可备份的模块", msg)
+        self.assertIn("证书（含私钥）", msg, "提示里应列出当前支持的模块")
+        ok2, msg2 = panel.backup_create_work(["unknown-id"], note="")
+        self.assertFalse(ok2)
+        self.assertIn("没有可备份的模块", msg2)
 
     def test_name_and_path_safety(self):
         self.assertEqual(panel.backup_path("../../etc/passwd"), "")
@@ -7456,6 +7461,179 @@ class TestBackupFrontendWiring(unittest.TestCase):
         self.assertIn('data-sec="sys"', self.html)
         self.assertIn("备份与恢复", self.html)
         self.assertIn("bkLoad()", self.html, "系统页加载时要拉备份信息")
+
+
+class TestBackupCertFiles(unittest.TestCase):
+    """备份/恢复「证书（含私钥）」档（v3.3.10）
+
+    真实 LE 目录里 live/<域名>/*.pem 是指向 archive/<域名>/*N.pem 的软链接 —— 打包时必须解引用，
+    恢复时按 certbot 结构写新修订并更新软链接（否则自动续期会踩到"live 不是软链接"）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fwcert-")
+        self.src_le = os.path.join(self.tmp, "src-le")
+        os.makedirs(os.path.join(self.src_le, "live", "example.com"))
+        os.makedirs(os.path.join(self.src_le, "archive", "example.com"))
+        os.makedirs(os.path.join(self.src_le, "renewal"))
+        self.content = {"fullchain.pem": b"FULLCHAIN\n", "privkey.pem": b"PRIVKEY\n",
+                        "chain.pem": b"CHAIN\n", "cert.pem": b"CERT\n"}
+        for fn, data in self.content.items():
+            with open(os.path.join(self.src_le, "archive", "example.com", fn.replace(".pem", "1.pem")), "wb") as f:
+                f.write(data)
+            os.symlink(os.path.join("..", "..", "archive", "example.com", fn.replace(".pem", "1.pem")),
+                       os.path.join(self.src_le, "live", "example.com", fn))
+        with open(os.path.join(self.src_le, "renewal", "example.com.conf"), "w") as f:
+            f.write("renew_hook = true\n")
+        self.backup_dir = os.path.join(self.tmp, "backups")
+        self._patches = [
+            unittest.mock.patch.object(panel, "LE_LIVE", os.path.join(self.src_le, "live")),
+            unittest.mock.patch.object(panel, "BACKUP_DIR", self.backup_dir),
+            unittest.mock.patch.object(panel, "CURRENT_VERSION", "3.3.10"),
+            unittest.mock.patch.object(panel, "ProxyStore",
+                                       lambda: types.SimpleNamespace(proxies=[{"domain": "example.com", "cert_ref": ""}])),
+            unittest.mock.patch.object(panel, "load_cert_store", lambda: {"example.com": {"source": "independent"}}),
+            unittest.mock.patch.object(panel, "discover_disk_certs", lambda: ["example.com"]),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _make_pkg(self):
+        files = panel.backup_collect(["certs"])
+        man = panel.backup_make_manifest(["certs"], "t", files)
+        ok, msg = panel.backup_create_work(["certs"], note="t")
+        self.assertTrue(ok, msg)
+        pkg = os.path.join(self.backup_dir, os.listdir(self.backup_dir)[0])
+        if pkg.endswith(".json"):
+            pkg = [f for f in os.listdir(self.backup_dir) if f.endswith(".tar.gz")][0]
+            pkg = os.path.join(self.backup_dir, pkg)
+        with tarfile.open(pkg) as tf:
+            members = tf.getmembers()
+            ext = os.path.join(self.tmp, "ext")
+            tf.extractall(ext)
+        with open(pkg + ".json", encoding="utf-8") as f:
+            man = json.load(f)
+        return pkg, members, ext, man
+
+    def test_collect_includes_certs_and_renewal(self):
+        """收集：live 下 4 个文件 + renewal 配置，且路径形状正确"""
+        arcs = [a for _, a in panel.backup_collect(["certs"])]
+        for fn in ("fullchain.pem", "privkey.pem", "chain.pem", "cert.pem"):
+            self.assertIn("data/certs/live/example.com/%s" % fn, arcs)
+        self.assertIn("data/certs/renewal/example.com.conf", arcs)
+
+    def test_store_domain_without_files_is_skipped(self):
+        """记录里有、磁盘上没有的域名不进包（避免空目录）"""
+        with unittest.mock.patch.object(panel, "load_cert_store",
+                                        lambda: {"ghost.example.com": {}, "example.com": {}}):
+            doms = panel.backup_cert_domains()
+        self.assertEqual(doms, ["example.com"])
+
+    def test_package_dereferences_symlinks(self):
+        """打包必须解引用：包内不能出现软链接，私钥内容要真在里面"""
+        _, members, ext, man = self._make_pkg()
+        self.assertEqual([m.name for m in members if m.issym()], [], "包内出现软链接 → 恢复出来是断链")
+        self.assertFalse([m.name for m in members if m.islnk()], "包内出现硬链接")
+        with open(os.path.join(ext, "data/certs/live/example.com/privkey.pem"), "rb") as f:
+            self.assertEqual(f.read(), self.content["privkey.pem"])
+
+    def test_manifest_records_sha256_of_private_key(self):
+        """manifest 逐文件 sha256（含私钥），恢复时用于校验"""
+        _, _, _, man = self._make_pkg()
+        arc = "data/certs/live/example.com/privkey.pem"
+        ent = [e for e in man["files"] if e["arc"] == arc]
+        self.assertEqual(len(ent), 1)
+        self.assertEqual(ent[0]["size"], len(self.content["privkey.pem"]))
+        self.assertEqual(len(ent[0]["sha256"]), 64)
+
+    def test_restore_creates_new_revision_and_symlinks(self):
+        """目标机有 archive → 写新修订 + 更新 live 软链接（certbot 兼容）"""
+        _, _, ext, man = self._make_pkg()
+        dst = os.path.join(self.tmp, "dst-le")
+        os.makedirs(os.path.join(dst, "archive", "example.com"))
+        for fn in self.content:
+            with open(os.path.join(dst, "archive", "example.com", fn.replace(".pem", "1.pem")), "wb") as f:
+                f.write(b"OLD")
+        with unittest.mock.patch.object(panel, "LE_LIVE", os.path.join(dst, "live")), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok, msg = panel.restore_cert_files(os.path.join(ext, "data", "certs"), man)
+        self.assertTrue(ok, msg)
+        arch = sorted(os.listdir(os.path.join(dst, "archive", "example.com")))
+        self.assertIn("fullchain2.pem", arch, "没有生成新修订（会覆盖现有证书）")
+        link = os.path.join(dst, "live", "example.com", "fullchain.pem")
+        self.assertTrue(os.path.islink(link))
+        self.assertTrue(os.readlink(link).endswith("archive/example.com/fullchain2.pem"))
+        with open(link, "rb") as f:
+            self.assertEqual(f.read(), self.content["fullchain.pem"])
+        self.assertEqual(oct(os.stat(os.path.join(dst, "archive", "example.com", "privkey2.pem")).st_mode & 0o777),
+                         "0o600")
+        self.assertTrue(os.path.isfile(os.path.join(dst, "renewal", "example.com.conf")))
+
+    def test_restore_falls_back_to_plain_files(self):
+        """目标机没有 archive 结构 → 直接写 live 普通文件，私钥仍 0600"""
+        _, _, ext, man = self._make_pkg()
+        dst = os.path.join(self.tmp, "plain-le")
+        os.makedirs(dst)
+        with unittest.mock.patch.object(panel, "LE_LIVE", dst), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok, msg = panel.restore_cert_files(os.path.join(ext, "data", "certs"), man)
+        self.assertTrue(ok, msg)
+        d = os.path.join(dst, "example.com")
+        self.assertEqual(sorted(os.listdir(d)), ["cert.pem", "chain.pem", "fullchain.pem", "privkey.pem"])
+        self.assertEqual(oct(os.stat(os.path.join(d, "privkey.pem")).st_mode & 0o777), "0o600")
+        self.assertEqual(oct(os.stat(os.path.join(d, "fullchain.pem")).st_mode & 0o777), "0o644")
+
+    def test_restore_rejects_tampered_cert(self):
+        """包内证书被改过（sha256 不符）→ 拒绝恢复该文件，不落盘"""
+        _, _, ext, man = self._make_pkg()
+        with open(os.path.join(ext, "data/certs/live/example.com/fullchain.pem"), "wb") as f:
+            f.write(b"TAMPERED")
+        dst = os.path.join(self.tmp, "tamper-le")
+        os.makedirs(dst)
+        with unittest.mock.patch.object(panel, "LE_LIVE", dst), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok, msg = panel.restore_cert_files(os.path.join(ext, "data", "certs"), man)
+        self.assertIn("校验和不符", msg)
+        self.assertFalse(os.path.exists(os.path.join(dst, "example.com", "fullchain.pem")))
+
+    def test_dry_run_writes_nothing(self):
+        """演练模式：统计照算、一个字节都不落盘"""
+        _, _, ext, man = self._make_pkg()
+        dst = os.path.join(self.tmp, "dry-le")
+        os.makedirs(dst)
+        with unittest.mock.patch.object(panel, "LE_LIVE", dst), \
+             unittest.mock.patch.object(panel, "DRY_RUN", True):
+            ok, msg = panel.restore_cert_files(os.path.join(ext, "data", "certs"), man)
+        self.assertTrue(ok, msg)
+        self.assertIn("4 个文件", msg)
+        self.assertEqual(os.listdir(dst), [])
+
+    def test_domain_safety(self):
+        """域名要能安全当目录名（防穿越/绝对路径）"""
+        for bad in ("..evil", "a/b", "/etc/passwd", "..", "", "x/../y", "\\evil"):
+            self.assertFalse(panel.cert_domain_safe(bad), bad)
+        for good in ("example.com", "*.example.com", "a-b_c.example.com"):
+            self.assertTrue(panel.cert_domain_safe(good), good)
+
+    def test_module_enabled_and_restore_item_present(self):
+        """证书档已转正：模块可选、可恢复项里有证书文件、快照覆盖证书"""
+        certs = [m for m in panel.BACKUP_MODULES if m["id"] == "certs"][0]
+        self.assertTrue(certs["ready"], "证书档应已转正（不再是灰色后续版本）")
+        self.assertIn("私钥", certs["desc"])
+        self.assertIn("cert_files", [i["id"] for i in panel.RESTORE_ITEMS])
+        self.assertTrue([i for i in panel.RESTORE_ITEMS if i["id"] == "cert_files"][0]["on"],
+                        "证书恢复项默认应勾选")
+        self.assertIn("certs", panel.backup_snapshot_modules(), "恢复前快照必须覆盖证书")
+
+    def test_snapshot_skips_certs_when_no_cert(self):
+        """没有证书时快照不该硬塞 certs 模块"""
+        with unittest.mock.patch.object(panel, "backup_cert_domains", lambda: []):
+            self.assertEqual(panel.backup_snapshot_modules(), ["config", "nginx"])
 
 
 class TestBackupAPI(unittest.TestCase):
