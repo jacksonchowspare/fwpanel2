@@ -204,6 +204,7 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
 
 ### 反向代理与证书（Nginx + ACME）
 - 域名绑定反代（HTTP/HTTPS、WebSocket 勾选、HTTP→HTTPS 跳转、**HSTS 支持**），列表「功能」列显示启用的 WS / HSTS；**已添加代理可随时编辑**（协议 / WebSocket / HSTS 弹窗修改，立即生效）
+- ⚠ **编辑弹窗里的「协议」是「回源协议」**（nginx → 目标服务用什么协议连），**不是**站点对外协议：Docker 应用与端口站容器都是明文 HTTP，选 `https` 会让 nginx 用 TLS 去连明文端口 → **502 Bad Gateway**（保存时界面会直接提示）。证书列会标出实际生效的证书（引用别的证书显示「使用证书 X」，用本站域名自己的证书显示「使用证书 X（自身域名）」）
 - ACME 证书一键申请 / 手动续期 / 证书路径一键复制；**单独申请 SSL 证书模块**（无需配置反代，独立管理多域名证书），状态行显示 **certbot 自动续期状态 + 下次检测时间**（中文格式）
 - 一键安装 nginx + certbot（自动识别 apt/pacman/dnf），证书申请前自动写入 ACME 挑战路径配置并 reload nginx
 - **禁止公网直连**：

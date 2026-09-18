@@ -1708,10 +1708,16 @@ window.addEventListener("error", function (ev) {
     <h3>✏️ 编辑代理</h3>
     <div style="margin-bottom:16px">
       <div style="color:var(--muted);font-size:12px;margin-bottom:8px">代理域名：<span id="pxe_domain" style="color:var(--text)"></span></div>
-      <div style="display:flex;align-items:center;gap:8px;margin-bottom:10px">
-        <span style="font-size:13px">协议</span>
-        <select id="pxe_scheme" style="flex:1"><option value="http">http</option><option value="https">https</option></select>
-        <select id="pxe_cert" style="flex:1" title="更换引用的证书（空=自动申请）"></select>
+      <div style="display:flex;align-items:center;gap:8px;margin-bottom:4px">
+        <span style="font-size:13px;flex:none;width:52px">协议</span>
+        <select id="pxe_scheme" style="flex:1" title="回源协议：nginx 连接目标服务时用的协议（不是站点对外协议）。面板部署的 Docker 应用与端口站都是明文 HTTP，选 https 会让 nginx 用 TLS 去连明文端口 → 502">
+          <option value="http">http</option><option value="https">https</option></select>
+        <span style="font-size:13px;flex:none">证书</span>
+        <select id="pxe_cert" style="flex:1" title="引用的证书：空 = 用本站域名自己的证书；也可引用已申请的其它证书（含泛域名）"></select>
+      </div>
+      <div style="color:var(--muted);font-size:11px;margin-bottom:10px">
+        协议 = <b>回源协议</b>（nginx → 目标服务）：Docker 应用/网站容器一般是 <b>http</b>；
+        站点对外是否 HTTPS 由「证书 + 80→443 跳转」决定，与这里无关。
       </div>
       <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;cursor:pointer"><input type="checkbox" id="pxe_ws" style="width:auto;flex:none"> WebSocket 支持</label>
       <label style="display:flex;align-items:center;gap:6px;cursor:pointer" title="HTTP Strict Transport Security：强制浏览器 HTTPS 访问（仅 HTTPS 代理生效）"><input type="checkbox" id="pxe_hsts" style="width:auto;flex:none"> HSTS（强制 HTTPS，1 年含子域名）</label>
@@ -5163,7 +5169,12 @@ async function loadProxy() {
       const cert = p.cert_exists
         ? (p.cert_expiry ? `有效至 ${new Date(p.cert_expiry * 1000).toLocaleDateString()}` : "已签发")
         : (p.ssl ? "未签发" : "未申请");
-      const certRefTag = p.cert_ref ? `<span style="color:#4da3ff;font-size:11px;margin-right:6px">使用证书 ${p.cert_ref}</span>` : "";
+      // v3.3.16：cert_ref 为空但「本站域名自己的证书」已生效时也要标出来
+      // （用户实测反馈：手动申请证书后列表里看不到「使用证书 X」，以为没匹配上）
+      const certRefShown = p.cert_ref || (p.cert_exists ? (p.cert_ref_resolved || p.domain) : "");
+      const certRefTag = certRefShown
+        ? `<span style="color:#4da3ff;font-size:11px;margin-right:6px">使用证书 ${certRefShown}${p.cert_ref ? "" : "（自身域名）"}</span>`
+        : "";
       // v3.3.5：文本与按钮分成两段渲染（文本可伸缩 + 按钮钉在列右边缘），
       // 否则按钮跟在变长文本后面 → 每行位置都不同（用户反馈：看着乱、还会顶到「功能」列）
       let certText = "", certBtns = "";
@@ -5180,7 +5191,7 @@ async function loadProxy() {
         certBtns = `<button class="btn mini" onclick="issueSsl('${p.id}')">申请证书</button><span></span>`;   // 占位对齐
       }
       // 窄窗口下文本会用省略号截断 → 加 title 让鼠标悬停能看全
-      const certTitle = (p.cert_ref ? "使用证书 " + p.cert_ref + " " : "") + cert;
+      const certTitle = (certRefShown ? "使用证书 " + certRefShown + (p.cert_ref ? "" : "（自身域名）") + " " : "") + cert;
       const certCell = `<div style="display:flex;align-items:center;gap:10px">`
         + `<span title="${certTitle}" style="flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${certText}</span>`
         + (certBtns ? `<span style="flex:0 0 auto" class="ops-grid">${certBtns}</span>` : "")

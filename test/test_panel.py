@@ -1401,6 +1401,39 @@ class TestAPI(unittest.TestCase):
         # 清理
         self._req("DELETE", "/api/proxy/" + pid, token=self._token())
 
+    def test_proxy_edit_echoes_fields_and_warns_on_https_upstream(self):
+        """编辑回显改了哪些字段；回源协议选 https 而目标是面板应用/端口站时给 502 提示
+
+        v3.3.16（ak 实机）：反代「协议」是回源协议，被设成 https 后 nginx 拿 TLS 连明文容器
+        → 502 Bad Gateway，而界面上什么提示都没有（用户排查了半小时）。
+        """
+        code, d = self._req("POST", "/api/proxy", {
+            "domain": "echo.example.com", "target_host": "127.0.0.1",
+            "target_port": 18099, "scheme": "http"}, token=self._token())
+        self.assertEqual(code, 200, d)
+        pid = d["proxy"]["id"]
+        fake_apps = types.SimpleNamespace(apps=[{"folder": "wp-18099", "name": "WordPress",
+                                                "port": 18099, "template": "wordpress"}])
+        with unittest.mock.patch.object(panel, "AppStore", lambda: fake_apps):
+            code, d = self._req("POST", "/api/proxy/" + pid, {
+                "action": "edit", "scheme": "https"}, token=self._token())
+        self.assertEqual(code, 200, d)
+        msg = d.get("msg", "")
+        self.assertIn("协议: https", msg, "要回显改后的协议")
+        self.assertIn("证书: 本站域名证书", msg, "要回显证书引用状态")
+        self.assertIn("502", msg, "目标端口是面板应用且回源选 https → 必须提示会 502")
+        self.assertIn("WordPress", msg)
+        # 改回 http 就不该再提示
+        code, d = self._req("POST", "/api/proxy/" + pid, {
+            "action": "edit", "scheme": "http"}, token=self._token())
+        self.assertEqual(code, 200, d)
+        self.assertNotIn("502", d.get("msg", ""))
+        self.assertIn("协议: http", d.get("msg", ""))
+        # 非本机目标（外部 https 服务）也不该误报
+        self.assertEqual(panel.proxy_scheme_warning(
+            {"scheme": "https", "target_host": "10.0.0.9", "target_port": 18099}), "")
+        self._req("DELETE", "/api/proxy/" + pid, token=self._token())
+
     def test_proxy_hsts(self):
         """反代 HSTS：配置渲染包含 Strict-Transport-Security"""
         p = {"domain": "hsts.example.com", "target_host": "127.0.0.1",
@@ -8892,6 +8925,21 @@ class TestProxyCertTabWiring(unittest.TestCase):
                       "证书文本必须可伸缩并在窄窗口下省略号截断")
         self.assertIn('flex:0 0 auto" class="ops-grid"', self.html, "按钮组必须钉在列右侧不参与伸缩（走定宽槽位）")
         self.assertIn("title=\"${certTitle}\"", self.html, "被截断时要有悬浮提示")
+
+    def test_proxy_cert_cell_shows_own_domain_cert(self):
+        """证书列在「本站域名自己的证书生效」时也要标出「使用证书 X（自身域名）」
+
+        v3.3.16（用户实测反馈）：手动申请证书后 cert_ref 仍是空 → 列表什么都不标，
+        用户以为证书没匹配上（实际上 nginx 用的就是本站域名的证书）。
+        """
+        self.assertIn("p.cert_ref || (p.cert_exists ? (p.cert_ref_resolved || p.domain) : \"\")", self.html,
+                      "cert_ref 为空时要回退到解析出的证书（自身域名）")
+        self.assertIn("（自身域名）", self.html, "自身域名证书要标注出来")
+        self.assertIn("使用证书 ${certRefShown}", self.html)
+        # 编辑弹窗必须说明「协议 = 回源协议」，避免再被理解成「站点对外协议」
+        self.assertIn("回源协议", self.html)
+        self.assertIn("选 https 会让 nginx 用 TLS 去连明文端口 → 502", self.html)
+        self.assertIn("Docker 应用/网站容器一般是 <b>http</b>", self.html)
 
     def test_proxy_ops_column_right_aligned(self):
         """代理列表「操作」列右对齐（与「已申请证书」表一致）"""

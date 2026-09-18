@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.15"
+CURRENT_VERSION = "3.3.16"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -2485,6 +2485,47 @@ def host_guard(domain):
         base = re.escape(domain[2:])
         return f'    if ($host !~ ^(.+\\.)?{base}$) {{ return 444; }}\n'
     return f'    if ($host != "{domain}") {{ return 444; }}\n'
+
+
+def proxy_scheme_warning(p):
+    """回源协议可疑时给一句提示（ak 实机踩过：反代被设成 https，容器却是明文 → 502）
+
+    「协议」= nginx → 目标服务的回源协议，不是站点对外协议；面板部署的 Docker 应用与
+    端口站都是明文 HTTP，选 https 会直接 502（upstream SSL 握手失败）。
+    """
+    if (p.get("scheme") or "http") != "https":
+        return ""
+    host = (p.get("target_host") or "").strip()
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        return ""
+    try:
+        port = int(p.get("target_port") or 0)
+    except (TypeError, ValueError):
+        return ""
+    if port <= 0:
+        return ""
+    try:
+        apps = list(AppStore().apps or [])
+    except Exception:
+        apps = []
+    for a in apps:
+        try:
+            if int(a.get("port") or 0) == port:
+                return ("；⚠ 目标端口 %s 是面板部署的应用（%s），容器是明文 HTTP："
+                        "回源协议应选 http（选 https 会 502）" % (port, a.get("name") or a.get("folder")))
+        except (TypeError, ValueError):
+            continue
+    try:
+        sites = list(SiteStore().sites or [])
+    except Exception:
+        sites = []
+    for s in sites:
+        try:
+            if str(s.get("type") or "") == "port" and int(s.get("port") or 0) == port:
+                return "；⚠ 目标端口 %s 是面板的端口站，一般是明文 HTTP：回源协议应选 http" % port
+        except (TypeError, ValueError):
+            continue
+    return ""
 
 
 def _proxy_cert(domain, cert_ref):
@@ -11493,7 +11534,12 @@ class PanelHandler(BaseHTTPRequestHandler):
             pstore.save()
             ok, msg = apply_proxies(pstore)
             tail = "" if ok else f"；配置应用失败: {msg}"
-            self._send(200, {"ok": True, "msg": f"{p['domain']} 已更新（WebSocket: {'开' if p['websocket'] else '关'} / HSTS: {'开' if p['hsts'] else '关'}）{tail}"})
+            # v3.3.16：把改了哪些字段回显出来，并对可疑的回源协议给出提示（用户实测反馈）
+            self._send(200, {"ok": True, "msg": (
+                f"{p['domain']} 已更新（协议: {p.get('scheme') or 'http'} / "
+                f"证书: {p.get('cert_ref') or '本站域名证书'} / "
+                f"WebSocket: {'开' if p['websocket'] else '关'} / HSTS: {'开' if p['hsts'] else '关'}）"
+                f"{tail}{proxy_scheme_warning(p)}")})
         else:
             self._send(400, {"error": f"未知操作: {action}（支持 enable / ssl / renew / blockip / edit）"})
 
