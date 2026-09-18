@@ -313,7 +313,8 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
   - 不含 Docker **镜像**（`dockerimage`，可重新拉取，动辄几 GB）
   - 证书档内容：面板管理/引用的域名的 `live/<域名>/{fullchain,privkey,chain,cert}.pem` + `/etc/letsencrypt/renewal/<域名>.conf`（自动续期配置）
     - 真实 LE 目录里 `live/` 下是 `archive/` 的**软链接**，打包时会**解引用**（存真实内容），否则恢复出来是断链
-  - Docker 应用数据档内容：面板部署应用的 `db`/`html`/`data` 子目录（排除应用自身的 `backups/`，否则旧备份会套娃进新包）+ **现场数据库 dump**（mysql 应用走容器内 `mysqldump --all-databases`，sqlite 应用直接复制数据文件）+ `dockercompose/<目录>/` 的 compose 文件
+  - Docker 应用数据档内容：面板部署应用的 `db`/`html`/`data` 子目录（排除应用自身的 `backups/`，否则旧备份会套娃进新包）+ **现场数据库 dump**（mysql/mariadb 应用走容器内 `mysqldump`/`mariadb-dump --all-databases`，sqlite 应用直接复制数据文件）+ `dockercompose/<目录>/` 的 compose 文件
+    - 数据库命令会自动适配镜像家族（`mysql*` 与 `mariadb-*` 两种官方镜像的客户端命令名不同，v3.3.15 修）
     - 默认**不停容器**：数据库拿到的是现场一致快照，文件目录是"运行中快照"（结果里会标注）；勾选「停机打包」会 `compose stop` → 打包 → 自动 `up -d` 起回，更一致但应用会短暂中断
     - 界面可**逐应用、逐子目录反勾**（例如只保留数据库与配置、排除网盘的用户文件）；`/DockerData/dockerrun` 的自动数据卷需显式勾选
     - 恢复前快照同样按体积阈值决定是否包含应用数据
@@ -327,7 +328,8 @@ curl -sSL https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/insta
   - 恢复项可分模块勾选：面板设置 / 面板端口与绑定 / 防火墙规则 / 反代 / 站点记录 / 证书记录 / **证书文件（含私钥）** / **站点文件（/var/www）** / **应用数据（Docker）** / 应用记录 / 联邦令牌 / nginx 重新渲染
   - **端口/绑定默认不覆盖**（勾了才覆盖）——避免恢复完自己连不上
   - **防火墙规则恢复后自动补回当前 SSH 端口与面板端口的放行**（否则可能把自己锁在门外）
-  - 应用数据恢复（v3.3.14 起）：可**逐应用勾选**要恢复哪些应用 —— 先停目标应用容器 → 写回 `/DockerData/apps/<应用>` → mysql 应用再 `up -d db` 后导入包内 `database.sql` → 最后起回应用（可在界面关掉「恢复后起回容器」）
+  - 应用数据恢复（v3.3.14 起）：可**逐应用勾选**要恢复哪些应用 —— 先停目标应用容器 → 写回 `/DockerData/apps/<应用>` → mysql/mariadb 应用再 `up -d db` 后导入包内 `database.sql` → 最后起回应用（可在界面关掉「恢复后起回容器」）
+    - compose 项目文件**先写回、再动容器**（否则本次恢复用的还是旧配置，v3.3.15 修）；数据库命令同样自动适配 `mysql*` / `mariadb-*`（v3.3.15 修）
     - 逐文件比对包内 `sha256`（不符即跳过并报告）；路径**两层校验**（`..` 判定 + 落点 realpath 复核，只落在应用数据根之内），目标机里被换成软链接的子目录会被拒绝写入
     - 默认**不删除目标机多余文件**；需要与备份完全一致时，单独勾该应用的「**先清空**」（红色危险项，默认关，二次确认后才会删）
     - 只恢复与所选应用对应的 compose 项目文件，避免造出「有配置无数据」的空容器；⚠ 还要同时勾选「应用记录」，否则容器不会被重建

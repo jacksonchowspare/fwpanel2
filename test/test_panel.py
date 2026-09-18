@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tarfile
 import tempfile
@@ -8050,11 +8051,98 @@ class TestBackupApps(unittest.TestCase):
             d2 = panel.backup_app_dumps()
         self.assertEqual([c for c in self.calls if c[1] and c[1][0] == "exec"], [], "演练模式不该真的跑 mysqldump")
 
+    def test_sqlite_app_snapshot_hint(self):
+        """sqlite 应用（运行中快照）要在结果里提示 WAL 风险；勾了停机打包就不提（实机发现）"""
+        with unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok, msg = panel.backup_create_work(["apps"], note="wal-hint", opts={})
+        self.assertTrue(ok, msg)
+        self.assertIn("运行中快照", msg)
+        self.assertIn("Vaultwarden", msg, "要点名是哪个 sqlite 应用")
+        with unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok2, msg2 = panel.backup_create_work(["apps"], note="wal-hint2", opts={"stop": True})
+        self.assertTrue(ok2, msg2)
+        self.assertNotIn("运行中快照", msg2, "停机打包后不该再提这条")
+
     def test_module_ready(self):
         """应用数据档已转正"""
         mod = [m for m in panel.BACKUP_MODULES if m["id"] == "apps"][0]
         self.assertTrue(mod["ready"])
         self.assertIn("现场数据库 dump", mod["desc"])
+
+
+class TestAppDbShellCompat(unittest.TestCase):
+    """db 容器里的 mysql 系命令要兼容 mysql / mariadb 两种官方镜像（v3.3.15）
+
+    实机来源（ak，2026-09-18）：**mariadb:11 镜像里没有 mysql / mysqladmin / mysqldump**，
+    只有 mariadb / mariadb-admin / mariadb-dump → 打包时 dump 静默失败（包里没有 database.sql）、
+    恢复时探测白等 30 秒后跳过导入。三个 mysql 模板（WordPress/Typecho/Nextcloud）默认 db 镜像
+    都是 mariadb:11，等于这条路径整体不可用 —— 必须两种名字都认。
+    """
+
+    def setUp(self):
+        self.root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(self.root, "panel.py"), encoding="utf-8") as f:
+            self.py = f.read()
+
+    def test_snippet_maps_each_binary(self):
+        s = panel.app_db_shell("mysqldump", '-uroot -p"$PW" --all-databases')
+        self.assertIn("command -v mysqldump", s)
+        self.assertIn("exec mariadb-dump", s)
+        self.assertIn('-uroot -p"$PW" --all-databases', s)
+        self.assertIn("exec mariadb-admin ping", panel.app_db_shell("mysqladmin", "ping -uroot -p\"$PW\" --silent"))
+        self.assertIn("exec mariadb -uroot", panel.app_db_shell("mysql", '-uroot -p"$PW"'))
+
+    def test_snippet_picks_available_binary_in_real_sh(self):
+        """真跑 sh：只有 mariadb-* 时用 mariadb-*，只有 mysql-* 时用 mysql-*"""
+        tmp = tempfile.mkdtemp(prefix="fwdb-")
+        try:
+            for d, names in (("only-maria", ("mariadb-dump",)), ("only-mysql", ("mysqldump",))):
+                dd = os.path.join(tmp, d)
+                os.makedirs(dd)
+                for n in names:
+                    p = os.path.join(dd, n)
+                    with open(p, "w") as f:
+                        f.write("#!/bin/sh\necho RAN-%s $@\n" % n)
+                    os.chmod(p, 0o755)
+            s = panel.app_db_shell("mysqldump", "--all-databases")
+            sh_bin = "/bin/sh" if os.path.exists("/bin/sh") else "sh"
+            r1 = subprocess.run([sh_bin, "-c", s], capture_output=True, text=True,
+                                env=dict(os.environ, PATH=os.path.join(tmp, "only-maria")))
+            self.assertIn("RAN-mariadb-dump --all-databases", r1.stdout + r1.stderr)
+            r2 = subprocess.run([sh_bin, "-c", s], capture_output=True, text=True,
+                                env=dict(os.environ, PATH=os.path.join(tmp, "only-mysql")))
+            self.assertIn("RAN-mysqldump --all-databases", r2.stdout + r2.stderr)
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def test_no_bare_mysql_binaries_left(self):
+        """源码里不许再出现写死的 "exec mysql*"（必须走 app_db_shell）"""
+        import re as _re
+        hits = _re.findall(r"""["']exec (?:mysqldump|mysqladmin|mysql)\b""", self.py)
+        self.assertEqual(hits, [], "还有写死的 mysql 系命令：%s" % hits)
+
+    def test_all_db_callers_use_compat_snippet(self):
+        calls = []
+
+        def fake(folder, *args, **kw):
+            joined = " ".join(str(a) for a in args)
+            calls.append(joined)
+            return True, "mysqld is alive" if "mysqladmin" in joined or "mariadb-admin" in joined else "DUMP"
+
+        apps = [{"folder": "wp-8080", "name": "WP", "template": "wordpress", "db": "mysql",
+                 "data_dir": "/nonexistent", "port": 8080, "domain": ""}]
+        with unittest.mock.patch.object(panel, "app_compose_cmd", fake), \
+             unittest.mock.patch.object(panel, "backup_app_list", lambda: apps), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False), \
+             unittest.mock.patch.object(panel, "COMPOSE_BASE", "/nonexistent-compose"), \
+             unittest.mock.patch.dict(panel._backup_opts, {}, clear=True):
+            panel.backup_app_dumps(["wp-8080"])
+            panel._wait_db_ready("wp-8080", tries=1, delay=0)
+        self.assertTrue(calls, "应当有调用")
+        for c in calls:
+            self.assertIn("command -v", c, "mysql 系命令必须带家族回退：%s" % c)
+        self.assertTrue(any("mariadb-dump" in c for c in calls), "dump 要有 mariadb-dump 回退")
+        self.assertTrue(any("mariadb-admin" in c for c in calls), "ping 要有 mariadb-admin 回退")
 
 
 class TestBackupAppRestore(unittest.TestCase):
@@ -8089,6 +8177,7 @@ class TestBackupAppRestore(unittest.TestCase):
         self.calls = []
         self.stop_snapshot = {}      # 停容器那一刻，目标文件还是旧的？（验「停 → 写」顺序）
         self.up_snapshot = {}        # 起回容器那一刻，文件已是新的？（验「写 → 起」顺序）
+        self.stop_compose = {}       # 停容器那一刻，磁盘上的 compose 已是包内版本？（v3.3.15 实机教训）
 
         def _read(p):
             try:
@@ -8101,8 +8190,10 @@ class TestBackupAppRestore(unittest.TestCase):
             self.calls.append((folder, tuple(str(a) for a in args), dict(kw)))
             joined = " ".join(str(a) for a in args)
             idxp = os.path.join(self.dst_dd, "apps", folder, "html", "index.php")
+            cpath = os.path.join(self.dst_dd, "dockercompose", folder, "docker-compose.yml")
             if joined.startswith("stop"):
                 self.stop_snapshot[folder] = _read(idxp)
+                self.stop_compose[folder] = _read(cpath)
             elif joined.startswith("up -d") and " db" not in joined:
                 self.up_snapshot[folder] = _read(idxp)
             if "mysqldump" in joined:
@@ -8149,9 +8240,12 @@ class TestBackupAppRestore(unittest.TestCase):
         return path, man, ext
 
     def _dst_ready(self, folders=("wordpress-8080", "vaultwarden-8083")):
-        """目标机摆好 compose 文件；故意不给 nextcloud 放 → 验证「本机无此应用」分支"""
+        """目标机摆好 compose 文件；故意不给 nextcloud 放 → 验证「本机无此应用」分支
+
+        内容故意与包内不同（带 OLD-COMPOSE 标记）→ 用来验证「compose 先写回、再动容器」。"""
         for f in folders:
-            self._w(self.dst_dd, "dockercompose/%s/docker-compose.yml" % f, "services: {}")
+            self._w(self.dst_dd, "dockercompose/%s/docker-compose.yml" % f,
+                    "# OLD-COMPOSE\nservices: {}\n")
 
     def _restore(self, man, ext, opts=None, dry=False):
         self.calls.clear()
@@ -8238,13 +8332,28 @@ class TestBackupAppRestore(unittest.TestCase):
                if f == "wordpress-8080" and self._phase(a) == "import"][0]
         self.assertTrue(str(imp.get("stdin_file") or "").endswith(os.path.join("wordpress-8080", "database.sql")),
                         "要把包里的 SQL 喂给 mysql 的 stdin")
+        imp_args = " ".join(" ".join(a) for f, a, _kw in self.calls
+                            if f == "wordpress-8080" and self._phase(a) == "import")
+        self.assertIn("mariadb", imp_args, "导入命令要兼容 mariadb 镜像（没有 mysql 命令）")
         # sqlite 应用没有数据库导入这一步
         vw = [self._phase(a) for f, a, _kw in self.calls if f == "vaultwarden-8083"]
         self.assertEqual(vw, ["stop", "up"])
-        # 目标机没有这个应用（无 compose 文件）→ 不调 docker，但文件照样写回
-        self.assertEqual([c for c in self.calls if c[0] == "nextcloud-8082"], [])
+        # 包内带 compose 的应用：compose 先写回 → 容器一并重建（本次恢复就是用的新配置）
+        nc = [self._phase(a) for f, a, _kw in self.calls if f == "nextcloud-8082"]
+        self.assertEqual(nc[0], "stop")
         self.assertTrue(os.path.isfile(os.path.join(self.dst_dd, "apps/nextcloud-8082/html/index.html")))
-        self.assertIn("本机无此应用", msg)
+
+    def test_app_without_compose_anywhere_is_files_only(self):
+        """目标机与包里都没有 compose 的应用：只写文件、不碰 docker（并如实说明）"""
+        _, man, ext = self._pack()
+        self._dst_ready(("wordpress-8080",))          # 不给 vaultwarden 放 compose
+        ok, msg = self._restore(man, ext, {"apps": ["vaultwarden-8083"]})
+        self.assertTrue(ok, msg)
+        self.assertEqual([c for c in self.calls if c[0] == "vaultwarden-8083"], [],
+                         "没有 compose 就不该调 docker")
+        self.assertTrue(os.path.isfile(os.path.join(self.dst_dd, "apps/vaultwarden-8083/data/db.sqlite3")),
+                        "文件照样写回")
+        self.assertIn("本机无此应用配置", msg)
 
     def test_only_selected_apps_restored(self):
         """只恢复勾选的应用；没勾的应用连 compose 也不写（避免有配置无数据的空容器）"""
@@ -8268,6 +8377,20 @@ class TestBackupAppRestore(unittest.TestCase):
         wp = [self._phase(a) for f, a, _kw in self.calls if f == "wordpress-8080"]
         self.assertEqual(wp, ["stop", "up-db", "ping", "import"])
         self.assertIn("保持停止", msg)
+
+    def test_compose_written_before_containers_touched(self):
+        """compose 项目文件必须在停容器之前写回（实机教训：写在后面 → 本次恢复用旧配置）"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        ok, msg = self._restore(man, ext, {"apps": ["wordpress-8080"]})
+        self.assertTrue(ok, msg)
+        on_stop = self.stop_compose.get("wordpress-8080") or ""
+        self.assertNotIn("OLD-COMPOSE", on_stop,
+                         "停容器时磁盘上的 compose 必须已经是包内版本（否则本次恢复等于用了旧配置）")
+        self.assertIn("services:", on_stop)
+        cpath = os.path.join(self.dst_dd, "dockercompose/wordpress-8080/docker-compose.yml")
+        with open(cpath) as f:
+            self.assertNotIn("OLD-COMPOSE", f.read())
 
     def test_wipe_only_when_explicitly_asked(self):
         """危险项「先清空」默认关；显式勾选才删除包内没有的文件"""

@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.14"
+CURRENT_VERSION = "3.3.15"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -2599,7 +2599,7 @@ BACKUP_MODULES = [
     {"id": "nginx", "name": "nginx 配置", "desc": "面板写的反代/站点/兜底守卫配置", "on": True, "ready": True},
     {"id": "certs", "name": "证书（含私钥）", "desc": "面板管理/引用的证书与续期配置；⚠ 包内含私钥，请妥善保管（恢复后写回 /etc/letsencrypt 并按需 reload nginx）", "on": True, "ready": True},
     {"id": "sites", "name": "站点文件（/var/www）", "desc": "站点目录内容，含权限与属主；自动跳过 .git / node_modules / 缓存 / 临时目录 / logs 日志 / 软链接（可能较大）", "on": False, "ready": True},
-    {"id": "apps", "name": "Docker 应用数据", "desc": "面板部署的应用数据（db/html/data）+ 现场数据库 dump + compose 文件；不含镜像；可选停机打包与自动数据卷", "on": False, "ready": True},
+    {"id": "apps", "name": "Docker 应用数据", "desc": "面板部署的应用数据（db/html/data）+ 现场数据库 dump + compose 文件；不含镜像；可选停机打包与自动数据卷。⚠ sqlite 应用（如 Vaultwarden）建议勾「停机打包」：运行中快照里最新数据可能只存在于 WAL 文件（包内会一并包含，但停机更稳）", "on": False, "ready": True},
 ]
 
 RESTORE_ITEMS = [
@@ -3081,7 +3081,7 @@ def _wait_db_ready(folder, tries=15, delay=2.0):
     last = ""
     for _i in range(max(1, int(tries))):
         ok, out = app_compose_cmd(folder, "exec", "-T", "db", "sh", "-c",
-                                  'exec mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent',
+                                  app_db_shell("mysqladmin", 'ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent'),
                                   timeout=30, full=True)
         last = str(out or "")
         if ok and "alive" in last.lower():
@@ -3133,6 +3133,41 @@ def restore_app_files(src_root, man, opts=None):
             runs_items.append((e, arc))
     total_files, total_bytes = 0, 0
     report, skipped = [], []
+    data_root = os.path.dirname(src_root.rstrip("/"))      # <tmp>/data（apps / compose / runs 的共同父目录）
+
+    def _write_group(items, prefix, src_base, root):
+        n, sk = 0, []
+        for e, arc in items:
+            rest = arc[len(prefix):]
+            top = _app_folder_safe(rest.split("/", 1)[0]) if "/" in rest else ""
+            if not top or top not in sel:
+                sk.append(arc)
+                continue
+            if e.get("is_dir"):
+                continue
+            src = os.path.join(data_root, src_base, rest)
+            dst = _safe_dest_under(root, rest)
+            if not dst or not os.path.isfile(src):
+                sk.append(arc)
+                continue
+            want = e.get("sha256") or ""
+            if want and _sha256_file(src) != want:
+                sk.append(arc + "(校验和不符)")
+                continue
+            n += 1
+            if not DRY_RUN:
+                ok_w, why = _write_pkg_entry(src, dst, e, can_chown, chown_failed)
+                if not ok_w:
+                    sk.append("%s(%s)" % (arc, why))
+                    n -= 1
+        return n, sk
+
+    # ⚠ compose 项目文件必须在**停容器之前**写回：下面的 stop / up -d 都是按磁盘上的
+    # compose 文件操作的，写在后面等于这次恢复用的还是旧配置（实机踩过：包里 compose
+    # 与现场不同 → up -d db 报 "no such service: db"）
+    compose_n, compose_sk = _write_group(compose_items, BACKUP_COMPOSE_ARC, "compose", compose_base)
+    runs_n, runs_sk = _write_group(runs_items, BACKUP_RUNS_ARC, "runs", runs_base)
+
     for folder in sorted(by_app):
         if folder not in sel:
             continue
@@ -3147,7 +3182,7 @@ def restore_app_files(src_root, man, opts=None):
             ok_st, msg_st = app_compose_cmd(folder, "stop", timeout=180)
             steps.append("停容器" + ("完成" if ok_st else "失败：%s" % str(msg_st)[:80]))
         else:
-            steps.append("本机无此应用（跳过停容器）")
+            steps.append("本机无此应用配置（跳过停容器）")
         # 2) 清空（危险项，默认关；显式勾选才做）
         if folder in wipe and not DRY_RUN:
             n_rm, failed = _wipe_dir_contents(target)
@@ -3200,15 +3235,18 @@ def restore_app_files(src_root, man, opts=None):
         dump_src = dumps.get(folder)
         if rec.get("db") == "mysql" or (not rec.get("db") and dump_src):
             if not dump_src:
-                steps.append("包内无数据库导出（未导入）")
+                if folder in wipe:
+                    steps.append("⚠ 包内无数据库导出且已清空数据目录（数据库将由容器重新初始化！）")
+                else:
+                    steps.append("包内无数据库导出（未导入，仅文件级恢复）")
             elif DRY_RUN:
                 steps.append("导入数据库（演练跳过）")
             elif not os.path.isfile(app_compose_file(folder)):
-                steps.append("本机无此应用（未导入数据库）")
+                steps.append("本机无此应用配置（未导入数据库）")
             else:
                 ok_d, msg_d = app_compose_cmd(folder, "up", "-d", "db", timeout=300)
                 if not ok_d:
-                    steps.append("起 db 失败：%s" % str(msg_d)[:100])
+                    steps.append("起 db 失败（compose 里没有 db 服务？）：%s" % str(msg_d)[:100])
                 else:
                     ready, _why = _wait_db_ready(folder)
                     if not ready:
@@ -3216,7 +3254,7 @@ def restore_app_files(src_root, man, opts=None):
                     else:
                         ok_i, msg_i = app_compose_cmd(
                             folder, "exec", "-T", "db", "sh", "-c",
-                            'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD"',
+                            app_db_shell("mysql", '-uroot -p"$MYSQL_ROOT_PASSWORD"'),
                             timeout=3600, full=True, stdin_file=dump_src)
                         steps.append("导入数据库" + ("完成" if ok_i else "失败：%s" % str(msg_i)[:120]))
         # 5) 起回应用
@@ -3228,41 +3266,9 @@ def restore_app_files(src_root, man, opts=None):
             ok_u, msg_u = app_compose_cmd(folder, "up", "-d", timeout=300)
             steps.append("起回容器" + ("完成" if ok_u else "失败：%s" % str(msg_u)[:80]))
         else:
-            steps.append("本机无此应用（跳过起回）")
+            steps.append("本机无此应用配置（跳过起回）")
         report.append("%s：%s（%d 文件 / %.1f MB / %.1fs）" % (
             rec.get("name") or folder, "、".join(steps), f_n, b_n / 1048576.0, time.time() - t0))
-    # compose 项目文件 / 自动数据卷：只写「对应应用也恢复」的项目（避免造出有配置无数据的空容器）
-    data_root = os.path.dirname(src_root.rstrip("/"))      # <tmp>/data（apps / compose / runs 的共同父目录）
-
-    def _write_group(items, prefix, src_base, root):
-        n, sk = 0, []
-        for e, arc in items:
-            rest = arc[len(prefix):]
-            top = _app_folder_safe(rest.split("/", 1)[0]) if "/" in rest else ""
-            if not top or top not in sel:
-                sk.append(arc)
-                continue
-            if e.get("is_dir"):
-                continue
-            src = os.path.join(data_root, src_base, rest)
-            dst = _safe_dest_under(root, rest)
-            if not dst or not os.path.isfile(src):
-                sk.append(arc)
-                continue
-            want = e.get("sha256") or ""
-            if want and _sha256_file(src) != want:
-                sk.append(arc + "(校验和不符)")
-                continue
-            n += 1
-            if not DRY_RUN:
-                ok_w, why = _write_pkg_entry(src, dst, e, can_chown, chown_failed)
-                if not ok_w:
-                    sk.append("%s(%s)" % (arc, why))
-                    n -= 1
-        return n, sk
-
-    compose_n, compose_sk = _write_group(compose_items, BACKUP_COMPOSE_ARC, "compose", compose_base)
-    runs_n, runs_sk = _write_group(runs_items, BACKUP_RUNS_ARC, "runs", runs_base)
     skipped.extend(compose_sk)
     skipped.extend(runs_sk)
     skipped.extend(skipped_other)
@@ -3674,7 +3680,8 @@ def backup_app_dumps(app_folders=None):
             out.append(("%s%s/database.sql" % (BACKUP_APPS_ARC, a["folder"]), b"", a["name"] + "（演练跳过）"))
             continue
         ok, txt = app_compose_cmd(a["folder"], "exec", "-T", "db", "sh", "-c",
-                                  'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --all-databases',
+                                  app_db_shell("mysqldump",
+                                               '-uroot -p"$MYSQL_ROOT_PASSWORD" --all-databases'),
                                   timeout=900, full=True)
         if not ok or not txt.strip():
             out.append(("%s%s/database.sql" % (BACKUP_APPS_ARC, a["folder"]), b"",
@@ -3870,7 +3877,14 @@ def backup_create_work(modules, note="", name_prefix="", opts=None):
         dmap = {}
         if "apps" in mods:
             dmap = {arc: data for arc, data, _note in backup_app_dumps(_backup_opts.get("apps")) if data}
-        return _backup_pack(mods, man, files, note, name_prefix, dmap)
+        ok, msg = _backup_pack(mods, man, files, note, name_prefix, dmap)
+        # ⚠ 运行中快照的 sqlite 应用：最新数据可能还没合并进主库文件、只在 -wal 里
+        # （实机验证：ak 上的 Vaultwarden 主库单独 integrity_check 通过但用户记录在 WAL 里）
+        if ok and "apps" in mods and not _backup_opts.get("stop"):
+            sq = [a.get("name") or a.get("folder") for a in (man.get("apps") or []) if a.get("db") == "sqlite"]
+            if sq:
+                msg += "；⚠ %s 为运行中快照（最新数据可能仍在 WAL，建议勾「停机打包」）" % "、".join(sq[:2])
+        return ok, msg
     finally:
         if stopped:
             backup_apps_start(stopped)
@@ -4357,6 +4371,22 @@ def app_compose_file(folder):
     return os.path.join(COMPOSE_BASE, folder, "docker-compose.yml")
 
 
+def app_db_shell(mysql_bin, args):
+    """在 db 容器里执行 mysql 系命令的 sh 片段（兼容 mysql / mariadb 两种官方镜像）
+
+    ⚠ 实机验证（2026-09，ak 上的 mariadb:11）：**mariadb 官方镜像里没有 mysql / mysqladmin /
+    mysqldump**，只有 mariadb / mariadb-admin / mariadb-dump —— 直接 `exec mysqldump` 会报
+    `sh: 1: exec: mysqldump: not found`，于是：备份时数据库 dump 静默失败（包里没有 database.sql）、
+    恢复时 mysqladmin 探测失败白等 30 秒后跳过导入。三个 mysql 模板（WordPress/Typecho/Nextcloud）
+    默认 db 镜像都是 mariadb:11，所以这条路径必须两种名字都认。
+    （compose 里的健康检查早就做过同样区分，这里是与它对齐。）
+    """
+    alt = {"mysql": "mariadb", "mysqladmin": "mariadb-admin",
+           "mysqldump": "mariadb-dump"}.get(mysql_bin, mysql_bin)
+    return ("if command -v %s >/dev/null 2>&1; then exec %s %s; fi; exec %s %s"
+            % (mysql_bin, mysql_bin, args, alt, args))
+
+
 def app_compose_cmd(folder, *args, timeout=300, full=False, stdin_data=None, stdin_file=""):
     """在应用 compose 项目目录执行 docker compose 子命令
 
@@ -4540,7 +4570,8 @@ def app_backup_work(aid):
         dump = os.path.join(staging, "database.sql")
         ok, out = app_compose_cmd(app["folder"], "exec", "-T", "db",
                                   "sh", "-c",
-                                  'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --all-databases',
+                                  app_db_shell("mysqldump",
+                                               '-uroot -p"$MYSQL_ROOT_PASSWORD" --all-databases'),
                                   timeout=900, full=True)
         if ok:
             with open(dump, "w") as f:
