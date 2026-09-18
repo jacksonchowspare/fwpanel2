@@ -1519,6 +1519,13 @@ window.addEventListener("error", function (ev) {
 
       <div style="font-size:13px;margin-bottom:6px">备份内容</div>
       <div id="bk_mods" style="display:flex;flex-wrap:wrap;gap:12px;font-size:13px;margin-bottom:8px"></div>
+      <div id="bk_apps_box" style="margin-bottom:8px"></div>
+      <div id="bk_opts" style="display:flex;flex-wrap:wrap;gap:14px;font-size:12px;color:var(--muted);margin-bottom:10px">
+        <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer" title="打包前暂停应用容器（compose stop），打完自动起回——数据库与文件都是停机后的状态，更一致，但应用会短暂中断">
+          <input type="checkbox" id="bk_opt_stop" style="width:auto"> 停机打包（更一致，会短暂中断应用）</label>
+        <label style="display:inline-flex;align-items:center;gap:5px;cursor:pointer" title="包含 /DockerData/dockerrun 下你手动跑容器时挂的数据目录（默认不含）">
+          <input type="checkbox" id="bk_opt_runs" style="width:auto"> 含自动数据卷 dockerrun</label>
+      </div>
       <div class="form-row" style="margin-bottom:10px">
         <input id="bk_note" placeholder="备注（可选，例如「换机前」）" style="flex:1;min-width:180px">
         <button class="btn" id="bk_btn" onclick="bkCreate()">开始备份</button>
@@ -1999,13 +2006,15 @@ async function bkLoad() {
           " / " + (sz.files || 0) + " 个文件</span>"
         : "";
       return '<label style="display:inline-flex;align-items:center;gap:5px;' + (m.ready ? "" : "opacity:.45") + '" title="' + attrEsc(m.desc || "") + '">' +
-        '<input type="checkbox" data-bkmod="' + attrEsc(m.id) + '"' + (m.on && m.ready ? " checked" : "") + (m.ready ? "" : " disabled") + ' style="width:auto"> ' +
+        '<input type="checkbox" data-bkmod="' + attrEsc(m.id) + '"' + (m.on && m.ready ? " checked" : "") + (m.ready ? "" : " disabled") +
+        ' onchange="bkAppsToggle()" style="width:auto"> ' +
         esc(m.name) + (m.ready ? "" : "（后续版本）") + hint + '</label>';
     }).join("");
     const c = d.counts || {};
     $("bk_hint").innerHTML = "落地目录 <b>" + esc(d.dir) + "</b> ｜ 可用空间 " + bkFmt(d.free) +
       " ｜ 当前内容：规则 " + (c.rules || 0) + " 条 · 反代 " + (c.proxies || 0) + " 个 · 站点 " + (c.sites || 0) +
       " 个 · 应用 " + (c.apps || 0) + " 个 · 证书 " + (c.certs || 0) + " 张";
+    bkAppsRender(d.apps || {});
     bkTable(d.items || []);
   } catch (e) {
     $("bk_hint").textContent = "读取备份信息失败：" + (e.message || "");
@@ -2037,14 +2046,69 @@ function bkTable(items) {
   }).join("");
 }
 
+let bkAppSel = {};        // {应用目录: {子目录: 勾选}}
+
+function bkAppsToggle() {
+  const box = $("bk_apps_box");
+  if (!box) return;
+  const on = bkMods().indexOf("apps") >= 0;
+  box.style.display = on ? "" : "none";
+}
+
+function bkAppsRender(info) {
+  const box = $("bk_apps_box");
+  if (!box) return;
+  const list = (info && info.apps) || [];
+  if (!list.length) {
+    box.innerHTML = '<div style="color:var(--muted);font-size:12px">站点与应用的备份里没有 Docker 应用数据（没有部署应用时此项为空）</div>';
+    bkAppsToggle();
+    return;
+  }
+  bkAppSel = bkAppSel || {};
+  box.innerHTML = '<div style="color:var(--muted);font-size:12px;margin-bottom:6px">应用数据范围：共 ' +
+      bkFmt(info.bytes || 0) + (info.compose_bytes ? "（含 compose 文件 " + bkFmt(info.compose_bytes) + "）" : "") +
+      ' —— 取消勾选可排除大目录（例如网盘的用户文件）</div>' +
+    list.map(a => {
+      bkAppSel[a.folder] = bkAppSel[a.folder] || {};
+      const subs = (a.subs || []).map(s => {
+        if (bkAppSel[a.folder][s.name] === undefined) bkAppSel[a.folder][s.name] = true;
+        return '<label style="display:inline-flex;align-items:center;gap:4px;margin-right:12px;font-size:12px;cursor:pointer">' +
+          '<input type="checkbox" data-bkapp="' + attrEsc(a.folder) + '" data-bksub="' + attrEsc(s.name) + '"' +
+          (bkAppSel[a.folder][s.name] ? " checked" : "") + ' style="width:auto"> ' +
+          esc(s.name) + " " + bkFmt(s.bytes) + '</label>';
+      }).join("");
+      return '<div style="margin-bottom:6px">' +
+        '<div style="font-size:13px"><b>' + esc(a.name) + '</b> <span style="color:var(--muted)">' + esc(a.folder) +
+        (a.db ? " · " + esc(a.db) : "") + " · " + bkFmt(a.bytes) + '</span></div>' +
+        '<div style="margin-left:14px">' + subs + '</div></div>';
+    }).join("");
+  bkAppsToggle();
+}
+
+function bkAppsOpts() {
+  const o = { apps: [], skip_subs: {} };
+  document.querySelectorAll("#bk_apps_box [data-bkapp]").forEach(c => {
+    const folder = c.dataset.bkapp, sub = c.dataset.bksub;
+    if (o.apps.indexOf(folder) < 0) o.apps.push(folder);
+    if (!c.checked) (o.skip_subs[folder] = o.skip_subs[folder] || []).push(sub);
+  });
+  return o;
+}
+
 async function bkCreate() {
   const mods = bkMods();
   if (!mods.length) { toast("请至少勾选一项备份内容", "err"); return; }
   const btn = $("bk_btn");
   if (btn) btn.disabled = true;
+  let opts = null;
+  if (mods.indexOf("apps") >= 0) {          // v3.3.13：应用数据范围与选项
+    opts = bkAppsOpts();
+    opts.stop = !!($("bk_opt_stop") || {}).checked;
+    opts.dockerrun = !!($("bk_opt_runs") || {}).checked;
+  }
   try {
     const r = await apiTask("POST", "/api/backup/create",
-      { modules: mods, note: (($("bk_note") || {}).value || "") },
+      { modules: mods, note: (($("bk_note") || {}).value || ""), opts: opts },
       t => { $("bk_hint").textContent = "备份中：" + (t.msg || ""); });
     toast(r.msg || "备份完成");
     if ($("bk_note")) $("bk_note").value = "";

@@ -7202,14 +7202,18 @@ class TestBackup(unittest.TestCase):
                          panel._sha256_file(os.path.join(self.etc, "config.json")))
 
     def test_create_rejects_unknown_modules(self):
-        """未实现的模块与不存在的模块都要被拒（证书档 v3.3.10、站点档 v3.3.12 均已转正）"""
-        ok, msg = panel.backup_create_work(["apps"], note="")   # apps 仍属未实现（v3.3.12 起 sites 已转正）
+        """不存在的模块要被拒；已实现但环境里没内容的模块走「没有可备份的内容」
+
+        v3.3.13 起五个模块全部实现（config/nginx/certs/sites/apps），所以"未实现"这一分支已不存在。
+        """
+        ok, msg = panel.backup_create_work(["unknown-id"], note="")
         self.assertFalse(ok)
         self.assertIn("没有可备份的模块", msg)
         self.assertIn("证书（含私钥）", msg, "提示里应列出当前支持的模块")
-        ok2, msg2 = panel.backup_create_work(["unknown-id"], note="")
+        self.assertIn("Docker 应用数据", msg)
+        ok2, msg2 = panel.backup_create_work(["apps"], note="")
         self.assertFalse(ok2)
-        self.assertIn("没有可备份的模块", msg2)
+        self.assertIn("没有可备份的内容", msg2)
 
     def test_name_and_path_safety(self):
         self.assertEqual(panel.backup_path("../../etc/passwd"), "")
@@ -7876,6 +7880,171 @@ class TestBackupSiteFiles(unittest.TestCase):
             man2 = panel.backup_make_manifest(["sites"], "t")
         self.assertTrue(man2["hash_limited"])
         self.assertTrue(all(e["sha256"] == "" for e in man2["files"] if not e.get("is_dir")))
+
+
+class TestBackupApps(unittest.TestCase):
+    """备份「Docker 应用数据」（打包侧，v3.3.13）
+
+    覆盖：应用清单与体积明细、排除应用自身 backups/、compose 文件、现场数据库 dump（仅 mysql 应用）、
+    子目录反勾、dockerrun 可选、停机打包的顺序（stop → dump → up）、演练模式不 dump。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fwapps-")
+        self.dd = os.path.join(self.tmp, "DockerData")
+        os.environ["FW_DOCKER_DATA"] = self.dd
+        self._w("apps/wordpress-8080/db/wp.sql")
+        self._w("apps/wordpress-8080/html/index.php", "<?php")
+        self._w("apps/wordpress-8080/html/wp-content/uploads/big.bin", "B" * 4096)
+        self._w("apps/wordpress-8080/backups/old.tar.gz", "OLD" * 20000)   # 体积统计不该计入它
+        self._w("apps/vaultwarden-8083/data/db.sqlite3", "SQLITE")
+        self._w("apps/nextcloud-8082/db/nc.sql")
+        self._w("apps/nextcloud-8082/html/data/userfile.bin", "U" * 2048)
+        self._w("dockercompose/wordpress-8080/docker-compose.yml", "services: {}")
+        self._w("dockerrun/manual-run/note.txt", "manual")
+        self.apps = [
+            {"folder": "wordpress-8080", "name": "WordPress", "template": "wordpress",
+             "data_dir": os.path.join(self.dd, "apps/wordpress-8080"), "port": 8080, "domain": ""},
+            {"folder": "vaultwarden-8083", "name": "Vaultwarden", "template": "vaultwarden",
+             "data_dir": os.path.join(self.dd, "apps/vaultwarden-8083"), "port": 8083, "domain": "v.example.com"},
+            {"folder": "nextcloud-8082", "name": "Nextcloud", "template": "nextcloud",
+             "data_dir": os.path.join(self.dd, "apps/nextcloud-8082"), "port": 8082, "domain": ""},
+        ]
+        self.calls = []
+
+        def fake_compose(folder, *args, timeout=300, full=False):
+            self.calls.append((folder, args))
+            if args and args[0] == "exec":
+                return True, "-- MySQL dump\nCREATE TABLE t (id int);\n"
+            return True, ""
+
+        self.backup_dir = os.path.join(self.tmp, "backups")
+        self._patches = [
+            unittest.mock.patch.object(panel, "DOCKER_DATA_BASE", self.dd),
+            unittest.mock.patch.object(panel, "BACKUP_DIR", self.backup_dir),
+            unittest.mock.patch.object(panel, "CURRENT_VERSION", "3.3.13"),
+            unittest.mock.patch.object(panel, "BackupConfigGuard", None, create=True),
+            unittest.mock.patch.object(panel, "AppStore",
+                                       lambda: types.SimpleNamespace(
+                                           apps=self.apps,
+                                           get=lambda f: next((a for a in self.apps if a["folder"] == f), None))),
+            unittest.mock.patch.object(panel, "app_compose_cmd", fake_compose),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        os.environ.pop("FW_DOCKER_DATA", None)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _w(self, rel, data="x", mode=0o644):
+        p = os.path.join(self.dd, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(p, mode)
+
+    def _pack(self, opts=None, note="t"):
+        # 测试环境默认 DRY_RUN=1（dump 会被跳过），这里显式关掉以验证真实打包路径
+        with unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok, msg = panel.backup_create_work(["apps"], note=note, opts=opts or {})
+        self.assertTrue(ok, msg)
+        pkg = sorted(f for f in os.listdir(self.backup_dir) if f.endswith(".tar.gz"))[-1]
+        pkg_path = os.path.join(self.backup_dir, pkg)
+        with open(pkg_path + ".json", encoding="utf-8") as f:
+            man = json.load(f)
+        ext = os.path.join(self.tmp, "ext-" + note)
+        with tarfile.open(pkg_path) as tf:
+            tf.extractall(ext)
+        return man, ext
+
+    def test_app_list_and_subdir_sizes(self):
+        """清单要有逐应用、逐子目录体积（界面据此反勾大目录）"""
+        lst = {a["folder"]: a for a in panel.backup_app_list()}
+        self.assertEqual(sorted(lst), ["nextcloud-8082", "vaultwarden-8083", "wordpress-8080"])
+        wp = lst["wordpress-8080"]
+        subs = {x["name"]: x["bytes"] for x in wp["subs"]}
+        self.assertEqual(sorted(subs), ["db", "html"])
+        self.assertGreaterEqual(subs["html"], 4096)
+        self.assertEqual(wp["db"], "mysql")
+        self.assertEqual(lst["vaultwarden-8083"]["db"], "sqlite")
+        st = panel.backup_apps_size()
+        self.assertGreater(st["bytes"], 0)
+        self.assertGreater(st["compose_bytes"], 0)
+
+    def test_size_stats_exclude_app_own_backups(self):
+        """体积统计要排除应用自身的 backups/（否则界面显示的体积虚高）"""
+        wp = [x for x in panel.backup_app_list() if x["folder"] == "wordpress-8080"][0]
+        subs_all = sum(x["bytes"] for x in wp["subs"])
+        self.assertEqual(wp["bytes"], subs_all, "应用体积应只算模板子目录（不含 backups/）")
+        self.assertLess(wp["bytes"], 1000 * 1000, "backups/ 里那 60KB 不该被算进来")
+        idx = os.path.join(self.dd, "apps/wordpress-8080/backups")
+        self.assertTrue(os.path.isdir(idx))
+
+    def test_collect_scope(self):
+        """collect：排除应用自身 backups/、含 compose、默认不含 dockerrun"""
+        arcs = sorted(a for _, a in panel.backup_collect(["apps"]))
+        self.assertFalse(any("/backups/" in a for a in arcs), "应用自己的备份目录不该套娃进新包")
+        self.assertIn("data/compose/wordpress-8080/docker-compose.yml", arcs)
+        self.assertFalse(any(a.startswith("data/runs/") for a in arcs))
+
+    def test_dockerrun_is_optional(self):
+        """含 dockerrun 时才收自动数据卷"""
+        with unittest.mock.patch.dict(panel._backup_opts, {"dockerrun": True}, clear=False):
+            arcs = sorted(a for _, a in panel.backup_collect(["apps"]))
+        self.assertIn("data/runs/manual-run/note.txt", arcs)
+
+    def test_skip_subs(self):
+        """反勾的子目录必须同时从 collect 与 manifest 里排除（否则照样进包）"""
+        man, _ = self._pack({"skip_subs": {"nextcloud-8082": ["html"]}}, note="skip")
+        arcs = [e["arc"] for e in man["files"]]
+        self.assertFalse(any("nextcloud-8082/html" in a for a in arcs))
+        self.assertTrue(any("nextcloud-8082/db" in a for a in arcs))
+
+    def test_package_has_dump_for_mysql_only(self):
+        """包内要有 mysql 应用的 database.sql（0600），sqlite 应用不需要"""
+        man, ext = self._pack()
+        arcs = [e["arc"] for e in man["files"]]
+        self.assertIn("data/apps/wordpress-8080/database.sql", arcs)
+        self.assertIn("data/apps/nextcloud-8082/database.sql", arcs)
+        self.assertNotIn("data/apps/vaultwarden-8083/database.sql", arcs)
+        dump = os.path.join(ext, "data/apps/wordpress-8080/database.sql")
+        with open(dump, encoding="utf-8") as f:
+            self.assertIn("MySQL dump", f.read())
+        self.assertEqual(oct(os.stat(dump).st_mode & 0o777), "0o600")
+        ent = [e for e in man["files"] if e["arc"].endswith("wordpress-8080/database.sql")][0]
+        self.assertEqual(len(ent["sha256"]), 64)
+
+    def test_stop_option_orders_stop_dump_up(self):
+        """停机打包：先 stop → 再 dump → 最后 up（顺序不能错）"""
+        self.calls.clear()
+        self._pack({"stop": True, "apps": ["wordpress-8080"]}, note="stop")
+        seq = [(f, a[0]) for f, a in self.calls]
+        self.assertEqual(seq[0], ("wordpress-8080", "stop"))
+        self.assertEqual(seq[-1], ("wordpress-8080", "up"))
+        self.assertIn(("wordpress-8080", "exec"), seq)
+        self.assertLess(seq.index(("wordpress-8080", "stop")), seq.index(("wordpress-8080", "exec")))
+        # 只针对指定应用（不给 apps 白名单之外的应用停机）
+        self.assertNotIn(("nextcloud-8082", "stop"), seq)
+
+    def test_dry_run_makes_no_dump(self):
+        """演练模式：不执行 dump、不产生内容"""
+        with unittest.mock.patch.object(panel, "DRY_RUN", True):
+            d = panel.backup_app_dumps()
+        self.assertTrue(d)
+        self.assertTrue(all(b == b"" for _, b, _ in d))
+        self.calls.clear()
+        with unittest.mock.patch.object(panel, "DRY_RUN", True):
+            d2 = panel.backup_app_dumps()
+        self.assertEqual([c for c in self.calls if c[1] and c[1][0] == "exec"], [], "演练模式不该真的跑 mysqldump")
+
+    def test_module_ready(self):
+        """应用数据档已转正"""
+        mod = [m for m in panel.BACKUP_MODULES if m["id"] == "apps"][0]
+        self.assertTrue(mod["ready"])
+        self.assertIn("现场数据库 dump", mod["desc"])
 
 
 class TestBackupAPI(unittest.TestCase):

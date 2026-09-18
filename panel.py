@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.12"
+CURRENT_VERSION = "3.3.13"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -2581,6 +2581,13 @@ BACKUP_HASH_MAX_BYTES = 256 * 1024 * 1024                       # 超此体积�
 BACKUP_SNAPSHOT_SITE_MAX = 1024 * 1024 * 1024                   # 站点体积超此值不进恢复前快照
 BACKUP_SITE_WALK_CAP = 200000                                   # 体积统计的条目上限（防页面卡死）
 
+# ---- 应用数据档（v3.3.13）----
+BACKUP_APPS_ARC = "data/apps/"           # 应用数据在包内的前缀
+BACKUP_COMPOSE_ARC = "data/compose/"     # compose 项目文件
+BACKUP_RUNS_ARC = "data/runs/"           # 自动数据卷（dockerrun，可选）
+# 应用自身的 backups/ 不参与「体积统计」（打包范围由模板子目录决定，天然不含它）
+BACKUP_APPS_EXCLUDE_DIRS = ("backups",)
+
 BACKUP_RECORD_FILES = ("config.json", "rules.json", "proxies.json", "sites.json",
                        "certificates.json", "apps.json", "fed_nodes.json", "firewall.nft")
 
@@ -2589,7 +2596,7 @@ BACKUP_MODULES = [
     {"id": "nginx", "name": "nginx 配置", "desc": "面板写的反代/站点/兜底守卫配置", "on": True, "ready": True},
     {"id": "certs", "name": "证书（含私钥）", "desc": "面板管理/引用的证书与续期配置；⚠ 包内含私钥，请妥善保管（恢复后写回 /etc/letsencrypt 并按需 reload nginx）", "on": True, "ready": True},
     {"id": "sites", "name": "站点文件（/var/www）", "desc": "站点目录内容，含权限与属主；自动跳过 .git / node_modules / 缓存 / 临时目录 / logs 日志 / 软链接（可能较大）", "on": False, "ready": True},
-    {"id": "apps", "name": "Docker 应用数据", "desc": "应用数据与数据库 dump（可能很大）", "on": False, "ready": False},
+    {"id": "apps", "name": "Docker 应用数据", "desc": "面板部署的应用数据（db/html/data）+ 现场数据库 dump + compose 文件；不含镜像；可选停机打包与自动数据卷", "on": False, "ready": True},
 ]
 
 RESTORE_ITEMS = [
@@ -3135,6 +3142,209 @@ def backup_sites_size():
     return {"bytes": total, "files": cnt, "truncated": truncated}
 
 
+def backup_docker_base():
+    """Docker 数据根（默认 /DockerData，测试可用 FW_DOCKER_DATA 覆盖）"""
+    try:
+        return DOCKER_DATA_BASE
+    except Exception:
+        return "/DockerData"
+
+
+def backup_app_list():
+    """面板部署的应用清单（含体积明细，供界面逐应用/逐子目录勾选）"""
+    base = backup_docker_base()
+    out = []
+    try:
+        apps = list(AppStore().apps or [])
+    except Exception:
+        apps = []
+    for a in apps:
+        folder = str((a or {}).get("folder") or "").strip()
+        if not folder:
+            continue
+        ddir = str(a.get("data_dir") or os.path.join(base, "apps", folder)).strip()
+        if not os.path.isdir(ddir):
+            continue
+        subs = []
+        for sub in app_data_subdirs(a.get("template")):
+            p = os.path.join(ddir, sub)
+            size, cnt, trunc = _walk_size(p)
+            subs.append({"name": sub, "bytes": size, "files": cnt, "truncated": trunc})
+        total, cnt, trunc = _walk_size(ddir, exclude_top=BACKUP_APPS_EXCLUDE_DIRS)
+        out.append({
+            "folder": folder, "name": str(a.get("name") or folder),
+            "template": str(a.get("template") or ""),
+            "domain": str(a.get("domain") or ""), "port": a.get("port"),
+            "db": (app_template(a.get("template")) or {}).get("db") or "",
+            "dir": ddir, "bytes": total, "files": cnt, "truncated": trunc, "subs": subs,
+        })
+    return out
+
+
+def _walk_size(path, exclude_top=()):
+    """目录体积/文件数（有上限，避免超大目录拖死页面）"""
+    total, cnt, truncated = 0, 0, False
+    if not os.path.isdir(path):
+        return 0, 0, False
+    for cur, dirs, files in os.walk(path, followlinks=False):
+        rel = os.path.relpath(cur, path)
+        if rel == ".":
+            dirs[:] = [d for d in dirs if d not in exclude_top]
+        for fn in files:
+            p = os.path.join(cur, fn)
+            if os.path.islink(p):
+                continue
+            try:
+                total += os.path.getsize(p)
+            except OSError:
+                continue
+            cnt += 1
+            if cnt >= BACKUP_SITE_WALK_CAP:
+                return total, cnt, True
+    return total, cnt, truncated
+
+
+def backup_app_entries(app_folders=None, skip_subs=None, with_runs=False):
+    """应用数据 + compose 文件条目（{abs, arc, size, mode, uid, gid, mtime, is_dir}）
+
+    app_folders: 只收这些应用（None = 全部）
+    skip_subs:   {folder: [子目录名]} 需要排除的大目录
+    with_runs:   是否含 dockerrun 下的自动数据卷
+    """
+    base = backup_docker_base()
+    want = set(app_folders) if app_folders else None
+    skip_subs = dict(skip_subs or {})
+    entries = []
+
+    def add_tree(root_abs, arc_prefix, exclude_top=()):
+        for cur, dirs, files in os.walk(root_abs, followlinks=False):
+            rel = os.path.relpath(cur, root_abs)
+            arc_dir = arc_prefix if rel == "." else arc_prefix.rstrip("/") + "/" + rel.replace(os.sep, "/")
+            if rel == "." and exclude_top:
+                dirs[:] = [d for d in dirs if d not in exclude_top]
+            try:
+                st = os.stat(cur)
+            except OSError:
+                continue
+            entries.append({"abs": cur, "arc": arc_dir, "size": 0, "mode": stat.S_IMODE(st.st_mode),
+                            "uid": st.st_uid, "gid": st.st_gid, "mtime": int(st.st_mtime), "is_dir": True})
+            for fn in sorted(files):
+                p = os.path.join(cur, fn)
+                if os.path.islink(p):
+                    continue
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                entries.append({"abs": p, "arc": arc_dir + "/" + fn, "size": st.st_size,
+                                "mode": stat.S_IMODE(st.st_mode), "uid": st.st_uid, "gid": st.st_gid,
+                                "mtime": int(st.st_mtime), "is_dir": False})
+
+    for a in backup_app_list():
+        folder = a["folder"]
+        if want is not None and folder not in want:
+            continue
+        ddir = a["dir"]
+        skip = set(skip_subs.get(folder) or [])
+        for sub in app_data_subdirs(a["template"]):
+            if sub in skip:
+                continue
+            p = os.path.join(ddir, sub)
+            if os.path.isdir(p):
+                add_tree(p, BASE_APP_ARC_SUB(folder, sub))
+    # compose 项目文件（重建容器靠它）
+    cdir = os.path.join(base, "dockercompose")
+    if os.path.isdir(cdir):
+        for name in sorted(os.listdir(cdir)):
+            p = os.path.join(cdir, name)
+            if os.path.isdir(p):
+                add_tree(p, BACKUP_COMPOSE_ARC + name)
+    if with_runs:
+        rdir = os.path.join(base, "dockerrun")
+        if os.path.isdir(rdir):
+            for name in sorted(os.listdir(rdir)):
+                p = os.path.join(rdir, name)
+                if os.path.isdir(p):
+                    add_tree(p, BACKUP_RUNS_ARC + name)
+    return entries
+
+
+def BASE_APP_ARC_SUB(folder, sub):
+    """应用子目录在包内的路径"""
+    return "%s%s/%s" % (BACKUP_APPS_ARC, folder, sub)
+
+
+def backup_apps_size():
+    """应用数据体积（逐应用明细 + compose），供界面显示与快照阈值判断"""
+    apps = backup_app_list()
+    compose_bytes = 0
+    cdir = os.path.join(backup_docker_base(), "dockercompose")
+    if os.path.isdir(cdir):
+        for name in sorted(os.listdir(cdir)):
+            p = os.path.join(cdir, name)
+            if os.path.isdir(p):
+                compose_bytes += _walk_size(p)[0]
+    return {"bytes": sum(a["bytes"] for a in apps) + compose_bytes,
+            "files": sum(a["files"] for a in apps),
+            "apps": apps, "compose_bytes": compose_bytes,
+            "truncated": any(a["truncated"] for a in apps)}
+
+
+def backup_app_dumps(app_folders=None):
+    """现场导出数据库（mysql 应用）：返回 [(arc, 内容 bytes, 应用名)]；演练模式跳过
+
+    同一次打包内结果复用（manifest 与打包循环都要用，不能跑两遍 mysqldump）。
+    """
+    cached = _backup_opts.get("_dumps")
+    if cached is not None:
+        return cached
+    out = []
+    want = set(app_folders) if app_folders else None
+    for a in backup_app_list():
+        if want is not None and a["folder"] not in want:
+            continue
+        if a["db"] != "mysql":
+            continue
+        if DRY_RUN:
+            out.append(("%s%s/database.sql" % (BACKUP_APPS_ARC, a["folder"]), b"", a["name"] + "（演练跳过）"))
+            continue
+        ok, txt = app_compose_cmd(a["folder"], "exec", "-T", "db", "sh", "-c",
+                                  'exec mysqldump -uroot -p"$MYSQL_ROOT_PASSWORD" --all-databases',
+                                  timeout=900, full=True)
+        if not ok or not txt.strip():
+            out.append(("%s%s/database.sql" % (BACKUP_APPS_ARC, a["folder"]), b"",
+                        a["name"] + "（导出失败：" + str(txt)[:120] + "）"))
+            continue
+        out.append(("%s%s/database.sql" % (BACKUP_APPS_ARC, a["folder"]),
+                    txt.encode("utf-8", "replace"), a["name"] + " 数据库已导出"))
+    _backup_opts["_dumps"] = out
+    return out
+
+
+def backup_apps_stop(app_folders=None):
+    """停机打包：返回可以起回的 (folder, name) 列表"""
+    stopped = []
+    want = set(app_folders) if app_folders else None
+    for a in backup_app_list():
+        if want is not None and a["folder"] not in want:
+            continue
+        ok, msg = app_compose_cmd(a["folder"], "stop", timeout=180)
+        task_progress("已暂停 %s%s" % (a["name"], "" if ok else "（失败：%s）" % str(msg)[:80]))
+        if ok:
+            stopped.append((a["folder"], a["name"]))
+    return stopped
+
+
+def backup_apps_start(stopped):
+    """把停机打包时暂停的应用起回来"""
+    for folder, name in stopped or []:
+        ok, msg = app_compose_cmd(folder, "up", "-d", timeout=300)
+        task_progress("已恢复运行 %s%s" % (name, "" if ok else "（失败：%s）" % str(msg)[:80]))
+
+
+_backup_opts = {}          # 本次打包的选项 {stop, dockerrun, apps, skip_subs}
+
+
 def backup_collect(modules):
     """按模块收集 (绝对路径, 归档内相对路径)；只认名单内 / 形状能识别的文件"""
     mods = set(modules or [])
@@ -3160,7 +3370,13 @@ def backup_collect(modules):
         for e in backup_site_entries():
             if not e["is_dir"]:
                 files.append((e["abs"], e["arc"]))
-    # v3.3.12 起：certs / sites 已实现；apps（Docker 应用数据）仍标 ready=False
+    if "apps" in mods:
+        # ⚠ 必须和 manifest 用同一套选项（应用白名单 / 反勾的子目录），否则 collect 仍会收被排除的文件
+        for e in backup_app_entries(app_folders=_backup_opts.get("apps"),
+                                    skip_subs=_backup_opts.get("skip_subs"),
+                                    with_runs=bool(_backup_opts.get("dockerrun"))):
+            if not e["is_dir"]:
+                files.append((e["abs"], e["arc"]))
     return files
 
 
@@ -3200,6 +3416,19 @@ def backup_make_manifest(modules, note="", files=None, name_prefix=""):
     if "sites" in mods:
         for e in backup_site_entries():
             meta[e["arc"]] = e
+    if "apps" in mods:
+        for e in backup_app_entries(app_folders=_backup_opts.get("apps"),
+                                    skip_subs=_backup_opts.get("skip_subs"),
+                                    with_runs=bool(_backup_opts.get("dockerrun"))):
+            meta[e["arc"]] = e
+    # 数据库 dump 条目（现场导出，体积小；演练模式为空）
+    dump_entries = []
+    if "apps" in mods:
+        for arc, data, note in backup_app_dumps(_backup_opts.get("apps")):
+            if data:
+                dump_entries.append({"arc": arc, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                                     "mode": 0o600, "uid": 0, "gid": 0, "mtime": int(time.time()), "is_dir": False})
+            task_progress("数据库 dump：%s" % note)
     site_total = sum(e["size"] for e in meta.values() if not e["is_dir"])
     hash_limited = bool("sites" in mods and site_total > BACKUP_HASH_MAX_BYTES)
     entries = []
@@ -3215,6 +3444,7 @@ def backup_make_manifest(modules, note="", files=None, name_prefix=""):
             entries.append(ent)
         except OSError:
             continue
+    entries.extend(dump_entries)
     for arc, m in sorted(meta.items()):
         if m["is_dir"]:
             entries.append({"arc": arc, "size": 0, "sha256": "", "mode": m["mode"],
@@ -3237,18 +3467,43 @@ def backup_make_manifest(modules, note="", files=None, name_prefix=""):
     }
 
 
-def backup_create_work(modules, note="", name_prefix=""):
-    """长任务体：打包 → 落地 + 侧车 manifest"""
+def backup_create_work(modules, note="", name_prefix="", opts=None):
+    """长任务体：打包 → 落地 + 侧车 manifest
+
+    opts（v3.3.13）：{stop: 停机打包, dockerrun: 含自动数据卷, apps: [应用目录], skip_subs: {应用: [子目录]}}
+    """
+    global _backup_opts
     ready = set(m["id"] for m in BACKUP_MODULES if m.get("ready"))
     mods = [m for m in (modules or []) if m in ready]
     if not mods:
         names = "、".join(m["name"] for m in BACKUP_MODULES if m.get("ready"))
         return False, "没有可备份的模块（当前版本支持：%s）" % names
-    files = backup_collect(mods)
-    if not files:
-        return False, "没有可备份的内容（面板记录文件为空？）"
-    task_progress("统计文件与校验和...")
-    man = backup_make_manifest(mods, note, files)
+    _backup_opts = dict(opts or {})
+    stopped = []
+    if "apps" in mods and _backup_opts.get("stop"):
+        task_progress("停机打包：依次暂停应用容器...")
+        stopped = backup_apps_stop(_backup_opts.get("apps"))
+    try:
+        files = backup_collect(mods)
+        if not files and "apps" not in mods:
+            return False, "没有可备份的内容（面板记录文件为空？）"
+        task_progress("统计文件与校验和...")
+        man = backup_make_manifest(mods, note, files)
+        if not man.get("files"):
+            return False, "没有可备份的内容（勾选的模块里没有实际文件）"
+        # dump 内容只在内存里（不能进 manifest —— JSON 存不下 bytes），打包循环通过参数取用
+        dmap = {}
+        if "apps" in mods:
+            dmap = {arc: data for arc, data, _note in backup_app_dumps(_backup_opts.get("apps")) if data}
+        return _backup_pack(mods, man, files, note, name_prefix, dmap)
+    finally:
+        if stopped:
+            backup_apps_start(stopped)
+        _backup_opts = {}
+
+
+def _backup_pack(mods, man, files, note, name_prefix, dump_map=None):
+    dump_map = dump_map or {}
     ts = time.strftime("%Y%m%d-%H%M%S")
     host = re.sub(r"[^A-Za-z0-9._-]", "_", socket.gethostname())[:32] or "host"
     name = ("%sfwpanel-%s-v%s-%s.tar.gz" % (name_prefix, host, CURRENT_VERSION, ts))
@@ -3270,6 +3525,13 @@ def backup_create_work(modules, note="", name_prefix=""):
                     if arc == e["arc"]:
                         src_p = p
                         break
+                if e["arc"] in dump_map:
+                    ti = tarfile.TarInfo(e["arc"])
+                    ti.size = len(dump_map[e["arc"]])
+                    ti.mode = 0o600
+                    ti.mtime = int(e.get("mtime") or time.time())
+                    tf.addfile(ti, io.BytesIO(dump_map[e["arc"]]))
+                    continue
                 if e.get("is_dir"):
                     ti = tarfile.TarInfo(e["arc"])
                     ti.type = tarfile.DIRTYPE
@@ -10900,6 +11162,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             total = usage.total
         except OSError:
             free = total = 0
+        try:
+            _apps_info = backup_apps_size()
+        except Exception:
+            _apps_info = {"bytes": 0, "files": 0, "apps": [], "compose_bytes": 0, "truncated": False}
         self._send(200, {
             "items": backup_list(),
             "modules": BACKUP_MODULES,
@@ -10909,7 +11175,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             "chunk": BACKUP_UPLOAD_CHUNK,
             "max_bytes": BACKUP_MAX_BYTES,
             "counts": backup_counts(),
-            "sizes": {"sites": backup_sites_size()},
+            "apps": _apps_info,
+            "sizes": {"sites": backup_sites_size(),
+                      "apps": {"bytes": _apps_info["bytes"], "files": _apps_info["files"],
+                               "truncated": _apps_info["truncated"]}},
             "panel_version": CURRENT_VERSION,
         })
 
@@ -10923,10 +11192,19 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not isinstance(mods, list) or not mods:
             mods = [m["id"] for m in BACKUP_MODULES if m.get("on") and m.get("ready")]
         note = str(d.get("note") or "")[:200]
+        # v3.3.13：应用数据档的选项（白名单化，别让任意字段混进来）
+        raw = d.get("opts") if isinstance(d.get("opts"), dict) else {}
+        opts = {
+            "stop": bool(raw.get("stop")),
+            "dockerrun": bool(raw.get("dockerrun")),
+            "apps": [x for x in (raw.get("apps") or []) if isinstance(x, str)][:50],
+            "skip_subs": {k: [y for y in (v or []) if isinstance(y, str)][:20]
+                          for k, v in (raw.get("skip_subs") or {}).items() if isinstance(k, str)},
+        }
         if DRY_RUN:
             self._send(200, {"ok": True, "msg": "DRY_RUN: 跳过打包"})
             return
-        tid = start_task("backup/create", backup_create_work, mods, note)
+        tid = start_task("backup/create", backup_create_work, mods, note, "", opts)
         self._send(200, {"task": tid})
 
     def _api_backup_download(self, query):
