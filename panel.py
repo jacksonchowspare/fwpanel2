@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.17"
+CURRENT_VERSION = "3.3.18"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -3181,10 +3181,10 @@ def restore_app_files(src_root, man, opts=None):
         for e, arc in items:
             rest = arc[len(prefix):]
             top = _app_folder_safe(rest.split("/", 1)[0]) if "/" in rest else ""
-            if not top or top not in sel:
-                sk.append(arc)
-                continue
             if e.get("is_dir"):
+                continue        # 目录占位条目只是记录权限，不算「跳过」（实机报告里会误导用户）
+            if not top or top not in sel:
+                sk.append(arc + "（不在所选应用范围）")
                 continue
             src = os.path.join(data_root, src_base, rest)
             dst = _safe_dest_under(root, rest)
@@ -3735,16 +3735,32 @@ def backup_app_dumps(app_folders=None):
 
 
 def backup_apps_stop(app_folders=None):
-    """停机打包：返回可以起回的 (folder, name) 列表"""
+    """停机打包：暂停**应用容器**（db 保持运行，供现场 dump），返回可起回的 (folder, name)
+
+    ⚠ 实机踩过（ak，2026-09-18）：原来这里是 `docker compose stop`（停整个项目，含 db），
+    随后 backup_app_dumps 用 `docker compose exec db mysqldump` 导出 → db 已停 → 报
+    `service "db" is not running` → **包里静默没有 database.sql**（只在进度日志里留一行失败），
+    而 mysqldump 本来完全不需要停 db。现在只停 app 服务；停不动（服务名不符/旧 compose）就
+    回退全停，并在进度里说明 dump 可能失败。
+    """
     stopped = []
     want = set(app_folders) if app_folders else None
     for a in backup_app_list():
         if want is not None and a["folder"] not in want:
             continue
-        ok, msg = app_compose_cmd(a["folder"], "stop", timeout=180)
-        task_progress("已暂停 %s%s" % (a["name"], "" if ok else "（失败：%s）" % str(msg)[:80]))
-        if ok:
-            stopped.append((a["folder"], a["name"]))
+        ok, msg = app_compose_cmd(a["folder"], "stop", "app", timeout=180)
+        if not ok:
+            # 回退：旧 compose 里服务名可能不同 → 整体停（此时 mysql 应用会拿不到 dump）
+            ok2, msg2 = app_compose_cmd(a["folder"], "stop", timeout=180)
+            task_progress("已暂停 %s（整体停机%s）" % (
+                a["name"], "，数据库 dump 可能不可用" if a.get("db") == "mysql" else ""))
+            if ok2:
+                stopped.append((a["folder"], a["name"]))
+            else:
+                task_progress("暂停 %s 失败：%s" % (a["name"], str(msg2)[:80]))
+            continue
+        task_progress("已暂停应用容器 %s（数据库保持运行，供导出）" % a["name"])
+        stopped.append((a["folder"], a["name"]))
     return stopped
 
 
@@ -3836,12 +3852,17 @@ def backup_make_manifest(modules, note="", files=None, name_prefix=""):
             meta[e["arc"]] = e
     # 数据库 dump 条目（现场导出，体积小；演练模式为空）
     dump_entries = []
+    dump_notes = []
     if "apps" in mods:
-        for arc, data, note in backup_app_dumps(_backup_opts.get("apps")):
+        # ⚠ 实机踩过（ak，2026-09-18）：这里原来写 `for arc, data, note in ...`，把函数参数 note
+        # 覆盖掉了 → 清单里的「备注」变成 dump 状态（"WordPress 数据库已导出"），用户填的备注
+        # 被静默替换（侧车 json 与包内 manifest.json 都是错的）。变量名必须区分开。
+        for arc, data, dnote in backup_app_dumps(_backup_opts.get("apps")):
             if data:
                 dump_entries.append({"arc": arc, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                                      "mode": 0o600, "uid": 0, "gid": 0, "mtime": int(time.time()), "is_dir": False})
-            task_progress("数据库 dump：%s" % note)
+            dump_notes.append(dnote)
+            task_progress("数据库 dump：%s" % dnote)
     site_total = sum(e["size"] for e in meta.values()
                      if not e["is_dir"] and e["arc"].startswith(BACKUP_SITE_ARC))
     apps_total = sum(e["size"] for e in meta.values()
@@ -3878,6 +3899,7 @@ def backup_make_manifest(modules, note="", files=None, name_prefix=""):
         "created": int(time.time()),
         "hostname": socket.gethostname(),
         "note": str(note or "")[:200],
+        "dump_notes": list(dump_notes),
         "modules": [m for m in (modules or [])],
         "counts": backup_counts(),
         "apps": (backup_app_meta(_backup_opts.get("apps"), _backup_opts.get("skip_subs"))
@@ -3925,6 +3947,17 @@ def backup_create_work(modules, note="", name_prefix="", opts=None):
             sq = [a.get("name") or a.get("folder") for a in (man.get("apps") or []) if a.get("db") == "sqlite"]
             if sq:
                 msg += "；⚠ %s 为运行中快照（最新数据可能仍在 WAL，建议勾「停机打包」）" % "、".join(sq[:2])
+        # 现场 dump 没拿到要显式说出来（实机教训：只在进度日志留一行，用户看不到，以为有 dump）
+        if ok and "apps" in mods:
+            missing = []
+            for a in (man.get("apps") or []):
+                if a.get("db") != "mysql":
+                    continue
+                if not any(str(e.get("arc") or "").endswith("%s/database.sql" % a.get("folder"))
+                           for e in man.get("files") or []):
+                    missing.append(a.get("name") or a.get("folder"))
+            if missing:
+                msg += "；⚠ %s 未取到数据库 dump（恢复时只能按文件级还原，建议查应用日志）" % "、".join(missing[:3])
         return ok, msg
     finally:
         if stopped:
@@ -4928,6 +4961,14 @@ class SiteStore:
         return True
 
 
+def site_port_busy(port):
+    """端口在本机是否已被监听（独立函数便于测试替换；端口站的守卫用）"""
+    try:
+        return bool(port_in_use_py(int(port)))
+    except (TypeError, ValueError):
+        return False
+
+
 def site_validate(data, pstore, sstore, cfg, exclude_id=None):
     """校验并归一化站点配置 → (site_dict, error)"""
     t = str(data.get("type", "static")).strip().lower()
@@ -4971,6 +5012,22 @@ def site_validate(data, pstore, sstore, cfg, exclude_id=None):
             if (s.get("type") == "port" and int(s.get("port", 0) or 0) == port
                     and s.get("id") != exclude_id):
                 return None, f"端口 {port} 已被其它站点占用"
+        # ⚠ ak 实机发现（2026-09-18）：原来只挡面板/SSH/其它站点端口，没挡「已被应用或反代目标占用」
+        # 以及「本机已被别的服务监听」的端口 → 用户能在 8080（WordPress）上建端口站，
+        # nginx 去 bind 0.0.0.0:8080 与 docker-proxy 冲突 → reload 失败，站点白建还说不清原因。
+        for a in AppStore().apps:
+            if int(a.get("port") or 0) == port:
+                return None, "端口 %d 已被应用「%s」占用，不能给站点用" % (port, a.get("name") or a.get("folder"))
+        for p in pstore.proxies:
+            if int(p.get("target_port") or 0) == port:
+                return None, "端口 %d 已被反向代理「%s」的回源目标占用" % (port, p.get("domain") or "")
+        own_port = 0
+        if exclude_id:
+            for s in sstore.sites:
+                if s.get("id") == exclude_id and s.get("type") == "port":
+                    own_port = int(s.get("port", 0) or 0)
+        if port != own_port and site_port_busy(port):
+            return None, "端口 %d 在本机已被占用（先停掉占用它的服务，或换一个端口）" % port
     root = str(data.get("root", "")).strip()
     if not root:
         root = os.path.join(site_root_base(cfg),

@@ -2224,6 +2224,9 @@ function bkPreviewRender(name, prev, err) {
   const diff = prev.diff || {};
   const items = (bkInfo && bkInfo.restore_items) || [];
   const dPort = diff.panel_port || {};
+  const notes = [];
+  if (m.note) notes.push("备注：" + m.note);
+  if ((m.dump_notes || []).length) notes.push("数据库导出：" + m.dump_notes.join("；"));
   box.innerHTML =
     '<div style="margin-top:10px;padding:10px;border:1px solid var(--hover-bg);border-radius:var(--r-card)">' +
       '<div style="font-size:13px;margin-bottom:6px">将要恢复 <b>' + esc(name) + '</b> ｜ 来自 ' + esc(m.hostname || "-") +
@@ -2231,6 +2234,8 @@ function bkPreviewRender(name, prev, err) {
       '<div style="font-size:12px;color:var(--muted);margin-bottom:8px">包内文件：' + esc((prev.files || []).join("、")) +
         ' ｜ 端口对照：面板 ' + esc(String(dPort.now)) + ' → ' + esc(String(dPort.pkg)) +
         '（默认保持当前，勾选「面板端口与绑定」才覆盖）</div>' +
+      (notes.length ? '<div style="font-size:12px;color:var(--muted);margin-bottom:8px">' +
+        notes.map(esc).join(" ｜ ") + '</div>' : '') +
       '<div style="display:flex;flex-wrap:wrap;gap:12px;font-size:13px;margin-bottom:8px">' +
         items.map(it => '<label style="display:inline-flex;align-items:center;gap:5px" title="' + attrEsc(it.desc || "") + '">' +
           '<input type="checkbox" data-bkitem="' + attrEsc(it.id) + '" onchange="bkRestoreAppsToggle()"' + (it.on ? " checked" : "") + ' style="width:auto"> ' +

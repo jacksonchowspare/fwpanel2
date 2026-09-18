@@ -5138,10 +5138,14 @@ class TestSites(unittest.TestCase):
         # v3.0.1 起建站前会检查 nginx 是否安装；测试机没有 nginx，打桩为已安装
         self._nginx_avail = panel.nginx_available
         panel.nginx_available = lambda: True
+        # 端口占用检测默认打桩为空闲（真机上是真的 bind 测试；用例里单独覆盖）
+        self._port_busy = panel.site_port_busy
+        panel.site_port_busy = lambda port: False
 
     def tearDown(self):
         panel.SITE_FORBIDDEN_ROOTS = self._forbid
         panel.nginx_available = self._nginx_avail
+        panel.site_port_busy = self._port_busy
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _site(self, **kw):
@@ -5198,6 +5202,43 @@ class TestSites(unittest.TestCase):
                                 "target_host": "127.0.0.1", "target_port": 17999, "enabled": True}]
         _, err = panel.site_validate({"domain": "panel.example.com"}, self.pstore, self.sstore, self.cfg)
         self.assertIn("面板自身的访问域名", err)
+
+    # ---------- 端口站冲突（ak 真机发现：应用/反代目标/系统占用都能被占）----------
+    def test_port_conflict_with_app_port(self):
+        class _FakeApps:
+            def __init__(self, *a, **kw):
+                self.apps = [{"folder": "wordpress-8080", "name": "WordPress", "port": 8080}]
+        old = panel.AppStore
+        panel.AppStore = _FakeApps
+        try:
+            _, err = panel.site_validate({"type": "port", "port": 8080, "cert_mode": "none"},
+                                         self.pstore, self.sstore, self.cfg)
+        finally:
+            panel.AppStore = old
+        self.assertIsNotNone(err, "应用占用的端口不能给站点用（否则 nginx 绑不上）")
+        self.assertIn("已被应用", err)
+
+    def test_port_conflict_with_proxy_target(self):
+        self.pstore.proxies = [{"id": "dddddddddddd", "domain": "b.example.com",
+                                "target_host": "127.0.0.1", "target_port": 18085, "enabled": True}]
+        _, err = panel.site_validate({"type": "port", "port": 18085, "cert_mode": "none"},
+                                     self.pstore, self.sstore, self.cfg)
+        self.assertIn("回源目标占用", err)
+
+    def test_port_conflict_when_host_port_busy(self):
+        panel.site_port_busy = lambda port: True
+        _, err = panel.site_validate({"type": "port", "port": 18086, "cert_mode": "none"},
+                                     self.pstore, self.sstore, self.cfg)
+        self.assertIn("已被占用", err)
+
+    def test_port_own_port_allowed_while_editing(self):
+        site = self._site(type="port", domain="", port=18087)
+        s = self.sstore.add(site)
+        panel.site_port_busy = lambda port: True       # 本站 nginx 正在监听这个端口 = 必然 busy
+        got, err = panel.site_validate({"type": "port", "port": 18087, "cert_mode": "none", "note": "改备注"},
+                                       self.pstore, self.sstore, self.cfg, exclude_id=s["id"])
+        self.assertIsNone(err, "编辑自己时不该因为自己在监听这个端口而被拒")
+        self.assertEqual(got["port"], 18087)
 
     # ---------- nginx 渲染 ----------
     def test_render_static_and_port(self):
@@ -8133,6 +8174,59 @@ class TestBackupApps(unittest.TestCase):
             d2 = panel.backup_app_dumps()
         self.assertEqual([c for c in self.calls if c[1] and c[1][0] == "exec"], [], "演练模式不该真的跑 mysqldump")
 
+    def test_stop_option_only_stops_app_service(self):
+        """停机打包只停 app 服务（db 保持运行供 dump）——ak 实机踩过：全停导致 dump 静默失败"""
+        self.calls.clear()
+        self._pack({"stop": True, "apps": ["wordpress-8080"]}, note="stopapp")
+        stops = [a for f, a in self.calls if f == "wordpress-8080" and a and a[0] == "stop"]
+        self.assertTrue(stops, "应当调用过 stop")
+        self.assertEqual(stops[0], ("stop", "app"),
+                         "只停 app 服务；停整个项目会把 db 也停掉 → mysqldump 报 not running")
+        self.assertNotIn(("stop",), stops, "不该再出现不带服务名的整体停机")
+
+    def test_stop_option_falls_back_when_service_missing(self):
+        """旧 compose 服务名不符时回退整体停机，并在进度里说明 dump 可能不可用"""
+        logs = []
+
+        def fake_compose(folder, *args, **kw):
+            self.calls.append((folder, args))
+            if args[:2] == ("stop", "app"):
+                return False, "no such service: app"
+            if args[:1] == ("exec",):
+                return True, "-- MySQL dump\nCREATE TABLE t (id int);\n"
+            return True, ""
+
+        with unittest.mock.patch.object(panel, "app_compose_cmd", fake_compose), \
+             unittest.mock.patch.object(panel, "task_progress",
+                                        lambda m, *a: logs.append(str(m))):
+            stopped = panel.backup_apps_stop(["wordpress-8080"])
+        self.assertEqual(len(stopped), 1, "回退成功也算停住了")
+        self.assertTrue(any("整体停机" in x for x in logs), logs)
+
+    def test_result_warns_when_dump_missing(self):
+        """mysql 应用没取到 dump 时，结果消息必须显式警告（否则用户以为包里有 dump）"""
+        with unittest.mock.patch.object(panel, "backup_app_dumps", lambda folders=None: []), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok, msg = panel.backup_create_work(["apps"], note="nodump", opts={})
+        self.assertTrue(ok, msg)
+        self.assertIn("未取到数据库 dump", msg)
+        self.assertIn("WordPress", msg)
+
+    def test_user_note_not_clobbered_by_dump_note(self):
+        """ak 实机：dump 循环变量 note 覆盖了函数参数 → 用户填的备注被「数据库已导出」替换"""
+        with unittest.mock.patch.object(panel, "DRY_RUN", False):
+            man = panel.backup_make_manifest(["apps"], note="上线前基线")
+        self.assertEqual(man["note"], "上线前基线", "用户备注必须原样保留")
+        self.assertTrue(any("数据库已导出" in str(x) for x in man.get("dump_notes") or []),
+                        "dump 状态改放 dump_notes，不要挤占备注：%s" % (man.get("dump_notes"),))
+
+    def test_preview_shows_note_and_dump_status(self):
+        """恢复确认框要能看到包备注与数据库导出状态（前端渲染）"""
+        html = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                 "static/index.html"), encoding="utf-8").read()
+        self.assertIn('notes.push("数据库导出：" + m.dump_notes.join', html)
+        self.assertIn('notes.map(esc).join(" ｜ ")', html)
+
     def test_sqlite_app_snapshot_hint(self):
         """sqlite 应用（运行中快照）要在结果里提示 WAL 风险；勾了停机打包就不提（实机发现）"""
         with unittest.mock.patch.object(panel, "DRY_RUN", False):
@@ -8364,6 +8458,48 @@ class TestBackupAppRestore(unittest.TestCase):
         self.assertEqual(sorted(meta["wordpress-8080"]["subs"]), ["db", "html"])
         self.assertIn("apps_hash_limited", man)
         self.assertIn("apps_total", man)
+
+    def test_no_dump_warns_file_level_only(self):
+        """包内没有数据库导出：必须明说「仅文件级恢复」，不能静默跳过导入"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        os.remove(os.path.join(ext, "data/apps/wordpress-8080/database.sql"))
+        man["files"] = [e for e in man["files"] if not str(e["arc"]).endswith("database.sql")]
+        ok, msg = self._restore(man, ext)
+        self.assertTrue(ok, msg)
+        self.assertIn("包内无数据库导出", msg)
+        self.assertIn("仅文件级恢复", msg)
+
+    def test_no_dump_with_wipe_warns_db_reinit(self):
+        """无 dump 还勾了「先清空」：数据目录被清空后数据库会被容器重新初始化，必须红字警告"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        os.remove(os.path.join(ext, "data/apps/wordpress-8080/database.sql"))
+        man["files"] = [e for e in man["files"] if not str(e["arc"]).endswith("database.sql")]
+        ok, msg = self._restore(man, ext, {"apps": ["wordpress-8080"], "wipe_apps": ["wordpress-8080"]})
+        self.assertTrue(ok, msg)
+        self.assertIn("已清空数据目录", msg)
+        self.assertIn("容器重新初始化", msg)
+
+    def test_compose_dir_entries_not_reported_as_skipped(self):
+        """ak 实机：compose 目录占位条目被算进「跳过 N 项」，用户以为 compose 文件没恢复"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        ok, msg = self._restore(man, ext, {"apps": ["wordpress-8080"]})
+        self.assertTrue(ok, msg)
+        seg = msg.split("；跳过", 1)[1].split("｜", 1)[0] if "；跳过" in msg else ""
+        self.assertNotIn("data/compose/wordpress-8080、", seg)
+        self.assertFalse(seg.rstrip("）").endswith("data/compose/wordpress-8080"),
+                         "目录占位条目不该出现在跳过清单里：%s" % seg)
+
+    def test_skip_reason_names_out_of_scope_apps(self):
+        """真正跳过的（不在所选应用范围）要写明原因，别只丢个路径让用户猜"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        ok, msg = self._restore(man, ext, {"apps": ["wordpress-8080"]})
+        self.assertTrue(ok, msg)
+        seg = msg.split("；跳过", 1)[1].split("｜", 1)[0] if "；跳过" in msg else ""
+        self.assertIn("不在所选应用范围", seg)
 
     def test_pkg_apps_from_files_when_no_meta(self):
         """旧包没有 apps 元数据时，从文件路径倒推（含是否含数据库导出）"""
