@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.13"
+CURRENT_VERSION = "3.3.14"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -2579,6 +2579,9 @@ BACKUP_SITE_LOG_DIR = "logs"                                    # logs/ 下的 *
 BACKUP_SITE_LOG_SUFFIX = ".log"
 BACKUP_HASH_MAX_BYTES = 256 * 1024 * 1024                       # 超此体积就不再逐文件算 sha256
 BACKUP_SNAPSHOT_SITE_MAX = 1024 * 1024 * 1024                   # 站点体积超此值不进恢复前快照
+BACKUP_APPS_HASH_MAX_BYTES = 512 * 1024 * 1024                  # 应用数据超此体积就不再逐文件算 sha256
+BACKUP_SNAPSHOT_APPS_MAX = 1024 * 1024 * 1024                    # 应用数据超此值不进恢复前快照
+BACKUP_APPS_FOLDER_MAX = 64                                      # 应用目录名长度上限（路径校验用）
 BACKUP_SITE_WALK_CAP = 200000                                   # 体积统计的条目上限（防页面卡死）
 
 # ---- 应用数据档（v3.3.13）----
@@ -2610,6 +2613,7 @@ RESTORE_ITEMS = [
     {"id": "fed", "name": "联邦节点令牌", "desc": "⚠ 含明文令牌，恢复后建议 rotate", "on": True},
     {"id": "cert_files", "name": "证书文件（含私钥）", "desc": "⚠ 写回 /etc/letsencrypt（私钥 0600）；有 archive 时按 certbot 结构生成新修订，续期不受影响", "on": True},
     {"id": "site_files", "name": "站点文件（/var/www）", "desc": "⚠ 覆盖目标机同路径文件（不删除多余文件）；按记录还原权限与属主", "on": True},
+    {"id": "app_files", "name": "应用数据（Docker）", "desc": "⚠ 逐应用：停容器 → 写回 /DockerData/apps → mysql 应用导入数据库 → 起回容器。默认不删除目标机多余文件；要完全一致请单独勾「先清空」。⚠ 还需勾选「应用记录」，否则容器不会被重建", "on": False},
     {"id": "nginx", "name": "nginx 重新渲染", "desc": "按恢复后的记录重生成配置并 reload", "on": True},
 ]
 
@@ -2999,6 +3003,289 @@ def restore_site_files(src_root, man):
     return bool(files_n or dirs_meta), msg
 
 
+def _copy_file_stream(src, dst, mode):
+    """流式按权限复制（应用数据可能是 GB 级文件，不能整块读进内存）"""
+    tmp = dst + ".fwtmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    n = 0
+    with open(src, "rb") as f, os.fdopen(fd, "wb") as out:
+        while True:
+            b = f.read(1024 * 1024)
+            if not b:
+                break
+            out.write(b)
+            n += len(b)
+    try:
+        os.chmod(tmp, mode)
+    except OSError:
+        pass
+    os.replace(tmp, dst)
+    return n
+
+
+def _write_pkg_entry(src, dst, e, can_chown, chown_failed):
+    """写一个包内文件条目（流式 + 权限/属主/mtime）；返回 (ok, 原因)"""
+    try:
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        mode = int(e.get("mode") or 0o644) & 0o7777
+        _copy_file_stream(src, dst, mode)
+        if can_chown:
+            try:
+                os.chown(dst, int(e.get("uid") or 0), int(e.get("gid") or 0))
+            except (OSError, OverflowError) as ex:
+                if len(chown_failed) < 3:
+                    chown_failed.append("%s(%s)" % (os.path.basename(dst), ex))
+        if e.get("mtime"):
+            try:
+                os.utime(dst, (int(e["mtime"]), int(e["mtime"])))
+            except (OSError, OverflowError, ValueError):
+                pass
+        return True, ""
+    except OSError as ex:
+        return False, str(ex)
+
+
+def _wipe_dir_contents(d):
+    """清空目录内容（只删目录内的真实路径，软链接只删链接本身）；返回 (删除数, 失败项)"""
+    rd = os.path.realpath(d)
+    removed, failed = 0, []
+    if not os.path.isdir(d):
+        return 0, failed
+    for name in sorted(os.listdir(d)):
+        p = os.path.join(d, name)
+        try:
+            rp = os.path.realpath(p)
+        except OSError:
+            failed.append(name)
+            continue
+        if rp != rd and not rp.startswith(rd.rstrip("/") + "/"):
+            failed.append(name)          # 指向目录外的软链接/路径：不动
+            continue
+        try:
+            if os.path.islink(p) or os.path.isfile(p):
+                os.unlink(p)
+            elif os.path.isdir(p):
+                shutil.rmtree(p)          # rmtree 不跟随软链接
+            else:
+                os.unlink(p)
+            removed += 1
+        except OSError as ex:
+            failed.append("%s(%s)" % (name, ex))
+    return removed, failed
+
+
+def _wait_db_ready(folder, tries=15, delay=2.0):
+    """等数据库容器能接连接（导入 SQL 前必须就绪）"""
+    if DRY_RUN:
+        return True, "DRY_RUN 跳过等待"
+    last = ""
+    for _i in range(max(1, int(tries))):
+        ok, out = app_compose_cmd(folder, "exec", "-T", "db", "sh", "-c",
+                                  'exec mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent',
+                                  timeout=30, full=True)
+        last = str(out or "")
+        if ok and "alive" in last.lower():
+            return True, "数据库已就绪"
+        time.sleep(delay)
+    return False, "等待数据库就绪超时（%d 次：%s）" % (tries, last[:100])
+
+
+def restore_app_files(src_root, man, opts=None):
+    """把包内的 Docker 应用数据写回 /DockerData（v3.3.14，返回 (ok, 说明)）
+
+    逐应用：停容器 → （可选清空）→ 写回 apps/<应用> → mysql 应用起 db 并导入 database.sql → 起回应用。
+    护栏：路径两层校验（`..` 判定 + 落点 realpath 复核，只落在应用数据根之内）、逐文件 sha256、
+    默认不删除目标机多余文件、DRY_RUN 只统计不落盘不调 docker。
+
+    opts：{apps: 只恢复这些应用（空=包内全部）, wipe_apps: 先清空这些应用的数据目录,
+           restart_apps: 恢复后起回容器（默认 True）}
+    """
+    opts = dict(opts or {})
+    base = backup_docker_base()
+    apps_base = os.path.join(base, "apps")
+    compose_base = os.path.join(base, "dockercompose")
+    runs_base = os.path.join(base, "dockerrun")
+    pkg = {a["folder"]: a for a in backup_pkg_apps(man)}
+    if not pkg:
+        return False, "包内没有 Docker 应用数据"
+    sel = set(x for x in (_app_folder_safe(v) for v in (opts.get("apps") or [])) if x)
+    if not sel:
+        sel = set(pkg)
+    wipe = set(x for x in (_app_folder_safe(v) for v in (opts.get("wipe_apps") or [])) if x)
+    restart_apps = bool(opts.get("restart_apps", True))
+    apps_hash_limited = bool(man.get("apps_hash_limited"))
+    can_chown = (os.geteuid() == 0)
+    chown_failed = []
+    by_app, dumps = {}, {}
+    compose_items, runs_items, skipped_other = [], [], []
+    for e in man.get("files") or []:
+        arc = str(e.get("arc") or "")
+        if arc.startswith(BACKUP_APPS_ARC):
+            rest = arc[len(BACKUP_APPS_ARC):]
+            folder = _app_folder_safe(rest.split("/", 1)[0]) if "/" in rest else ""
+            if not folder:
+                skipped_other.append(arc)       # 目录名非法（穿越形状）一律不收
+                continue
+            by_app.setdefault(folder, []).append((e, rest))
+        elif arc.startswith(BACKUP_COMPOSE_ARC):
+            compose_items.append((e, arc))
+        elif arc.startswith(BACKUP_RUNS_ARC):
+            runs_items.append((e, arc))
+    total_files, total_bytes = 0, 0
+    report, skipped = [], []
+    for folder in sorted(by_app):
+        if folder not in sel:
+            continue
+        t0 = time.time()
+        rec = pkg.get(folder) or {"folder": folder, "name": folder, "db": "", "dump": False}
+        target = os.path.join(apps_base, folder)
+        steps = []
+        # 1) 停容器（写文件前必须停，否则数据会被容器写坏）
+        if DRY_RUN:
+            steps.append("停容器（演练跳过）")
+        elif os.path.isfile(app_compose_file(folder)):
+            ok_st, msg_st = app_compose_cmd(folder, "stop", timeout=180)
+            steps.append("停容器" + ("完成" if ok_st else "失败：%s" % str(msg_st)[:80]))
+        else:
+            steps.append("本机无此应用（跳过停容器）")
+        # 2) 清空（危险项，默认关；显式勾选才做）
+        if folder in wipe and not DRY_RUN:
+            n_rm, failed = _wipe_dir_contents(target)
+            steps.append("已清空目录（删 %d 项%s）" % (
+                n_rm, ("；失败 %s" % "、".join(failed[:3])) if failed else ""))
+        # 3) 写回文件
+        f_n, b_n = 0, 0
+        dirs_meta = []
+        for e, rest in sorted(by_app[folder], key=lambda x: str(x[0].get("arc") or "")):
+            if rest == folder + "/database.sql":
+                dumps[folder] = os.path.join(src_root, rest)   # dump 不进数据目录，直接导入
+                continue
+            src = os.path.join(src_root, rest)
+            dst = _safe_dest_under(apps_base, rest)
+            if not dst:
+                skipped.append(rest)
+                continue
+            if e.get("is_dir"):
+                dirs_meta.append((dst, e))
+                continue
+            if not os.path.isfile(src):
+                skipped.append(rest)
+                continue
+            want = e.get("sha256") or ""
+            if want and _sha256_file(src) != want:
+                skipped.append(rest + "(校验和不符)")
+                continue
+            f_n += 1
+            b_n += int(e.get("size") or 0)
+            total_files += 1
+            total_bytes += int(e.get("size") or 0)
+            if DRY_RUN:
+                continue
+            ok_w, why = _write_pkg_entry(src, dst, e, can_chown, chown_failed)
+            if not ok_w:
+                skipped.append("%s(%s)" % (rest, why))
+                f_n -= 1
+                total_files -= 1
+        for dst, e in sorted(dirs_meta, key=lambda x: -len(x[0])):
+            if DRY_RUN:
+                continue
+            try:
+                os.makedirs(dst, exist_ok=True)
+                os.chmod(dst, int(e.get("mode") or 0o755) & 0o7777)
+                if can_chown:
+                    os.chown(dst, int(e.get("uid") or 0), int(e.get("gid") or 0))
+            except (OSError, OverflowError):
+                pass
+        # 4) mysql 应用：起 db → 导入现场 dump
+        dump_src = dumps.get(folder)
+        if rec.get("db") == "mysql" or (not rec.get("db") and dump_src):
+            if not dump_src:
+                steps.append("包内无数据库导出（未导入）")
+            elif DRY_RUN:
+                steps.append("导入数据库（演练跳过）")
+            elif not os.path.isfile(app_compose_file(folder)):
+                steps.append("本机无此应用（未导入数据库）")
+            else:
+                ok_d, msg_d = app_compose_cmd(folder, "up", "-d", "db", timeout=300)
+                if not ok_d:
+                    steps.append("起 db 失败：%s" % str(msg_d)[:100])
+                else:
+                    ready, _why = _wait_db_ready(folder)
+                    if not ready:
+                        steps.append("数据库未就绪，未导入（%s）" % _why[:80])
+                    else:
+                        ok_i, msg_i = app_compose_cmd(
+                            folder, "exec", "-T", "db", "sh", "-c",
+                            'exec mysql -uroot -p"$MYSQL_ROOT_PASSWORD"',
+                            timeout=3600, full=True, stdin_file=dump_src)
+                        steps.append("导入数据库" + ("完成" if ok_i else "失败：%s" % str(msg_i)[:120]))
+        # 5) 起回应用
+        if DRY_RUN:
+            steps.append("起回容器（演练跳过）")
+        elif not restart_apps:
+            steps.append("按要求保持停止")
+        elif os.path.isfile(app_compose_file(folder)):
+            ok_u, msg_u = app_compose_cmd(folder, "up", "-d", timeout=300)
+            steps.append("起回容器" + ("完成" if ok_u else "失败：%s" % str(msg_u)[:80]))
+        else:
+            steps.append("本机无此应用（跳过起回）")
+        report.append("%s：%s（%d 文件 / %.1f MB / %.1fs）" % (
+            rec.get("name") or folder, "、".join(steps), f_n, b_n / 1048576.0, time.time() - t0))
+    # compose 项目文件 / 自动数据卷：只写「对应应用也恢复」的项目（避免造出有配置无数据的空容器）
+    data_root = os.path.dirname(src_root.rstrip("/"))      # <tmp>/data（apps / compose / runs 的共同父目录）
+
+    def _write_group(items, prefix, src_base, root):
+        n, sk = 0, []
+        for e, arc in items:
+            rest = arc[len(prefix):]
+            top = _app_folder_safe(rest.split("/", 1)[0]) if "/" in rest else ""
+            if not top or top not in sel:
+                sk.append(arc)
+                continue
+            if e.get("is_dir"):
+                continue
+            src = os.path.join(data_root, src_base, rest)
+            dst = _safe_dest_under(root, rest)
+            if not dst or not os.path.isfile(src):
+                sk.append(arc)
+                continue
+            want = e.get("sha256") or ""
+            if want and _sha256_file(src) != want:
+                sk.append(arc + "(校验和不符)")
+                continue
+            n += 1
+            if not DRY_RUN:
+                ok_w, why = _write_pkg_entry(src, dst, e, can_chown, chown_failed)
+                if not ok_w:
+                    sk.append("%s(%s)" % (arc, why))
+                    n -= 1
+        return n, sk
+
+    compose_n, compose_sk = _write_group(compose_items, BACKUP_COMPOSE_ARC, "compose", compose_base)
+    runs_n, runs_sk = _write_group(runs_items, BACKUP_RUNS_ARC, "runs", runs_base)
+    skipped.extend(compose_sk)
+    skipped.extend(runs_sk)
+    skipped.extend(skipped_other)
+    if not report and not compose_n and not runs_n:
+        return False, "没有可恢复的应用数据（勾选的应用不在包内？）"
+    head = "应用数据：%d 个应用 / %d 个文件 / %.1f MB" % (len(report), total_files, total_bytes / 1048576.0)
+    if compose_n:
+        head += "；compose 项目文件 %d 个" % compose_n
+    if runs_n:
+        head += "；自动数据卷 %d 个" % runs_n
+    if can_chown:
+        if chown_failed:
+            head += "；属主部分失败（%s）" % "、".join(chown_failed)
+    else:
+        head += "；⚠ 权限已还原，属主未还原（面板非 root 运行）"
+    if apps_hash_limited:
+        head += "；本包应用数据未逐文件校验（体积超 %s，仅保证大小一致）" % _fmt_size(BACKUP_APPS_HASH_MAX_BYTES)
+    if skipped:
+        head += "；跳过 %d 项（%s）" % (len(skipped), "、".join(skipped[:3]))
+    head += "；不删除目标机多余文件（要完全一致请勾「先清空」）"
+    return True, head + " ｜ " + " ； ".join(report)
+
+
 def backup_snapshot_modules():
     """恢复前快照要覆盖的模块（有证书就把证书一起快照，否则恢复坏了没得回滚）"""
     mods = ["config", "nginx"]
@@ -3010,6 +3297,11 @@ def backup_snapshot_modules():
     try:
         if backup_site_roots() and backup_sites_size().get("bytes", 0) <= BACKUP_SNAPSHOT_SITE_MAX:
             mods.append("sites")     # 站点体积可控才进快照（否则快照本身会很大很慢）
+    except Exception:
+        pass
+    try:
+        if backup_app_list() and backup_apps_size().get("bytes", 0) <= BACKUP_SNAPSHOT_APPS_MAX:
+            mods.append("apps")      # 应用数据同理：有且体积可控才快照
     except Exception:
         pass
     return mods
@@ -3269,6 +3561,79 @@ def backup_app_entries(app_folders=None, skip_subs=None, with_runs=False):
     return entries
 
 
+def backup_app_meta(app_folders=None, skip_subs=None):
+    """清单里的应用元数据（恢复侧据此逐应用勾选、判定数据库类型，v3.3.14）
+
+    与 backup_app_entries 用同一套白名单／反勾选项，保证「包里有什么」和「记了什么」一致。
+    """
+    want = set(app_folders) if app_folders else None
+    skip_subs = dict(skip_subs or {})
+    out = []
+    for a in backup_app_list():
+        folder = a["folder"]
+        if want is not None and folder not in want:
+            continue
+        skip = set(skip_subs.get(folder) or [])
+        subs = [s["name"] for s in (a.get("subs") or []) if s["name"] not in skip]
+        if not subs:
+            continue
+        out.append({"folder": folder, "name": a["name"], "template": a["template"],
+                    "db": a.get("db") or "", "subs": subs,
+                    "bytes": sum(int(s.get("bytes") or 0) for s in (a.get("subs") or [])
+                                 if s["name"] not in skip)})
+    return out
+
+
+def _app_folder_safe(name):
+    """应用目录名合法性（恢复侧防路径穿越：只允许面板自己生成的形状）"""
+    n = str(name or "").strip()
+    if not n or len(n) > BACKUP_APPS_FOLDER_MAX or ".." in n or n.startswith("."):
+        return ""
+    return n if re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", n) else ""
+
+
+def backup_pkg_apps(man, prefix=BACKUP_APPS_ARC):
+    """包内实际有的应用清单（新包读 manifest["apps"]，旧包从文件路径倒推）
+
+    返回 [{folder, name, db, subs, bytes, files, dump}]，供预览界面逐应用勾选。
+    """
+    out, idx = [], {}
+    for a in (man or {}).get("apps") or []:
+        folder = _app_folder_safe((a or {}).get("folder"))
+        if not folder or folder in idx:
+            continue
+        idx[folder] = {"folder": folder, "name": str(a.get("name") or folder),
+                       "db": str(a.get("db") or ""), "template": str(a.get("template") or ""),
+                       "subs": [str(x) for x in (a.get("subs") or [])],
+                       "bytes": int(a.get("bytes") or 0), "files": 0, "dump": False}
+        out.append(idx[folder])
+    for e in (man or {}).get("files") or []:
+        arc = str((e or {}).get("arc") or "")
+        if not arc.startswith(prefix):
+            continue
+        rest = arc[len(prefix):]
+        if "/" not in rest:
+            continue
+        folder = _app_folder_safe(rest.split("/", 1)[0])
+        if not folder:
+            continue
+        rec = idx.get(folder)
+        if rec is None:
+            subs = sorted(set(x.split("/", 1)[0] for x in
+                              [rest.split("/", 1)[1]] if x))
+            rec = {"folder": folder, "name": folder, "db": "", "template": "",
+                   "subs": subs, "bytes": 0, "files": 0, "dump": False}
+            idx[folder] = rec
+            out.append(rec)
+        name = rest.split("/", 1)[1]
+        if name == "database.sql":
+            rec["dump"] = True
+        if not e.get("is_dir"):
+            rec["files"] += 1
+            rec["bytes"] += int(e.get("size") or 0)
+    return out
+
+
 def BASE_APP_ARC_SUB(folder, sub):
     """应用子目录在包内的路径"""
     return "%s%s/%s" % (BACKUP_APPS_ARC, folder, sub)
@@ -3429,13 +3794,19 @@ def backup_make_manifest(modules, note="", files=None, name_prefix=""):
                 dump_entries.append({"arc": arc, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                                      "mode": 0o600, "uid": 0, "gid": 0, "mtime": int(time.time()), "is_dir": False})
             task_progress("数据库 dump：%s" % note)
-    site_total = sum(e["size"] for e in meta.values() if not e["is_dir"])
+    site_total = sum(e["size"] for e in meta.values()
+                     if not e["is_dir"] and e["arc"].startswith(BACKUP_SITE_ARC))
+    apps_total = sum(e["size"] for e in meta.values()
+                     if not e["is_dir"] and e["arc"].startswith(BACKUP_APPS_ARC))
     hash_limited = bool("sites" in mods and site_total > BACKUP_HASH_MAX_BYTES)
+    apps_hash_limited = bool("apps" in mods and apps_total > BACKUP_APPS_HASH_MAX_BYTES)
     entries = []
     for src_p, arc in files:
         try:
             size = os.path.getsize(src_p)
-            sha = "" if (hash_limited and arc.startswith(BACKUP_SITE_ARC)) else _sha256_file(src_p)
+            skip_hash = ((hash_limited and arc.startswith(BACKUP_SITE_ARC)) or
+                         (apps_hash_limited and arc.startswith(BACKUP_APPS_ARC)))
+            sha = "" if skip_hash else _sha256_file(src_p)
             ent = {"arc": arc, "size": size, "sha256": sha}
             m = meta.get(arc)
             if m:
@@ -3452,6 +3823,8 @@ def backup_make_manifest(modules, note="", files=None, name_prefix=""):
     return {
         "hash_limited": hash_limited,
         "site_total": site_total,
+        "apps_total": apps_total,
+        "apps_hash_limited": apps_hash_limited,
         "format": BACKUP_FORMAT,
         "panel_version": CURRENT_VERSION,
         "created": int(time.time()),
@@ -3459,6 +3832,8 @@ def backup_make_manifest(modules, note="", files=None, name_prefix=""):
         "note": str(note or "")[:200],
         "modules": [m for m in (modules or [])],
         "counts": backup_counts(),
+        "apps": (backup_app_meta(_backup_opts.get("apps"), _backup_opts.get("skip_subs"))
+                 if "apps" in mods else []),
         "panel_port": cfg.get("port"),
         "panel_bind": cfg.get("bind", ""),
         "ssh_port": cfg.get("ssh_port"),
@@ -3652,6 +4027,7 @@ def backup_preview(pkg_path):
     }
     present = [e["arc"].split("/")[-1] for e in man.get("files", [])]
     return {"manifest": man, "diff": diff, "files": present,
+            "apps": backup_pkg_apps(man),
             "counts_now": backup_counts()}, ""
 
 
@@ -3796,6 +4172,14 @@ def backup_restore_work(pkg_name, items, opts=None):
             except Exception as e:
                 restored.append("站点文件恢复异常：%s" % e)
 
+        if items.get("app_files"):
+            task_progress("恢复应用数据（Docker）...")
+            try:
+                ok_a, msg_a = restore_app_files(os.path.join(tmp, "data", "apps"), man, opts)
+                restored.append(msg_a if ok_a else ("应用数据：%s" % msg_a))
+            except Exception as e:
+                restored.append("应用数据恢复异常：%s" % e)
+
         if items.get("nginx"):
             task_progress("按恢复后的记录重新渲染 nginx...")
             try:
@@ -3850,8 +4234,31 @@ def backup_rollback_work(pkg_name):
     items["nginx"] = True
     items["cert_files"] = True
     items["site_files"] = True
+    items["app_files"] = True
     items["port"] = False          # 端口永远走护栏：不覆盖
     return backup_restore_work(pkg_name, items, {"snapshot": False, "restart": True})
+
+
+def backup_restore_opts(opts):
+    """规范化恢复选项（前端来的）：只放行白名单字段，应用目录名一律过形状校验
+
+    restore_apps / wipe_apps 里的非法名字（`..`、路径分隔符等）在这里就被丢掉，
+    到 restore_app_files 还会再校验一次（两层）。
+    """
+    o = dict(opts) if isinstance(opts, dict) else {}
+
+    def _folders(v):
+        if not isinstance(v, (list, tuple)):
+            return []
+        return [s for s in (_app_folder_safe(i) for i in list(v)[:200]) if s]
+
+    return {
+        "snapshot": bool(o.get("snapshot", True)),
+        "restart": bool(o.get("restart", True)),
+        "apps": _folders(o.get("restore_apps")),
+        "wipe_apps": _folders(o.get("wipe_apps")),
+        "restart_apps": bool(o.get("restart_apps", True)),
+    }
 
 
 def backup_upload_dir():
@@ -3950,12 +4357,15 @@ def app_compose_file(folder):
     return os.path.join(COMPOSE_BASE, folder, "docker-compose.yml")
 
 
-def app_compose_cmd(folder, *args, timeout=300, full=False):
+def app_compose_cmd(folder, *args, timeout=300, full=False, stdin_data=None, stdin_file=""):
     """在应用 compose 项目目录执行 docker compose 子命令
 
     ⚠ full=False 时输出截断到 400 字符，仅用于「给人看的提示」；
     需要解析输出（容器状态 JSON、日志、mysqldump 内容）必须 full=True ——
-    否则 JSON 被截断导致状态解析失败、备份 SQL 被砍成半截（实测踩过）。"""
+    否则 JSON 被截断导致状态解析失败、备份 SQL 被砍成半截（实测踩过）。
+    stdin_data / stdin_file（v3.3.14）：把内容喂给命令的 stdin（恢复时导入 SQL 用；
+    大 SQL 走 stdin_file 流式读取，不占内存）。
+    """
     if DRY_RUN:
         return True, "DRY_RUN: docker compose " + " ".join(str(a) for a in args)
     f = app_compose_file(folder)
@@ -3963,13 +4373,30 @@ def app_compose_cmd(folder, *args, timeout=300, full=False):
         return False, f"未找到应用容器配置：{f}"
     if not docker_installed():
         return False, "docker 不可用（请先在「Docker」页一键安装）"
+    kw = {}
+    fh = None
+    if stdin_file:
+        try:
+            fh = open(stdin_file, "rb")
+            kw["stdin"] = fh
+        except OSError as e:
+            return False, "读取导入数据失败：%s" % e
+    elif stdin_data is not None:
+        kw["input"] = (stdin_data.decode("utf-8", "replace")
+                       if isinstance(stdin_data, (bytes, bytearray)) else str(stdin_data))
     try:
         r = subprocess.run(["docker", "compose", "-f", f, *args],
-                           capture_output=True, text=True, timeout=timeout)
+                           capture_output=True, text=True, timeout=timeout, **kw)
     except subprocess.TimeoutExpired:
         return False, "命令超时（%ss）" % timeout
     except Exception as e:
         return False, str(e)[:200]
+    finally:
+        if fh is not None:
+            try:
+                fh.close()
+            except OSError:
+                pass
     out = (r.stdout or r.stderr).strip()
     return r.returncode == 0, out if full else out[:400]
 
@@ -11378,8 +11805,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not isinstance(items, dict) or not any(bool(v) for v in items.values()):
             self._send(400, {"error": "请至少勾选一个恢复项"})
             return
-        opts = d.get("opts") if isinstance(d.get("opts"), dict) else {}
-        opts = {"snapshot": bool(opts.get("snapshot", True)), "restart": bool(opts.get("restart", True))}
+        opts = backup_restore_opts(d.get("opts"))
         if DRY_RUN:
             self._send(200, {"ok": True, "msg": "DRY_RUN: 跳过恢复（勾选项 %s）"
                                               % ",".join(k for k, v in items.items() if v)})

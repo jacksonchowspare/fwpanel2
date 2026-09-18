@@ -7466,6 +7466,16 @@ class TestBackupFrontendWiring(unittest.TestCase):
         self.assertIn("备份与恢复", self.html)
         self.assertIn("bkLoad()", self.html, "系统页加载时要拉备份信息")
 
+    def test_app_data_restore_ui_wiring(self):
+        """应用数据恢复的前端控件与后端字段必须对得上（防改名漏改）"""
+        for needle in ("data-bkrapp", "data-bkrwipe", "bk_opt_apps_restart",
+                       "bkRestoreAppsRender", "bkRestoreAppPicks", "restore_apps", "wipe_apps",
+                       "restart_apps"):
+            self.assertTrue(needle in self.html, "前端缺少 " + needle)
+        for needle in ("def restore_app_files", '"app_files"', "backup_restore_opts",
+                       '"restore_apps"', '"wipe_apps"', '"restart_apps"', "def backup_pkg_apps"):
+            self.assertTrue(needle in self.py, "后端缺少 " + needle)
+
 
 class TestBackupCertFiles(unittest.TestCase):
     """备份/恢复「证书（含私钥）」档（v3.3.10）
@@ -8047,6 +8057,341 @@ class TestBackupApps(unittest.TestCase):
         self.assertIn("现场数据库 dump", mod["desc"])
 
 
+class TestBackupAppRestore(unittest.TestCase):
+    """恢复「Docker 应用数据」档（v3.3.14）
+
+    覆盖：逐应用「停 → 写 → 导入 → 起」的顺序、只恢复勾选的应用、默认不删目标机多余文件、
+    危险项「先清空」、路径穿越拒绝（`..` 判定 + 落点 realpath 复核，含 base 内软链接逃逸）、
+    sha256 不符跳过、演练模式不落盘不调 docker、包内应用清单（新包 manifest.apps / 旧包按路径倒推）、
+    恢复项与快照/回滚联动、API 选项规整。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fwapprs-")
+        self.src_dd = os.path.join(self.tmp, "src")
+        self.dst_dd = os.path.join(self.tmp, "dst")
+        self.backup_dir = os.path.join(self.tmp, "backups")
+        self._w(self.src_dd, "apps/wordpress-8080/db/wp.sql", "SRCDB")
+        self._w(self.src_dd, "apps/wordpress-8080/html/index.php", "<?php echo 1;", 0o600)
+        self._w(self.src_dd, "apps/vaultwarden-8083/data/db.sqlite3", "SQLITE")
+        self._w(self.src_dd, "apps/nextcloud-8082/db/nc.sql", "NC")
+        self._w(self.src_dd, "apps/nextcloud-8082/html/index.html", "NC-HTML")
+        self._w(self.src_dd, "dockercompose/wordpress-8080/docker-compose.yml", "services: {}")
+        self._w(self.src_dd, "dockercompose/nextcloud-8082/docker-compose.yml", "services: {}")
+        self.apps = [
+            {"folder": "wordpress-8080", "name": "WordPress", "template": "wordpress",
+             "data_dir": os.path.join(self.src_dd, "apps/wordpress-8080"), "port": 8080, "domain": ""},
+            {"folder": "vaultwarden-8083", "name": "Vaultwarden", "template": "vaultwarden",
+             "data_dir": os.path.join(self.src_dd, "apps/vaultwarden-8083"), "port": 8083, "domain": ""},
+            {"folder": "nextcloud-8082", "name": "Nextcloud", "template": "nextcloud",
+             "data_dir": os.path.join(self.src_dd, "apps/nextcloud-8082"), "port": 8082, "domain": ""},
+        ]
+        self.calls = []
+        self.stop_snapshot = {}      # 停容器那一刻，目标文件还是旧的？（验「停 → 写」顺序）
+        self.up_snapshot = {}        # 起回容器那一刻，文件已是新的？（验「写 → 起」顺序）
+
+        def _read(p):
+            try:
+                with open(p, encoding="utf-8") as f:
+                    return f.read()
+            except OSError:
+                return None
+
+        def fake_compose(folder, *args, **kw):
+            self.calls.append((folder, tuple(str(a) for a in args), dict(kw)))
+            joined = " ".join(str(a) for a in args)
+            idxp = os.path.join(self.dst_dd, "apps", folder, "html", "index.php")
+            if joined.startswith("stop"):
+                self.stop_snapshot[folder] = _read(idxp)
+            elif joined.startswith("up -d") and " db" not in joined:
+                self.up_snapshot[folder] = _read(idxp)
+            if "mysqldump" in joined:
+                return True, "-- MySQL dump\nCREATE TABLE t (id int);\n"
+            if "mysqladmin" in joined:
+                return True, "mysqld is alive"
+            return True, ""
+
+        self._patches = [
+            unittest.mock.patch.object(panel, "DOCKER_DATA_BASE", self.src_dd),
+            unittest.mock.patch.object(panel, "COMPOSE_BASE", os.path.join(self.src_dd, "dockercompose")),
+            unittest.mock.patch.object(panel, "BACKUP_DIR", self.backup_dir),
+            unittest.mock.patch.object(panel, "CURRENT_VERSION", "3.3.14"),
+            unittest.mock.patch.object(panel, "AppStore", lambda: types.SimpleNamespace(apps=self.apps)),
+            unittest.mock.patch.object(panel, "app_compose_cmd", fake_compose),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _w(self, root, rel, data, mode=0o644):
+        p = os.path.join(root, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(p, mode)
+        return p
+
+    def _pack(self):
+        with unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok, msg = panel.backup_create_work(["apps"], note="rs", opts={})
+        self.assertTrue(ok, msg)
+        pkg = sorted(f for f in os.listdir(self.backup_dir) if f.endswith(".tar.gz"))[-1]
+        path = os.path.join(self.backup_dir, pkg)
+        with open(path + ".json", encoding="utf-8") as f:
+            man = json.load(f)
+        ext = os.path.join(self.tmp, "ext")
+        with tarfile.open(path) as tf:
+            tf.extractall(ext)
+        return path, man, ext
+
+    def _dst_ready(self, folders=("wordpress-8080", "vaultwarden-8083")):
+        """目标机摆好 compose 文件；故意不给 nextcloud 放 → 验证「本机无此应用」分支"""
+        for f in folders:
+            self._w(self.dst_dd, "dockercompose/%s/docker-compose.yml" % f, "services: {}")
+
+    def _restore(self, man, ext, opts=None, dry=False):
+        self.calls.clear()
+        with unittest.mock.patch.object(panel, "DOCKER_DATA_BASE", self.dst_dd), \
+             unittest.mock.patch.object(panel, "COMPOSE_BASE", os.path.join(self.dst_dd, "dockercompose")), \
+             unittest.mock.patch.object(panel, "DRY_RUN", dry):
+            return panel.restore_app_files(os.path.join(ext, "data", "apps"), man, opts or {})
+
+    @staticmethod
+    def _phase(args):
+        j = " ".join(args)
+        if j.startswith("stop"):
+            return "stop"
+        if j.startswith("up -d db"):
+            return "up-db"
+        if "mysqladmin" in j:
+            return "ping"
+        if "mysqldump" in j:
+            return "dump"
+        if j.startswith("exec"):
+            return "import"
+        if j.startswith("up -d"):
+            return "up"
+        return j
+
+    # ---------- 打包侧新增：清单里的应用元数据 ----------
+    def test_manifest_records_app_meta(self):
+        """清单要带应用元数据（恢复界面据此逐应用勾选、判断数据库类型）"""
+        _, man, _ = self._pack()
+        meta = {a["folder"]: a for a in man.get("apps") or []}
+        self.assertEqual(sorted(meta), ["nextcloud-8082", "vaultwarden-8083", "wordpress-8080"])
+        self.assertEqual(meta["vaultwarden-8083"]["db"], "sqlite")
+        self.assertEqual(meta["wordpress-8080"]["db"], "mysql")
+        self.assertEqual(sorted(meta["wordpress-8080"]["subs"]), ["db", "html"])
+        self.assertIn("apps_hash_limited", man)
+        self.assertIn("apps_total", man)
+
+    def test_pkg_apps_from_files_when_no_meta(self):
+        """旧包没有 apps 元数据时，从文件路径倒推（含是否含数据库导出）"""
+        _, man, _ = self._pack()
+        old = dict(man)
+        old.pop("apps", None)
+        got = {a["folder"]: a for a in panel.backup_pkg_apps(old)}
+        self.assertEqual(sorted(got), ["nextcloud-8082", "vaultwarden-8083", "wordpress-8080"])
+        self.assertTrue(got["wordpress-8080"]["dump"])
+        self.assertFalse(got["vaultwarden-8083"]["dump"])
+        self.assertGreater(got["wordpress-8080"]["bytes"], 0)
+
+    # ---------- 恢复 ----------
+    def test_restore_writes_files_and_keeps_extra(self):
+        """写回文件、还原权限、默认不删目标机多余文件；dump 不落到数据目录"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        self._w(self.dst_dd, "apps/wordpress-8080/html/index.php", "OLD")
+        keep = self._w(self.dst_dd, "apps/wordpress-8080/html/keep_me.txt", "KEEP")
+        ok, msg = self._restore(man, ext)
+        self.assertTrue(ok, msg)
+        with open(os.path.join(self.dst_dd, "apps/wordpress-8080/html/index.php")) as f:
+            self.assertEqual(f.read(), "<?php echo 1;")
+        self.assertEqual(oct(os.stat(os.path.join(self.dst_dd, "apps/wordpress-8080/html/index.php")).st_mode & 0o777),
+                         "0o600", "权限要按记录还原")
+        self.assertTrue(os.path.isfile(keep), "默认不删目标机多余文件")
+        self.assertTrue(os.path.isfile(os.path.join(self.dst_dd, "apps/vaultwarden-8083/data/db.sqlite3")))
+        self.assertFalse(os.path.exists(os.path.join(self.dst_dd, "apps/wordpress-8080/database.sql")),
+                         "dump 只用于导入，不该留在数据目录里")
+        self.assertIn("不删除目标机多余文件", msg)
+        self.assertIn("WordPress", msg)
+
+    def test_stop_write_import_up_order(self):
+        """mysql 应用：停 → 写 → 起 db → 等就绪 → 导入 → 起回（顺序不能乱）"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        self._w(self.dst_dd, "apps/wordpress-8080/html/index.php", "OLD")
+        ok, msg = self._restore(man, ext)
+        self.assertTrue(ok, msg)
+        wp = [self._phase(a) for f, a, _kw in self.calls if f == "wordpress-8080"]
+        self.assertEqual(wp, ["stop", "up-db", "ping", "import", "up"])
+        # 顺序的真正含义：停容器时文件还是旧的，起回容器时文件已经是新的
+        self.assertEqual(self.stop_snapshot.get("wordpress-8080"), "OLD",
+                         "停容器必须在覆盖文件之前（否则运行中的容器会把数据写坏）")
+        self.assertEqual(self.up_snapshot.get("wordpress-8080"), "<?php echo 1;",
+                         "起回容器必须在写完之后")
+        imp = [kw for f, a, kw in self.calls
+               if f == "wordpress-8080" and self._phase(a) == "import"][0]
+        self.assertTrue(str(imp.get("stdin_file") or "").endswith(os.path.join("wordpress-8080", "database.sql")),
+                        "要把包里的 SQL 喂给 mysql 的 stdin")
+        # sqlite 应用没有数据库导入这一步
+        vw = [self._phase(a) for f, a, _kw in self.calls if f == "vaultwarden-8083"]
+        self.assertEqual(vw, ["stop", "up"])
+        # 目标机没有这个应用（无 compose 文件）→ 不调 docker，但文件照样写回
+        self.assertEqual([c for c in self.calls if c[0] == "nextcloud-8082"], [])
+        self.assertTrue(os.path.isfile(os.path.join(self.dst_dd, "apps/nextcloud-8082/html/index.html")))
+        self.assertIn("本机无此应用", msg)
+
+    def test_only_selected_apps_restored(self):
+        """只恢复勾选的应用；没勾的应用连 compose 也不写（避免有配置无数据的空容器）"""
+        _, man, ext = self._pack()
+        self._dst_ready(("wordpress-8080",))
+        ok, msg = self._restore(man, ext, {"apps": ["wordpress-8080"]})
+        self.assertTrue(ok, msg)
+        self.assertTrue(os.path.isfile(os.path.join(self.dst_dd, "apps/wordpress-8080/db/wp.sql")))
+        self.assertFalse(os.path.isdir(os.path.join(self.dst_dd, "apps/vaultwarden-8083")))
+        self.assertFalse(os.path.isdir(os.path.join(self.dst_dd, "apps/nextcloud-8082")))
+        self.assertTrue(os.path.isfile(os.path.join(self.dst_dd, "dockercompose/wordpress-8080/docker-compose.yml")))
+        self.assertFalse(os.path.exists(os.path.join(self.dst_dd, "dockercompose/nextcloud-8082/docker-compose.yml")))
+        self.assertNotIn("Vaultwarden", msg)
+
+    def test_restart_can_be_turned_off(self):
+        """「恢复后起回容器」关掉时保持停止（只写文件，不 up）"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        ok, msg = self._restore(man, ext, {"apps": ["wordpress-8080"], "restart_apps": False})
+        self.assertTrue(ok, msg)
+        wp = [self._phase(a) for f, a, _kw in self.calls if f == "wordpress-8080"]
+        self.assertEqual(wp, ["stop", "up-db", "ping", "import"])
+        self.assertIn("保持停止", msg)
+
+    def test_wipe_only_when_explicitly_asked(self):
+        """危险项「先清空」默认关；显式勾选才删除包内没有的文件"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        keep = self._w(self.dst_dd, "apps/wordpress-8080/html/keep_me.txt", "KEEP")
+        ok, msg = self._restore(man, ext, {"apps": ["wordpress-8080"]})
+        self.assertTrue(ok, msg)
+        self.assertTrue(os.path.isfile(keep))
+        self.assertNotIn("已清空目录", msg)
+        ok2, msg2 = self._restore(man, ext, {"apps": ["wordpress-8080"], "wipe_apps": ["wordpress-8080"]})
+        self.assertTrue(ok2, msg2)
+        self.assertFalse(os.path.isfile(keep), "勾了「先清空」就该删掉包内没有的文件")
+        self.assertIn("已清空目录", msg2)
+        with open(os.path.join(self.dst_dd, "apps/wordpress-8080/html/index.php")) as f:
+            self.assertEqual(f.read(), "<?php echo 1;")
+
+    def test_sha_mismatch_skipped(self):
+        """包内文件被改动（sha256 不符）→ 跳过不覆盖并报告"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        with open(os.path.join(ext, "data/apps/wordpress-8080/db/wp.sql"), "a", encoding="utf-8") as f:
+            f.write("TAMPERED")
+        old = self._w(self.dst_dd, "apps/wordpress-8080/db/wp.sql", "OLD-DB")
+        ok, msg = self._restore(man, ext, {"apps": ["wordpress-8080"]})
+        self.assertTrue(ok, msg)
+        with open(old) as f:
+            self.assertEqual(f.read(), "OLD-DB")
+        self.assertIn("校验和不符", msg)
+
+    def test_rejects_traversal(self):
+        """穿越形状一律拒收：非法目录名、带 `..` 的相对路径、base 内软链接逃逸"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        # ① 目录名非法（`..`）：即使包内真有这个文件也不能收
+        self._w(ext, "data/evil/pwn.txt", "PWN")
+        man["files"].append({"arc": "data/apps/../evil/pwn.txt", "size": 3, "sha256": "",
+                             "mode": 0o644, "is_dir": False})
+        # ② 合法目录名 + `..` 穿越：源文件存在，但落点校验必须拒绝
+        self._w(ext, "data/apps/escape.txt", "ESC")
+        man["files"].append({"arc": "data/apps/wordpress-8080/../escape.txt", "size": 3, "sha256": "",
+                             "mode": 0o644, "is_dir": False})
+        ok, msg = self._restore(man, ext, {"apps": ["wordpress-8080"]})
+        self.assertTrue(ok, msg)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "evil", "pwn.txt")))
+        self.assertFalse(os.path.exists(os.path.join(self.dst_dd, "apps/escape.txt")),
+                         "带 .. 的路径不能落到应用数据根里")
+        self.assertIn("跳过", msg)
+
+    def test_symlink_escape_blocked_by_second_layer(self):
+        """base 内软链接目录逃逸：第一层（`..` 判定）拦不住，必须靠落点 realpath 复核"""
+        base = os.path.join(self.tmp, "guard")
+        outside = os.path.join(self.tmp, "guard-out")
+        os.makedirs(os.path.join(base, "sub"))
+        os.makedirs(outside)
+        self.assertTrue(panel._safe_dest_under(base, "sub/a.txt"))
+        self.assertEqual(panel._safe_dest_under(base, "../x"), "")
+        self.assertEqual(panel._safe_dest_under(base, "/etc/passwd"), "")
+        self.assertEqual(panel._safe_dest_under(base, ""), "")
+        os.symlink(outside, os.path.join(base, "link"))
+        self.assertEqual(panel._safe_dest_under(base, "link/out.txt"), "",
+                         "指向 base 之外的软链接目录必须被 realpath 复核拦住")
+        # 集成：目标机里把某应用的子目录换成软链接 → 写入被拒、外部目录不被污染
+        _, man, ext = self._pack()
+        self._dst_ready()
+        os.makedirs(os.path.join(self.dst_dd, "apps/wordpress-8080"), exist_ok=True)
+        os.symlink(outside, os.path.join(self.dst_dd, "apps/wordpress-8080/html"))
+        ok, msg = self._restore(man, ext, {"apps": ["wordpress-8080"]})
+        self.assertTrue(ok, msg)
+        self.assertEqual(os.listdir(outside), [])
+        self.assertIn("跳过", msg)
+
+    def test_dry_run_only_counts(self):
+        """演练模式：不落盘、不调 docker"""
+        _, man, ext = self._pack()
+        self._dst_ready()
+        ok, msg = self._restore(man, ext, dry=True)
+        self.assertTrue(ok, msg)
+        self.assertEqual(self.calls, [], "演练模式不该调 docker compose")
+        self.assertFalse(os.path.isdir(os.path.join(self.dst_dd, "apps/wordpress-8080")))
+        self.assertIn("演练跳过", msg)
+
+    # ---------- 恢复项 / 快照 / 回滚 / API 选项 ----------
+    def test_restore_item_snapshot_rollback_wiring(self):
+        ids = [i["id"] for i in panel.RESTORE_ITEMS]
+        self.assertIn("app_files", ids)
+        item = [i for i in panel.RESTORE_ITEMS if i["id"] == "app_files"][0]
+        self.assertFalse(item["on"], "应用数据恢复默认不勾（要先停容器）")
+        self.assertIn("应用记录", item["desc"], "要提示还得勾「应用记录」")
+        seen = {}
+
+        def fake_restore(name, items, opts=None):
+            seen["items"] = dict(items)
+            return True, "ok"
+
+        with unittest.mock.patch.object(panel, "backup_restore_work", fake_restore):
+            panel.backup_rollback_work("snap.tar.gz")
+        self.assertTrue(seen["items"]["app_files"], "回滚也要带应用数据")
+        small = {"bytes": 1024, "files": 1, "apps": [], "compose_bytes": 0, "truncated": False}
+        with unittest.mock.patch.object(panel, "backup_app_list", lambda: [{"folder": "a"}]):
+            with unittest.mock.patch.object(panel, "backup_apps_size", lambda: small):
+                self.assertIn("apps", panel.backup_snapshot_modules())
+            with unittest.mock.patch.object(panel, "backup_apps_size",
+                                            lambda: {"bytes": panel.BACKUP_SNAPSHOT_APPS_MAX + 1}):
+                self.assertNotIn("apps", panel.backup_snapshot_modules(),
+                                 "应用数据太大就不进快照（快照本身会很大很慢）")
+
+    def test_restore_opts_sanitized(self):
+        """前端来的选项要过白名单 + 目录名形状校验（穿越名一律丢掉）"""
+        o = panel.backup_restore_opts({"snapshot": False, "restart_apps": False,
+                                       "restore_apps": ["wp-8080", "../bad", "a/b", "", None, 123],
+                                       "wipe_apps": ["../etc", "ok-1"]})
+        self.assertEqual(o["apps"], ["wp-8080", "123"])
+        self.assertEqual(o["wipe_apps"], ["ok-1"])
+        self.assertFalse(o["snapshot"])
+        self.assertFalse(o["restart_apps"])
+        d = panel.backup_restore_opts(None)
+        self.assertEqual(d["apps"], [])
+        self.assertTrue(d["snapshot"] and d["restart"] and d["restart_apps"])
+        self.assertEqual(panel._app_folder_safe(".."), "")
+        self.assertEqual(panel._app_folder_safe("a/../b"), "")
+        self.assertEqual(panel._app_folder_safe("wordpress-8080"), "wordpress-8080")
+
+
 class TestBackupAPI(unittest.TestCase):
     """HTTP 层：路由 / 鉴权 / 分块上传 / 流式下载 / 路径防护"""
 
@@ -8206,6 +8551,20 @@ class TestBackupAPI(unittest.TestCase):
                              token=self.token)
         self.assertEqual(code, 200, d)
         self.assertTrue(d.get("ok") or d.get("task"))
+
+    def test_restore_accepts_app_data_options(self):
+        """HTTP 层要能接受「应用数据（Docker）」恢复项与逐应用选项（v3.3.14）"""
+        ok, msg = panel.backup_create_work(["config"])
+        self.assertTrue(ok, msg)
+        name = panel.backup_list()[0]["name"]
+        code, d = self._post("/api/backup/restore",
+                             {"name": name, "items": {"app_files": True},
+                              "opts": {"snapshot": False, "restore_apps": ["wordpress-8080"],
+                                       "wipe_apps": ["wordpress-8080"], "restart_apps": False}},
+                             token=self.token)
+        self.assertEqual(code, 200, d)
+        self.assertIn("app_files", str(d.get("msg") or d.get("task") or ""),
+                      "演练模式应回显勾选项（证明 app_files 是合法恢复项）")
 
     def test_delete_and_rollback_missing(self):
         ok, msg = panel.backup_create_work(["config"])

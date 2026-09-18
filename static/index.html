@@ -2227,10 +2227,11 @@ function bkPreviewRender(name, prev, err) {
         '（默认保持当前，勾选「面板端口与绑定」才覆盖）</div>' +
       '<div style="display:flex;flex-wrap:wrap;gap:12px;font-size:13px;margin-bottom:8px">' +
         items.map(it => '<label style="display:inline-flex;align-items:center;gap:5px" title="' + attrEsc(it.desc || "") + '">' +
-          '<input type="checkbox" data-bkitem="' + attrEsc(it.id) + '"' + (it.on ? " checked" : "") + ' style="width:auto"> ' +
+          '<input type="checkbox" data-bkitem="' + attrEsc(it.id) + '" onchange="bkRestoreAppsToggle()"' + (it.on ? " checked" : "") + ' style="width:auto"> ' +
           (it.danger ? '<span style="color:var(--danger)">' + esc(it.name) + '</span>' : esc(it.name)) +
           '</label>').join("") +
       '</div>' +
+      '<div id="bk_r_apps" style="display:none;margin-bottom:8px"></div>' +
       '<div class="form-row" style="margin-bottom:8px">' +
         '<label style="font-size:13px;display:inline-flex;align-items:center;gap:5px"><input type="checkbox" id="bk_opt_snap" checked style="width:auto"> 恢复前自动快照（可回滚）</label>' +
         '<label style="font-size:13px;display:inline-flex;align-items:center;gap:5px"><input type="checkbox" id="bk_opt_restart" checked style="width:auto"> 恢复后重启面板</label>' +
@@ -2238,6 +2239,50 @@ function bkPreviewRender(name, prev, err) {
       btnHtml("确认恢复", "bkRestore()", "") +
       ' <span style="font-size:12px;color:var(--muted)">恢复会覆盖当前配置与规则；防火墙恢复后会自动补回当前 SSH／面板端口放行</span>' +
     '</div>';
+  bkRestoreAppsRender(prev);
+}
+
+/* v3.3.14：应用数据恢复范围（逐应用勾选 + 危险选项「先清空」） */
+function bkRestoreAppsRender(prev) {
+  const box = $("bk_r_apps");
+  if (!box) return;
+  const list = (prev && prev.apps) || [];
+  if (!list.length) {
+    box.innerHTML = "";
+    box.style.display = "none";
+    return;
+  }
+  box.innerHTML =
+    '<div style="font-size:13px;font-weight:600;margin-bottom:4px">应用数据范围（勾选要恢复的应用）</div>' +
+    '<div style="color:var(--muted);font-size:12px;margin-bottom:6px">恢复流程：停容器 → 写回 /DockerData/apps → mysql 应用导入数据库 → 起回容器。' +
+      '默认不删除目标机多余文件；勾「先清空」会连包内没有的文件一起删（不可恢复，除有快照）。' +
+      '若同时勾了「应用记录」，恢复后容器会按记录重建。</div>' +
+    list.map(a => '<div style="margin-bottom:6px">' +
+        '<label style="display:inline-flex;align-items:center;gap:5px;font-size:13px;cursor:pointer">' +
+          '<input type="checkbox" data-bkrapp="' + attrEsc(a.folder) + '" checked style="width:auto"> ' +
+          '<b>' + esc(a.name || a.folder) + '</b> <span style="color:var(--muted)">' + esc(a.folder) +
+          (a.db ? " · " + esc(a.db) : "") + " · " + bkFmt(a.bytes || 0) +
+          (a.dump ? " · 含数据库导出" : "") + '</span></label>' +
+        '<label style="display:inline-flex;align-items:center;gap:4px;font-size:12px;color:var(--danger);margin-left:14px;cursor:pointer" ' +
+          'title="会先删除该应用数据目录里的全部内容（包内没有的文件也会被删），只在需要与备份完全一致时勾选">' +
+          '<input type="checkbox" data-bkrwipe="' + attrEsc(a.folder) + '" style="width:auto"> 先清空</label>' +
+      '</div>').join("") +
+    '<label style="display:inline-flex;align-items:center;gap:5px;font-size:12px;cursor:pointer">' +
+      '<input type="checkbox" id="bk_opt_apps_restart" checked style="width:auto"> 恢复后起回容器</label>';
+  bkRestoreAppsToggle();
+}
+
+function bkRestoreAppsToggle() {
+  const box = $("bk_r_apps");
+  if (!box) return;
+  const on = !!(document.querySelector('[data-bkitem="app_files"]') || {}).checked;
+  box.style.display = on ? "" : "none";
+}
+
+function bkRestoreAppPicks() {
+  const apps = Array.from(document.querySelectorAll("[data-bkrapp]")).filter(c => c.checked).map(c => c.dataset.bkrapp);
+  const wipe = Array.from(document.querySelectorAll("[data-bkrwipe]")).filter(c => c.checked).map(c => c.dataset.bkrwipe);
+  return { apps: apps, wipe: wipe };
 }
 
 function bkItems() {
@@ -2252,18 +2297,41 @@ function bkRestore() {
   if (!picked.length) { toast("请至少勾选一个恢复项", "err"); return; }
   const snap = ($("bk_opt_snap") || {}).checked !== false;
   const restart = ($("bk_opt_restart") || {}).checked !== false;
-  const txt = "将用 " + bkSel + " 覆盖：" + picked.join("、") +
+  const opts = { snapshot: snap, restart: restart };
+  let extra = "";
+  let wipe = [];
+  if (items.app_files) {
+    const pick = bkRestoreAppPicks();
+    if (!pick.apps.length) { toast("「应用数据（Docker）」至少要勾一个应用，或取消该恢复项", "err"); return; }
+    opts.restore_apps = pick.apps;
+    opts.wipe_apps = pick.wipe;
+    opts.restart_apps = ($("bk_opt_apps_restart") || {}).checked !== false;
+    wipe = pick.wipe;
+    extra = "\n应用数据：" + pick.apps.join("、") +
+      (pick.apps.length && opts.restart_apps ? "（恢复后起回容器）" : "（恢复后不自动起容器）") +
+      (pick.wipe.length ? "\n⚠ 先清空：" + pick.wipe.join("、") + "——这些应用数据目录里包内没有的文件会被删除" : "") +
+      (items.apps ? "" : "\n⚠ 未勾选「应用记录」：恢复后容器不会被重建（需在应用页重新部署）");
+  }
+  const txt = "将用 " + bkSel + " 覆盖：" + picked.join("、") + extra +
     (snap ? "\n（恢复前会自动快照，可回滚）" : "\n（未勾选快照——出问题将无法回滚）");
-  confirmPanel(txt + "\n\n确定继续？", async () => {
+  const runRestore = async () => {
     try {
       const r = await apiTask("POST", "/api/backup/restore",
-        { name: bkSel, items: items, opts: { snapshot: snap, restart: restart } },
+        { name: bkSel, items: items, opts: opts },
         t => { $("bk_prev").innerHTML = '<div style="font-size:13px;color:var(--muted);margin-top:8px">恢复中：' + esc(t.msg || "") + '</div>'; });
       toast(restart ? "恢复完成，面板即将重启（约 5 秒）" : "恢复完成");
       if (!restart) bkLoad();
     } catch (e) {
       toast(e.message || "恢复失败", "err");
       bkOpen(bkSel);
+    }
+  };
+  confirmPanel(txt + "\n\n确定继续？", () => {
+    if (wipe.length) {
+      confirmPanel("⚠ 危险操作二次确认\n\n以下应用的数据目录会被先清空（包内没有的文件也会一起删除，无法用普通手段找回）：\n" +
+        wipe.join("、") + "\n\n确定继续？", runRestore, "⚠ 确认清空并恢复");
+    } else {
+      runRestore();
     }
   }, restart ? "♻ 恢复备份（含重启面板）" : "♻ 恢复备份");
 }
