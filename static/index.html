@@ -6500,7 +6500,11 @@ function termWsUrl(fedId) {
   const prefix = fedId ? "/api/fed/" + fedId : "";
   return proto + "//" + location.host + prefix + "/api/term/ws?token=" + encodeURIComponent(token);
 }
-function termApiPrefix(fedId) { return fedId ? "/api/fed/" + fedId : ""; }
+// ⚠ v3.3.21：终端里调后端**不要**再自己拼 /api/fed/<id> 前缀 —— api() 用的是全局 API
+// （节点态 enterFed 已设为 "/api/fed/<id>"），再拼一次就成了 /api/fed/<id>/api/fed/<id>/api/...
+// 实测后果：远程终端的 /api/term/info 探针静默失败、POST /api/term/key 被节点代理拒成 401→
+// 主控回 502「联邦令牌可能已失效」——用户看到误导提示、密钥根本注入不了。
+// WS 地址另走 termWsUrl()（不走 api()，那里自己拼前缀是对的）。
 
 function termNewSeq() { return ++TERM_SEQ; }
 
@@ -6880,7 +6884,7 @@ async function openTerm() {
   }
   // 探测可用性（经代理到目标机；纯提示不阻断）
   try {
-    const d = await api("GET", termApiPrefix(fedId) + "/api/term/info");
+    const d = await api("GET", "/api/term/info");
     if (!d.available) toast("低权用户 term 不存在且无法自动创建（面板需 root 运行）", "err");
     if (d.busy >= d.max) toast("目标机终端并发已达上限（" + d.busy + "/" + d.max + "）", "err");
   } catch (e) { /* 静默 */ }
@@ -6927,7 +6931,7 @@ async function termDelKey(win) {
   const p = win.keyPath;
   win.keyPath = null;
   if (!p) return;
-  try { await api("DELETE", termApiPrefix(win.fedId) + "/api/term/key", { path: p }); }
+  try { await api("DELETE", "/api/term/key", { path: p }); }
   catch (e) { /* 已删/远程断则忽略 */ }
 }
 
@@ -6940,9 +6944,9 @@ async function termPickKey(win) {
     const content = await f.text();
     if (!content.includes("PRIVATE KEY")) { toast("不是有效的私钥文件", "err"); win.fileEl.value = ""; return; }
     win.keysName.textContent = "上传中…";
-    const d = await api("POST", termApiPrefix(win.fedId) + "/api/term/key", { content, filename: name });
+    const d = await api("POST", "/api/term/key", { content, filename: name });
     if (win.keyPath && win.keyPath !== d.path) {
-      try { await api("DELETE", termApiPrefix(win.fedId) + "/api/term/key", { path: win.keyPath }); } catch (e) {}
+      try { await api("DELETE", "/api/term/key", { path: win.keyPath }); } catch (e) {}
     }
     win.keyPath = d.path;
     win.keysName.textContent = "已就绪: " + name;
