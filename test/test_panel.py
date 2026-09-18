@@ -2649,7 +2649,11 @@ class TestDocker(unittest.TestCase):
                 setattr(panel, name, fn)
 
     def test_uninstall_docker_apt_covers_both_sources(self):
-        """apt 卸载命令必须包含国内(docker-ce) + 国外(docker.io)两种来源包名"""
+        """apt 卸载要覆盖国内(docker-ce)+国外(docker.io)两种来源的包名，但只删**实际已装**的那些
+
+        （ak 实机：把不存在的包名一起丢给 apt-get remove，Debian 会整体报 Unable to locate package
+        让卸载永远失败；所以候选表要全，实际命令里只能留装了的。）
+        """
         import types
         real_run = panel.subprocess.run
         real_mgr = panel.pkg_mgr
@@ -2658,6 +2662,9 @@ class TestDocker(unittest.TestCase):
 
         def fake_run(args, **kw):
             calls.append(args)
+            if list(args[:2]) == ["dpkg-query", "-W"]:
+                return types.SimpleNamespace(returncode=0, stdout="docker-ce\ndocker.io\ndocker-compose\n",
+                                             stderr="")
             return types.SimpleNamespace(returncode=0, stdout="", stderr="")
 
         try:
@@ -2666,13 +2673,13 @@ class TestDocker(unittest.TestCase):
             panel.subprocess.run = fake_run
             ok, msg = panel.uninstall_docker_pkgs()
             self.assertTrue(ok)
-            # 找到 apt-get remove 命令，断言同时含 docker-ce 和 docker.io
             remove_calls = [a for a in calls if a[0] == "apt-get" and a[1] == "remove"]
             self.assertTrue(remove_calls)
-            self.assertTrue(any("docker-ce" in a for a in remove_calls))
-            self.assertTrue(any("docker.io" in a for a in remove_calls))
-            self.assertTrue(any("docker-compose-plugin" in a for a in remove_calls))
-            # 停止服务命令存在
+            joined = " ".join(" ".join(a) for a in remove_calls)
+            self.assertIn("docker-ce", joined, "国内源（docker-ce）要覆盖")
+            self.assertIn("docker.io", joined, "国外源（docker.io）要覆盖")
+            self.assertNotIn("docker-compose-v2", joined, "没装的包名不能传（会让 apt 整体失败）")
+            self.assertNotIn("containerd.io", joined, "没装的包名不能传")
             self.assertTrue(any(a[0] == "systemctl" and a[1] == "stop" for a in calls))
         finally:
             panel.subprocess.run = real_run
@@ -6177,6 +6184,206 @@ class TestBruteforceLogParsing(unittest.TestCase):
         self.assertTrue(any("6.6.6.6" in x and "封禁" in x for x in logs), logs)
         self.assertTrue(any(r.get("type") == "ip_deny" and r.get("ip") == "6.6.6.6"
                             and r.get("comment") == panel.BAN_COMMENT for r in store.rules), store.rules)
+
+
+class TestDnsCertErrorHint(unittest.TestCase):
+    """DNS-01 申请失败要把「凭据权限不足」这个最常见根因讲清楚（acme.sh 只说 Error adding TXT record）"""
+
+    def _run_with_stderr(self, msg):
+        class _R:
+            returncode = 1
+            stdout = ""
+            stderr = msg
+
+        with unittest.mock.patch.object(panel, "acme_available", lambda: True), \
+             unittest.mock.patch.object(panel.subprocess, "run", lambda *a, **k: _R()), \
+             unittest.mock.patch.object(panel, "DNS_PROVIDERS",
+                                        {"cf": {"dns": "dns_cf", "fields": [("CF_Token", "Cloudflare Token")]}}), \
+             unittest.mock.patch.object(panel, "LE_LIVE", "/tmp/le"), \
+             unittest.mock.patch.object(panel.os, "makedirs", lambda *a, **k: None):
+            return panel.issue_cert_dns("t.example.com", "", "cf", {"CF_Token": "x"})
+
+    def test_txt_record_error_gets_permission_hint(self):
+        ok, msg = self._run_with_stderr(
+            "[Fri] Error adding TXT record to domain: _acme-challenge.t.example.com")
+        self.assertFalse(ok)
+        self.assertIn("DNS 编辑", msg, "要提示 Cloudflare Token 需要 DNS 编辑权限")
+        self.assertIn("Error adding TXT record", msg, "原始报错不能丢")
+
+    def test_other_errors_not_polluted(self):
+        ok, msg = self._run_with_stderr("[Fri] Some totally different failure")
+        self.assertFalse(ok)
+        self.assertNotIn("DNS 编辑", msg)
+
+
+class TestLoginLockoutPerIp(unittest.TestCase):
+    """登录失败锁定：必须按来源 IP 计数（ak 实机：原来全局锁，别人 5 次错密码就把主人锁在门外）"""
+
+    def _auth(self):
+        cfg = make_cfg()
+        cfg.data["username"] = "admin"
+        cfg.data["password_hash"] = panel.hash_password("right-password") if hasattr(panel, "hash_password") else "x"
+        a = panel.Auth(cfg)
+        return a, cfg
+
+    def test_failures_lock_only_that_ip(self):
+        a, cfg = self._auth()
+        for _ in range(panel.LOCK_MAX_FAIL):
+            a.login("admin", "wrong", "1.2.3.4")
+        # 同一 IP 再试 → 被锁
+        tok, msg = a.login("admin", "wrong", "1.2.3.4")
+        self.assertIsNone(tok)
+        self.assertIn("该 IP 登录失败次数过多", msg)
+        # 另一个 IP 不受影响（这条就是本 bug 的护栏）
+        tok2, msg2 = a.login("admin", "wrong", "5.6.7.8")
+        self.assertIsNone(tok2)
+        self.assertEqual(msg2, "用户名或密码错误", "别人被锁不能影响我的来源 IP")
+
+    def test_success_clears_only_own_counter(self):
+        a, _cfg = self._auth()
+        for _ in range(3):
+            a.login("admin", "wrong", "1.2.3.4")
+        for _ in range(3):
+            a.login("admin", "wrong", "9.9.9.9")
+        # 用一个已知正确的口令走成功分支（打桩 verify_password），只清自己那条计数
+        with unittest.mock.patch.object(panel, "verify_password", lambda pw, h: True):
+            tok, msg = a.login("admin", "whatever", "1.2.3.4")
+        self.assertTrue(tok, msg)
+        self.assertNotIn("1.2.3.4", a.ip_fails)
+        self.assertIn("9.9.9.9", a.ip_fails, "别的 IP 的计数不该被清")
+
+    def test_global_fallback_after_many_ips(self):
+        """分布式尝试（很多不同 IP）要触发全局兜底，阈值高、锁定短"""
+        a, _cfg = self._auth()
+        for i in range(panel.GLOBAL_LOCK_MAX_FAIL):
+            a.login("admin", "wrong", "10.0.%d.%d" % (i // 250, i % 250))
+        tok, msg = a.login("admin", "wrong", "127.0.0.1")
+        self.assertIsNone(tok)
+        self.assertIn("面板已临时锁定", msg)
+        self.assertLessEqual(panel.GLOBAL_LOCK_SECONDS, 120, "全局兜底锁定要短，别把主人长期锁在门外")
+
+    def test_locked_message_has_countdown(self):
+        a, _cfg = self._auth()
+        for _ in range(panel.LOCK_MAX_FAIL):
+            a.login("admin", "wrong", "2.2.2.2")
+        tok, msg = a.login("admin", "wrong", "2.2.2.2")
+        self.assertIn("秒后可再试", msg, "要告诉用户还要等多久")
+
+    def test_login_without_ip_still_works(self):
+        """兼容旧调用（不传 ip）：行为等同于单一匿名桶，不能因此崩"""
+        a, _cfg = self._auth()
+        for _ in range(panel.LOCK_MAX_FAIL + 1):
+            tok, msg = a.login("admin", "wrong")
+        self.assertIsNone(tok)
+        self.assertTrue(msg)
+
+
+class TestDockerUninstallGuards(unittest.TestCase):
+    """Docker 卸载/安装的包名与回滚（ak 实机：卸载在 Debian 上必然失败且把服务停了）"""
+
+    def test_installed_pkg_names_filters_missing(self):
+        """候选包名里不存在的必须被过滤掉（apt/dnf 传不存在的名字会让整条 remove 失败）"""
+        calls = []
+
+        class _R:
+            def __init__(self, out=""):
+                self.stdout = out
+                self.stderr = ""
+                self.returncode = 0
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            if cmd[:2] == ["dpkg-query", "-W"]:
+                return _R("docker.io\ndocker-cli\ndocker-compose\nnginx\n")
+            if cmd[0] == "rpm":
+                return _R("docker-1.0\n" if cmd[2] == "docker" else "")
+            if cmd[:2] == ["pacman", "-Qq"]:
+                return _R("docker\n")
+            return _R("")
+
+        with unittest.mock.patch.object(panel, "pkg_mgr", lambda: "apt"), \
+             unittest.mock.patch.object(panel.subprocess, "run", fake_run):
+            got = panel._installed_pkg_names(["docker.io", "docker-ce", "docker-compose-v2",
+                                              "docker-compose", "containerd.io"], "apt")
+        self.assertEqual(got, ["docker.io", "docker-compose"], got)
+
+    def test_uninstall_apt_only_removes_installed(self):
+        """卸载只删实际装了的包；不存在的包名不能出现在 apt-get remove 里"""
+        seen = {}
+
+        class _R:
+            def __init__(self, out="", rc=0):
+                self.stdout, self.stderr, self.returncode = out, "", rc
+
+        def fake_run(cmd, *a, **kw):
+            if cmd[:2] == ["dpkg-query", "-W"]:
+                return _R("docker.io\ndocker-cli\ndocker-compose\n")
+            if cmd[:3] == ["apt-get", "remove", "-y"]:
+                seen["remove"] = cmd
+                return _R("Removing docker.io ...")
+            return _R("")
+
+        with unittest.mock.patch.object(panel, "pkg_mgr", lambda: "apt"), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False), \
+             unittest.mock.patch.object(panel.subprocess, "run", fake_run):
+            ok, msg = panel.uninstall_docker_pkgs()
+        self.assertTrue(ok, msg)
+        cmd = seen.get("remove") or []
+        self.assertIn("docker.io", cmd)
+        self.assertNotIn("docker-ce", cmd, "不存在的包名会在 Debian 上让 apt 整体失败")
+        self.assertNotIn("containerd.io", cmd)
+        self.assertNotIn("docker-compose-v2", cmd)
+
+    def test_uninstall_failure_rolls_docker_back(self):
+        """卸载失败必须把停掉的 Docker 服务恢复回去（否则「卸载失败」= 用户应用被停）"""
+        rolled = []
+        calls = []
+
+        class _R:
+            def __init__(self, out="", rc=0):
+                self.stdout, self.stderr, self.returncode = out, "", rc
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            if cmd[:2] == ["dpkg-query", "-W"]:
+                return _R("docker.io\n")
+            if cmd[:3] == ["apt-get", "remove", "-y"]:
+                return _R("E: Could not get lock /var/lib/dpkg/lock-frontend", 100)
+            if cmd[:2] == ["systemctl", "is-active"]:
+                return _R("active\n")
+            return _R("")
+
+        def fake_rollback():
+            rolled.append(True)
+            return "docker=active"
+
+        with unittest.mock.patch.object(panel, "pkg_mgr", lambda: "apt"), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False), \
+             unittest.mock.patch.object(panel.subprocess, "run", fake_run), \
+             unittest.mock.patch.object(panel, "docker_rollback_start", fake_rollback):
+            ok, msg = panel.uninstall_docker_pkgs()
+        self.assertFalse(ok)
+        self.assertTrue(rolled, "失败路径必须调用回滚")
+        self.assertIn("已把 Docker 服务恢复回去", msg)
+        self.assertIn("lock", msg)
+
+    def test_uninstall_says_ok_when_nothing_installed(self):
+        """已经没装 docker 时卸载应是「无事可做」的幂等成功，不是报错"""
+        class _R:
+            def __init__(self, out="", rc=0):
+                self.stdout, self.stderr, self.returncode = out, "", rc
+
+        def fake_run(cmd, *a, **kw):
+            if cmd[:2] == ["dpkg-query", "-W"]:
+                return _R("nginx\nbash\n")
+            return _R("")
+
+        with unittest.mock.patch.object(panel, "pkg_mgr", lambda: "apt"), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False), \
+             unittest.mock.patch.object(panel.subprocess, "run", fake_run):
+            ok, msg = panel.uninstall_docker_pkgs()
+        self.assertTrue(ok, msg)
+        self.assertIn("未发现已安装", msg)
 
 
 class TestSystem(unittest.TestCase):

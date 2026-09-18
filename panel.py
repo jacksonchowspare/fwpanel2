@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.19"
+CURRENT_VERSION = "3.3.20"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -141,6 +141,10 @@ SSH_PORT_DEFAULT = 22
 TOKEN_TTL = 24 * 3600          # token 有效期 24 小时
 LOCK_MAX_FAIL = 5              # 连续失败次数
 LOCK_SECONDS = 300             # 锁定 5 分钟
+# v3.3.20：按 IP 锁定之外再留一层**高阈值**的全局兜底（防分布式猜密码把面板拖死），
+# 阈值取高、锁定取短，避免单点就能把主人锁在门外。
+GLOBAL_LOCK_MAX_FAIL = 50      # 窗口内失败总次数（跨 IP）
+GLOBAL_LOCK_SECONDS = 60       # 全局兜底锁定时长
 
 # ------------------------------- 长任务后台执行（v2.1.18） -------------------------------
 # 动机：nginx 网关 proxy_read_timeout 默认 60s，安装/拉取/证书等长任务经反代访问会 504
@@ -615,30 +619,81 @@ class Auth:
         self.lock = threading.Lock()
         self.fail_count = 0
         self.lock_until = 0
+        # v3.3.20：按来源 IP 计数（{ip: [失败数, 锁定到期] }）+ 全局兜底
+        # ⚠ ak 实机（2026-09-19）：原来 fail_count/lock_until 记在单例上 → **全局锁**：
+        #   任何人（含扫描器）试 5 次错密码，面板登录口整体锁 5 分钟，主人自己也进不去，
+        #   日志却写「IP 已锁定」（误导排查）。
+        self.ip_fails = {}
+        self.global_fail_count = 0
+        self.global_fail_since = 0.0
 
-    def check_locked(self):
-        if time.time() < self.lock_until:
+    def check_locked(self, ip=None):
+        now = time.time()
+        if ip:
+            rec = self.ip_fails.get(ip)
+            if rec and rec[1] > now:
+                return True
+        elif any(v[1] > now for v in self.ip_fails.values()):
+            # 不指定 IP（旧调用）：任意一把锁在生效就算锁定
+            return True
+        if self.lock_until > now:
             return True
         return False
 
-    def login(self, username, password):
+    def _lock_seconds_left(self, ip=None):
+        now = time.time()
+        left = 0
+        if ip:
+            rec = self.ip_fails.get(ip)
+            if rec and rec[1] > now:
+                left = int(rec[1] - now)
+        if self.lock_until > now:
+            left = max(left, int(self.lock_until - now))
+        return left
+
+    def login(self, username, password, ip=""):
+        # 不传 IP 的调用（脚本/单测）落到同一个匿名桶，行为与「某个来源 IP」一致
+        key = (ip or "").strip() or "-"
         with self.lock:
-            if self.check_locked():
-                return None, "尝试过于频繁，请稍后再试"
+            if self.check_locked(key):
+                left = self._lock_seconds_left(key)
+                if self.lock_until > time.time():
+                    return None, f"登录失败次数过多，面板已临时锁定（{left} 秒后可再试）"
+                who = "该 IP" if key != "-" else "本机"
+                return None, f"{who} 登录失败次数过多，已临时锁定（{left} 秒后可再试）"
             stored_user = self.config.get("username")
             stored_pass = self.config.get("password_hash")
             if not stored_user or not stored_pass:
                 return None, "面板未初始化，请运行安装脚本"
             if hmac.compare_digest(username, stored_user) and verify_password(password, stored_pass):
+                self.ip_fails.pop(key, None)
                 self.fail_count = 0
+                self.global_fail_count = 0
                 token = secrets.token_urlsafe(32)
                 self.tokens[token] = time.time() + TOKEN_TTL
                 return token, "ok"
+            # 失败：按 IP 计数 + 全局兜底计数
+            now = time.time()
+            rec = self.ip_fails.get(key) or [0, 0.0]
+            rec[0] += 1
+            if rec[0] >= LOCK_MAX_FAIL:
+                rec = [0, now + LOCK_SECONDS]
+                log(f"登录失败次数过多：{('IP ' + key) if key != '-' else '本机'} 已锁定 {LOCK_SECONDS}s")
+            self.ip_fails[key] = rec
+            if len(self.ip_fails) > 512:          # 防止表无限增长
+                for k in [k for k, v in self.ip_fails.items() if v[1] < now and (now - v[1]) > LOCK_SECONDS][:256]:
+                    self.ip_fails.pop(k, None)
             self.fail_count += 1
-            if self.fail_count >= LOCK_MAX_FAIL:
-                self.lock_until = time.time() + LOCK_SECONDS
-                self.fail_count = 0
-                log(f"登录失败次数过多，IP 已锁定 {LOCK_SECONDS}s")
+            if now - self.global_fail_since > LOCK_SECONDS:
+                self.global_fail_since = now
+                self.global_fail_count = 0
+            self.global_fail_count += 1
+            if self.global_fail_count >= GLOBAL_LOCK_MAX_FAIL:
+                self.global_fail_count = 0
+                self.global_fail_since = now
+                self.lock_until = now + GLOBAL_LOCK_SECONDS
+                log(f"登录失败次数异常（{GLOBAL_LOCK_MAX_FAIL} 次/窗口，疑似分布式尝试），"
+                    f"面板登录全局兜底锁定 {GLOBAL_LOCK_SECONDS}s")
             return None, "用户名或密码错误"
 
     def check(self, token):
@@ -5872,7 +5927,13 @@ def issue_cert_dns(domain, email, provider, creds):
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300, env=env)
         if r.returncode != 0:
             # 完整报错（v1.25.4：不再截断，acme.sh 的失败原因对排查至关重要）
-            return False, f"证书申请失败: {(r.stderr or r.stdout).strip()}"
+            err = (r.stderr or r.stdout).strip()
+            # v3.3.20：DNS 验证失败最常见的根因是 API 凭据权限不足，acme.sh 自己只报
+            # 「Error adding TXT record」，用户看不出要改什么 → 补一句可自助的提示。
+            if "Error adding TXT record" in err or "invalid domain" in err:
+                err += ("\n提示：DNS 验证失败通常是 API 凭据权限不足或缺少该域名所在 Zone 的权限。"
+                        "Cloudflare 需 Token 含该 Zone 的「DNS 编辑」权限；DNSPod/阿里云需对应子账号密钥。")
+            return False, f"证书申请失败: {err}"
         install = [ACME_SH, "--install-cert", "-d", domain,
                    "--fullchain-file", f"{LE_LIVE}/{domain}/fullchain.pem",
                    "--key-file", f"{LE_LIVE}/{domain}/privkey.pem",
@@ -6477,6 +6538,53 @@ def install_docker_pkgs(source="official"):
     return False, "Docker 已安装，但服务未能启动（systemctl is-active 非 active）。请手动执行: systemctl start docker 并查看日志"
 
 
+def _installed_pkg_names(names, mgr=None):
+    """从候选包名里挑出**实际已安装**的（apt/dnf 传不存在的包名会让整条 remove 命令失败 —— 详见卸载函数注释）"""
+    mgr = mgr or pkg_mgr()
+    names = list(dict.fromkeys(names))
+    try:
+        if mgr == "apt":
+            r = subprocess.run(["dpkg-query", "-W", "-f=${Package}\n"],
+                               capture_output=True, text=True, timeout=60)
+            have = set(x.strip() for x in (r.stdout or "").splitlines() if x.strip())
+            return [n for n in names if n in have]
+        if mgr == "dnf":
+            out = []
+            for n in names:
+                r = subprocess.run(["rpm", "-q", n], capture_output=True, text=True, timeout=30)
+                if r.returncode == 0 and (r.stdout or "").strip():
+                    out.append(n)
+            return out
+        if mgr == "pacman":
+            r = subprocess.run(["pacman", "-Qq"], capture_output=True, text=True, timeout=60)
+            have = set(x.strip() for x in (r.stdout or "").splitlines() if x.strip())
+            return [n for n in names if n in have]
+    except Exception:
+        pass
+    return names
+
+
+def docker_rollback_start():
+    """卸载 Docker 失败时把服务恢复回去（已停/已禁用的回滚），返回说明文本。
+
+    ⚠ ak 实机（2026-09-19）：卸载函数先停服务再删包，删包失败就直接 return False ——
+    结果「卸载失败」等于把用户正在跑的应用全停了（Docker 已被 disable+stop，没人把它起回来）。
+    """
+    notes = []
+    for svc in ("docker", "docker.socket"):
+        try:
+            subprocess.run(["systemctl", "enable", svc], capture_output=True, text=True, timeout=60)
+            subprocess.run(["systemctl", "start", svc], capture_output=True, text=True, timeout=60)
+        except Exception:
+            pass
+    try:
+        r = subprocess.run(["systemctl", "is-active", "docker"], capture_output=True, text=True, timeout=30)
+        notes.append("docker=%s" % (r.stdout or "").strip())
+    except Exception:
+        pass
+    return "、".join(notes) or "已尝试恢复"
+
+
 def uninstall_docker_pkgs():
     """一键卸载 Docker：停止并禁用服务，移除两种来源安装的全部 docker 相关包
     （国内 docker-ce 系列 + 国外 docker.io/docker 系列 + compose），保留 /DockerData 数据目录。
@@ -6494,15 +6602,23 @@ def uninstall_docker_pkgs():
         except Exception:
             pass
     # 2. 移除包（一次性覆盖国内 + 国外两种来源的包名）
+    # ⚠ ak 实机（2026-09-19）：原来直接把「候选包名全表」丢给 apt-get remove ——
+    #   Debian 上 docker-ce / containerd.io / docker-compose-v2 这些名字根本不存在，
+    #   apt 会整体报 "Unable to locate package" 并失败 → **发行版源装的 Docker 永远卸载不掉**，
+    #   而且失败前已经把 docker 停了。现在只删实际安装了的包，失败要回滚服务。
     try:
         if mgr == "apt":
-            pkgs = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin",
+            cand = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin",
                     "docker.io", "docker-compose-v2", "docker-compose",
                     "docker-buildx-plugin", "docker-ce-rootless-extras"]
+            pkgs = _installed_pkg_names(cand, "apt")
+            if not pkgs:
+                return True, "未发现已安装的 Docker 相关包（可能已卸载）"
             r = subprocess.run(["apt-get", "remove", "-y", "--purge"] + pkgs,
                                capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
-                return False, f"apt-get remove 失败: {(r.stderr or r.stdout).strip()[:300]}"
+                return False, ("apt-get remove 失败（已把 Docker 服务恢复回去：%s）: %s"
+                               % (docker_rollback_start(), (r.stderr or r.stdout).strip()[:260]))
             r = subprocess.run(["apt-get", "autoremove", "-y", "--purge"],
                                capture_output=True, text=True, timeout=300)
         elif mgr == "pacman":
@@ -6517,19 +6633,24 @@ def uninstall_docker_pkgs():
                 if r2.returncode == 0:
                     r = r2
         elif mgr == "dnf":
-            pkgs = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin",
+            cand = ["docker-ce", "docker-ce-cli", "containerd.io", "docker-compose-plugin",
                     "docker", "docker-compose-v2", "docker-compose",
                     "docker-buildx-plugin", "docker-ce-rootless-extras"]
+            pkgs = _installed_pkg_names(cand, "dnf")
+            if not pkgs:
+                return True, "未发现已安装的 Docker 相关包（可能已卸载）"
             r = subprocess.run(["dnf", "remove", "-y"] + pkgs,
                                capture_output=True, text=True, timeout=300)
             if r.returncode != 0:
-                return False, f"dnf remove 失败: {(r.stderr or r.stdout).strip()[:300]}"
+                return False, ("dnf remove 失败（已把 Docker 服务恢复回去：%s）: %s"
+                               % (docker_rollback_start(), (r.stderr or r.stdout).strip()[:260]))
         else:
             return False, f"不支持的包管理器: {mgr}"
     except subprocess.TimeoutExpired:
-        return False, "卸载超时（5 分钟）"
+        return False, "卸载超时（5 分钟）已把 Docker 服务恢复回去：%s" % docker_rollback_start()
     if r.returncode != 0:
-        return False, f"卸载失败: {(r.stderr or r.stdout).strip()[:300]}"
+        return False, ("卸载失败（已把 Docker 服务恢复回去：%s）: %s"
+                       % (docker_rollback_start(), (r.stderr or r.stdout).strip()[:260]))
     return True, "Docker 已卸载（/DockerData 数据目录已保留）"
 
 
@@ -9536,7 +9657,13 @@ class PanelHandler(BaseHTTPRequestHandler):
     # ---------- API ----------
     def _api_login(self):
         data = self._read_json()
-        token, msg = self.server.auth.login(data.get("username", ""), data.get("password", ""))
+        # v3.3.20：把来源 IP 传进去（按 IP 计数锁定，不再因为别人的错误尝试把主人锁在门外）
+        peer = ""
+        try:
+            peer = self.client_address[0] if self.client_address else ""
+        except Exception:
+            peer = ""
+        token, msg = self.server.auth.login(data.get("username", ""), data.get("password", ""), peer)
         if token:
             self._send(200, {"token": token})
         else:
