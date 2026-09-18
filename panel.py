@@ -42,6 +42,7 @@ import tarfile
 import select
 import shutil
 import socket
+import stat
 import struct
 import subprocess
 import sys
@@ -55,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.11"
+CURRENT_VERSION = "3.3.12"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -2570,6 +2571,16 @@ BACKUP_FORMAT = 1
 BACKUP_UPLOAD_CHUNK = 4 * 1024 * 1024              # 分块上传块大小（前端按此切片）
 BACKUP_MAX_BYTES = 8 * 1024 * 1024 * 1024          # 单包上限 8G（防塞满磁盘）
 BACKUP_EXTRACT_MAX = 16 * 1024 * 1024 * 1024       # 解包总量上限
+# ---- 站点文件档（v3.3.12）----
+BACKUP_SITE_ARC = "data/www/"                                   # 站点内容在包内的前缀
+BACKUP_SITE_EXCLUDE_DIRS = (".git", "node_modules", "__pycache__", ".cache", "tmp")
+BACKUP_SITE_EXCLUDE_SUFFIX = (".cache",)
+BACKUP_SITE_LOG_DIR = "logs"                                    # logs/ 下的 *.log 不打包（通常是运行日志）
+BACKUP_SITE_LOG_SUFFIX = ".log"
+BACKUP_HASH_MAX_BYTES = 256 * 1024 * 1024                       # 超此体积就不再逐文件算 sha256
+BACKUP_SNAPSHOT_SITE_MAX = 1024 * 1024 * 1024                   # 站点体积超此值不进恢复前快照
+BACKUP_SITE_WALK_CAP = 200000                                   # 体积统计的条目上限（防页面卡死）
+
 BACKUP_RECORD_FILES = ("config.json", "rules.json", "proxies.json", "sites.json",
                        "certificates.json", "apps.json", "fed_nodes.json", "firewall.nft")
 
@@ -2577,7 +2588,7 @@ BACKUP_MODULES = [
     {"id": "config", "name": "面板配置与规则", "desc": "面板设置、防火墙规则、反代/站点/证书/应用记录", "on": True, "ready": True},
     {"id": "nginx", "name": "nginx 配置", "desc": "面板写的反代/站点/兜底守卫配置", "on": True, "ready": True},
     {"id": "certs", "name": "证书（含私钥）", "desc": "面板管理/引用的证书与续期配置；⚠ 包内含私钥，请妥善保管（恢复后写回 /etc/letsencrypt 并按需 reload nginx）", "on": True, "ready": True},
-    {"id": "sites", "name": "站点文件", "desc": "/var/www 下的站点目录（可能较大）", "on": False, "ready": False},
+    {"id": "sites", "name": "站点文件（/var/www）", "desc": "站点目录内容，含权限与属主；自动跳过 .git / node_modules / 缓存 / 临时目录 / logs 日志 / 软链接（可能较大）", "on": False, "ready": True},
     {"id": "apps", "name": "Docker 应用数据", "desc": "应用数据与数据库 dump（可能很大）", "on": False, "ready": False},
 ]
 
@@ -2591,6 +2602,7 @@ RESTORE_ITEMS = [
     {"id": "apps", "name": "应用记录", "desc": "Docker 应用记录（不含容器与数据）", "on": True},
     {"id": "fed", "name": "联邦节点令牌", "desc": "⚠ 含明文令牌，恢复后建议 rotate", "on": True},
     {"id": "cert_files", "name": "证书文件（含私钥）", "desc": "⚠ 写回 /etc/letsencrypt（私钥 0600）；有 archive 时按 certbot 结构生成新修订，续期不受影响", "on": True},
+    {"id": "site_files", "name": "站点文件（/var/www）", "desc": "⚠ 覆盖目标机同路径文件（不删除多余文件）；按记录还原权限与属主", "on": True},
     {"id": "nginx", "name": "nginx 重新渲染", "desc": "按恢复后的记录重生成配置并 reload", "on": True},
 ]
 
@@ -2872,6 +2884,114 @@ def restore_cert_files(src_root, man):
     return bool(doms_ok or renewed), msg
 
 
+def _safe_dest_under(base, rel):
+    """把包内相对路径安全地映射到 base 之下（拒绝穿越/绝对路径/软链接逃逸）"""
+    rel0 = str(rel or "").replace("\\", "/")
+    if rel0.startswith("/"):
+        return ""                      # 包内不该出现绝对路径
+    rel = rel0.strip("/")
+    if not rel or ".." in rel.split("/"):
+        return ""
+    dst = os.path.join(base, rel)
+    try:
+        rb = os.path.realpath(base)
+        rd = os.path.realpath(os.path.dirname(dst))
+    except OSError:
+        return ""
+    if rd != rb and not rd.startswith(rb.rstrip("/") + "/"):
+        return ""
+    return dst
+
+
+def restore_site_files(src_root, man):
+    """把包内站点文件写回站点根。返回 (ok, 说明)
+
+    - 只写到站点根之内（逐条路径二次校验）
+    - 逐文件还原权限与属主（属主用户不存在则退回 root 并提示）
+    - 只覆盖/补齐，不删除目标机多余文件
+    """
+    if not os.path.isdir(src_root):
+        return False, "包内没有站点文件"
+    base = backup_site_base()
+    try:
+        os.makedirs(base, exist_ok=True)
+    except OSError as e:
+        return False, "站点根不可写：%s" % e
+    skipped, dirs_meta = [], []
+    files_n, bytes_n = 0, 0
+    can_chown = (os.geteuid() == 0)
+    chown_failed = []
+    for e in man.get("files") or []:
+        arc = str(e.get("arc") or "")
+        if not arc.startswith(BACKUP_SITE_ARC):
+            continue
+        src = os.path.join(src_root, arc[len(BACKUP_SITE_ARC):])
+        dst = _safe_dest_under(base, arc[len(BACKUP_SITE_ARC):])
+        if not dst:
+            skipped.append(arc)
+            continue
+        if e.get("is_dir"):
+            dirs_meta.append((dst, e))
+            continue
+        if not os.path.isfile(src):
+            skipped.append(arc)
+            continue
+        want = e.get("sha256") or ""
+        if want and _sha256_file(src) != want:
+            skipped.append(arc + "(校验和不符)")
+            continue
+        files_n += 1
+        bytes_n += int(e.get("size") or 0)
+        if DRY_RUN:
+            continue
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            _copy_file_perm(src, dst, int(e.get("mode") or 0o644))
+            os.chmod(dst, int(e.get("mode") or 0o644) & 0o7777)
+            if can_chown:
+                uid, gid = int(e.get("uid") or 0), int(e.get("gid") or 0)
+                try:
+                    os.chown(dst, uid, gid)
+                except (OSError, OverflowError) as ex:
+                    if len(chown_failed) < 3:
+                        chown_failed.append("%s(%s)" % (os.path.basename(dst), ex))
+            if e.get("mtime"):
+                try:
+                    os.utime(dst, (int(e["mtime"]), int(e["mtime"])))
+                except OSError:
+                    pass
+        except OSError as ex:
+            skipped.append("%s(%s)" % (arc, ex))
+    # 目录（含空目录）：权限/属主也照还原；倒序处理保证父目录在后（避免被后续写入改回）
+    for dst, e in sorted(dirs_meta, key=lambda x: -len(x[0])):
+        if DRY_RUN:
+            continue
+        try:
+            os.makedirs(dst, exist_ok=True)
+            os.chmod(dst, int(e.get("mode") or 0o755) & 0o7777)
+            if can_chown:
+                try:
+                    os.chown(dst, int(e.get("uid") or 0), int(e.get("gid") or 0))
+                except (OSError, OverflowError) as ex:
+                    if len(chown_failed) < 3:
+                        chown_failed.append("%s(%s)" % (os.path.basename(dst), ex))
+        except OSError:
+            pass
+    msg = "站点文件 %d 个 / %.1f MB（目录 %d 个）" % (files_n, bytes_n / 1048576.0, len(dirs_meta))
+    if can_chown:
+        msg += "；权限与属主已按记录还原"
+        if chown_failed:
+            msg += "（部分失败：%s）" % "、".join(chown_failed)
+    else:
+        msg += "；⚠ 权限已还原，属主未还原（面板非 root 运行）"
+    if skipped:
+        msg += "；跳过 %d 项（%s）" % (len(skipped), "、".join(skipped[:3]))
+    if man.get("hash_limited"):
+        msg += "；本包站点文件未逐文件校验（体积超 256MB，仅保证大小一致）"
+    msg += "；不删除目标机多余文件"
+    return bool(files_n or dirs_meta), msg
+
+
 def backup_snapshot_modules():
     """恢复前快照要覆盖的模块（有证书就把证书一起快照，否则恢复坏了没得回滚）"""
     mods = ["config", "nginx"]
@@ -2880,7 +3000,139 @@ def backup_snapshot_modules():
             mods.append("certs")
     except Exception:
         pass
+    try:
+        if backup_site_roots() and backup_sites_size().get("bytes", 0) <= BACKUP_SNAPSHOT_SITE_MAX:
+            mods.append("sites")     # 站点体积可控才进快照（否则快照本身会很大很慢）
+    except Exception:
+        pass
     return mods
+
+
+def backup_site_base():
+    """站点根目录（config 的 site_root，默认 /var/www）"""
+    try:
+        return site_root_base()
+    except Exception:
+        return DEFAULT_SITE_ROOT
+
+
+def backup_site_roots():
+    """[(绝对目录, 包内相对前缀)] —— 只收站点根之内的站点目录（保证恢复不会写到别处）"""
+    base = backup_site_base()
+    out = []
+    try:
+        sites = SiteStore().sites or []
+    except Exception:
+        sites = []
+    try:
+        rb = os.path.realpath(base)
+    except OSError:
+        return out
+    cand = []
+    for st in sites:
+        r = str((st or {}).get("root") or "").strip()
+        if not r or not os.path.isdir(r):
+            continue
+        try:
+            rr = os.path.realpath(r)
+        except OSError:
+            continue
+        if rr == rb:
+            cand.append((rr, "."))
+        elif rr.startswith(rb.rstrip("/") + "/"):
+            cand.append((rr, rr[len(rb.rstrip("/")) + 1:].replace(os.sep, "/")))
+    # 去掉被其它根包含的根（父子站点目录只打最外层）
+    out = []
+    for rr, pre in sorted(set(cand), key=lambda x: x[1]):
+        if any(rr == x[0] or rr.startswith(x[0].rstrip("/") + "/") for x in out):
+            continue
+        out.append((rr, pre))
+    return out
+
+
+def backup_site_skip(name, is_dir, parent_name=""):
+    """站点文件排除规则（.git / node_modules / 缓存 / 临时 / logs 下的日志）"""
+    if is_dir:
+        if name in BACKUP_SITE_EXCLUDE_DIRS:
+            return True
+        return any(name.endswith(suf) for suf in BACKUP_SITE_EXCLUDE_SUFFIX)
+    if parent_name == BACKUP_SITE_LOG_DIR and name.endswith(BACKUP_SITE_LOG_SUFFIX):
+        return True
+    return False
+
+
+def backup_site_entries():
+    """站点文件条目（含目录）：{abs, arc, size, mode, uid, gid, mtime, is_dir}
+
+    软链接一律跳过（不跟随、不打包），避免把站点外的路径圈进包里；
+    跳过情况记在 backup_site_skipped() 里供 UI/日志说明。
+    """
+    entries, links = [], []
+    for root_abs, pre in backup_site_roots():
+        for cur, dirs, files in os.walk(root_abs, followlinks=False):
+            rel_cur = os.path.relpath(cur, root_abs)
+            arc_dir = BACKUP_SITE_ARC + (pre if rel_cur == "." else (pre + "/" + rel_cur).replace(os.sep, "/"))
+            keep = []
+            for d in sorted(dirs):
+                p = os.path.join(cur, d)
+                if os.path.islink(p):
+                    links.append(os.path.join(arc_dir, d))
+                    continue
+                if backup_site_skip(d, True):
+                    continue
+                keep.append(d)
+            dirs[:] = keep
+            try:
+                st = os.stat(cur)
+            except OSError:
+                continue
+            entries.append({"abs": cur, "arc": arc_dir, "size": 0, "mode": stat.S_IMODE(st.st_mode),
+                            "uid": st.st_uid, "gid": st.st_gid, "mtime": int(st.st_mtime), "is_dir": True})
+            for fn in sorted(files):
+                p = os.path.join(cur, fn)
+                if os.path.islink(p):
+                    links.append(os.path.join(arc_dir, fn))
+                    continue
+                if backup_site_skip(fn, False, os.path.basename(cur)):
+                    continue
+                try:
+                    st = os.stat(p)
+                except OSError:
+                    continue
+                entries.append({"abs": p, "arc": arc_dir + "/" + fn, "size": st.st_size,
+                                "mode": stat.S_IMODE(st.st_mode), "uid": st.st_uid, "gid": st.st_gid,
+                                "mtime": int(st.st_mtime), "is_dir": False})
+    return entries
+
+
+def backup_site_skipped():
+    """被跳过的软链接清单（用于说明"为什么少了这些文件"）"""
+    out = []
+    for root_abs, pre in backup_site_roots():
+        for cur, dirs, files in os.walk(root_abs, followlinks=False):
+            for d in list(dirs):
+                p = os.path.join(cur, d)
+                if os.path.islink(p):
+                    out.append(p + "/（软链接目录）")
+            for fn in files:
+                p = os.path.join(cur, fn)
+                if os.path.islink(p):
+                    out.append(p + "（软链接）")
+    return out
+
+
+def backup_sites_size():
+    """站点文件体积与文件数（有上限，避免超大目录把页面拖死）"""
+    total, cnt, truncated = 0, 0, False
+    for e in backup_site_entries():
+        if e["is_dir"]:
+            continue
+        total += e["size"]
+        cnt += 1
+        if cnt >= BACKUP_SITE_WALK_CAP:
+            truncated = True
+            break
+    return {"bytes": total, "files": cnt, "truncated": truncated}
 
 
 def backup_collect(modules):
@@ -2904,7 +3156,11 @@ def backup_collect(modules):
             rp = os.path.join(le_renewal_dir(), dom + ".conf")
             if os.path.isfile(rp):
                 files.append((rp, "data/certs/renewal/%s.conf" % dom))
-    # v3.3.10 起：certs 已实现；sites / apps 的实物内容在这里补（模块列表里仍标 ready=False）
+    if "sites" in mods:
+        for e in backup_site_entries():
+            if not e["is_dir"]:
+                files.append((e["abs"], e["arc"]))
+    # v3.3.12 起：certs / sites 已实现；apps（Docker 应用数据）仍标 ready=False
     return files
 
 
@@ -2937,15 +3193,35 @@ def backup_counts():
 
 def backup_make_manifest(modules, note="", files=None, name_prefix=""):
     cfg = Config()
-    files = backup_collect(modules) if files is None else files
+    mods = list(modules or [])
+    files = backup_collect(mods) if files is None else files
+    # 站点文件：合并权限/属主/mtime，并把「目录」也登记（空目录也要能还原）
+    meta = {}
+    if "sites" in mods:
+        for e in backup_site_entries():
+            meta[e["arc"]] = e
+    site_total = sum(e["size"] for e in meta.values() if not e["is_dir"])
+    hash_limited = bool("sites" in mods and site_total > BACKUP_HASH_MAX_BYTES)
     entries = []
     for src_p, arc in files:
         try:
-            entries.append({"arc": arc, "size": os.path.getsize(src_p),
-                            "sha256": _sha256_file(src_p)})
+            size = os.path.getsize(src_p)
+            sha = "" if (hash_limited and arc.startswith(BACKUP_SITE_ARC)) else _sha256_file(src_p)
+            ent = {"arc": arc, "size": size, "sha256": sha}
+            m = meta.get(arc)
+            if m:
+                ent.update({"mode": m["mode"], "uid": m["uid"], "gid": m["gid"],
+                            "mtime": m["mtime"], "is_dir": False})
+            entries.append(ent)
         except OSError:
             continue
+    for arc, m in sorted(meta.items()):
+        if m["is_dir"]:
+            entries.append({"arc": arc, "size": 0, "sha256": "", "mode": m["mode"],
+                            "uid": m["uid"], "gid": m["gid"], "mtime": m["mtime"], "is_dir": True})
     return {
+        "hash_limited": hash_limited,
+        "site_total": site_total,
         "format": BACKUP_FORMAT,
         "panel_version": CURRENT_VERSION,
         "created": int(time.time()),
@@ -2994,9 +3270,29 @@ def backup_create_work(modules, note="", name_prefix=""):
                     if arc == e["arc"]:
                         src_p = p
                         break
+                if e.get("is_dir"):
+                    ti = tarfile.TarInfo(e["arc"])
+                    ti.type = tarfile.DIRTYPE
+                    ti.mode = int(e.get("mode") or 0o755)
+                    ti.uid = int(e.get("uid") or 0)
+                    ti.gid = int(e.get("gid") or 0)
+                    ti.mtime = int(e.get("mtime") or time.time())
+                    tf.addfile(ti)
+                    continue
                 if not src_p:
                     continue
                 task_progress("打包 %s" % os.path.basename(e["arc"]))
+                if e["arc"].startswith(BACKUP_SITE_ARC):
+                    # 站点文件：带上权限/属主/mtime（恢复时原样还原）
+                    ti = tarfile.TarInfo(e["arc"])
+                    ti.size = int(e.get("size") or 0)
+                    ti.mode = int(e.get("mode") or 0o644)
+                    ti.uid = int(e.get("uid") or 0)
+                    ti.gid = int(e.get("gid") or 0)
+                    ti.mtime = int(e.get("mtime") or time.time())
+                    with open(src_p, "rb") as fp:
+                        tf.addfile(ti, fp)
+                    continue
                 tf.add(src_p, arcname=e["arc"], recursive=False)
         os.replace(tmp, dst)
         os.chmod(dst, 0o600)
@@ -3230,6 +3526,14 @@ def backup_restore_work(pkg_name, items, opts=None):
             except Exception as e:
                 restored.append("证书恢复异常：%s" % e)
 
+        if items.get("site_files"):
+            task_progress("恢复站点文件...")
+            try:
+                ok_s, msg_s = restore_site_files(os.path.join(tmp, "data", "www"), man)
+                restored.append(msg_s if ok_s else ("站点文件：%s" % msg_s))
+            except Exception as e:
+                restored.append("站点文件恢复异常：%s" % e)
+
         if items.get("nginx"):
             task_progress("按恢复后的记录重新渲染 nginx...")
             try:
@@ -3283,6 +3587,7 @@ def backup_rollback_work(pkg_name):
     items = {k: True for k in RESTORE_ITEM_FILE}
     items["nginx"] = True
     items["cert_files"] = True
+    items["site_files"] = True
     items["port"] = False          # 端口永远走护栏：不覆盖
     return backup_restore_work(pkg_name, items, {"snapshot": False, "restart": True})
 
@@ -10604,6 +10909,7 @@ class PanelHandler(BaseHTTPRequestHandler):
             "chunk": BACKUP_UPLOAD_CHUNK,
             "max_bytes": BACKUP_MAX_BYTES,
             "counts": backup_counts(),
+            "sizes": {"sites": backup_sites_size()},
             "panel_version": CURRENT_VERSION,
         })
 

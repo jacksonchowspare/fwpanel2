@@ -1990,10 +1990,18 @@ async function bkLoad() {
   try {
     const d = await api("GET", "/api/backup");
     bkInfo = d;
-    box.innerHTML = (d.modules || []).map(m =>
-      '<label style="display:inline-flex;align-items:center;gap:5px;' + (m.ready ? "" : "opacity:.45") + '" title="' + attrEsc(m.desc || "") + '">' +
-      '<input type="checkbox" data-bkmod="' + attrEsc(m.id) + '"' + (m.on && m.ready ? " checked" : "") + (m.ready ? "" : " disabled") + ' style="width:auto"> ' +
-      esc(m.name) + (m.ready ? "" : "（后续版本）") + '</label>').join("");
+    const sizes = d.sizes || {};
+    box.innerHTML = (d.modules || []).map(m => {
+      const sz = sizes[m.id];
+      // v3.3.12：站点这类"可能很大"的模块直接显示当前体积与文件数
+      const hint = (m.ready && sz)
+        ? ' <span style="color:var(--muted);font-size:11px">当前 ' + bkFmt(sz.bytes || 0) + (sz.truncated ? "+" : "") +
+          " / " + (sz.files || 0) + " 个文件</span>"
+        : "";
+      return '<label style="display:inline-flex;align-items:center;gap:5px;' + (m.ready ? "" : "opacity:.45") + '" title="' + attrEsc(m.desc || "") + '">' +
+        '<input type="checkbox" data-bkmod="' + attrEsc(m.id) + '"' + (m.on && m.ready ? " checked" : "") + (m.ready ? "" : " disabled") + ' style="width:auto"> ' +
+        esc(m.name) + (m.ready ? "" : "（后续版本）") + hint + '</label>';
+    }).join("");
     const c = d.counts || {};
     $("bk_hint").innerHTML = "落地目录 <b>" + esc(d.dir) + "</b> ｜ 可用空间 " + bkFmt(d.free) +
       " ｜ 当前内容：规则 " + (c.rules || 0) + " 条 · 反代 " + (c.proxies || 0) + " 个 · 站点 " + (c.sites || 0) +

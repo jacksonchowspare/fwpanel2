@@ -7202,8 +7202,8 @@ class TestBackup(unittest.TestCase):
                          panel._sha256_file(os.path.join(self.etc, "config.json")))
 
     def test_create_rejects_unknown_modules(self):
-        """未实现的模块与不存在的模块都要被拒（证书档 v3.3.10 起已转正，不再属于这一类）"""
-        ok, msg = panel.backup_create_work(["sites", "apps"], note="")
+        """未实现的模块与不存在的模块都要被拒（证书档 v3.3.10、站点档 v3.3.12 均已转正）"""
+        ok, msg = panel.backup_create_work(["apps"], note="")   # apps 仍属未实现（v3.3.12 起 sites 已转正）
         self.assertFalse(ok)
         self.assertIn("没有可备份的模块", msg)
         self.assertIn("证书（含私钥）", msg, "提示里应列出当前支持的模块")
@@ -7634,6 +7634,248 @@ class TestBackupCertFiles(unittest.TestCase):
         """没有证书时快照不该硬塞 certs 模块"""
         with unittest.mock.patch.object(panel, "backup_cert_domains", lambda: []):
             self.assertEqual(panel.backup_snapshot_modules(), ["config", "nginx"])
+
+
+class TestBackupSiteFiles(unittest.TestCase):
+    """备份/恢复「站点文件（/var/www）」档（v3.3.12）
+
+    覆盖：排除规则（.git / node_modules / 缓存 / tmp / logs 日志 / 软链接）、目录与空目录、
+    权限与属主记录、恢复时权限还原 + 属主按记录 chown、路径穿越拒绝、演练不落盘、体积统计。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="fwsite-")
+        self.base = os.path.join(self.tmp, "www")
+        self.s1 = os.path.join(self.base, "site1")
+        for d in ("assets", "empty_dir", ".git", "node_modules/x", "logs", "inc.cache", "tmp"):
+            os.makedirs(os.path.join(self.s1, d))
+        self._w("index.html", "<h1>hi</h1>")
+        self._w("assets/app.js", "console.log(1)", 0o600)
+        self._w("real.log", "keep me")
+        self._w("logs/access.log", "drop me")
+        self._w(".git/config", "drop")
+        self._w("node_modules/x/y.js", "drop")
+        self._w("inc.cache/z.txt", "drop")
+        self._w("tmp/t.txt", "drop")
+        os.symlink("/etc/passwd", os.path.join(self.s1, "escape"))
+        self.backup_dir = os.path.join(self.tmp, "backups")
+        self._patches = [
+            unittest.mock.patch.object(panel, "BACKUP_DIR", self.backup_dir),
+            unittest.mock.patch.object(panel, "CURRENT_VERSION", "3.3.12"),
+            unittest.mock.patch.object(panel, "site_root_base", lambda cfg=None: self.base),
+            unittest.mock.patch.object(panel, "SiteStore",
+                                       lambda: types.SimpleNamespace(sites=[{"domain": "site1.test", "root": self.s1}])),
+        ]
+        for p in self._patches:
+            p.start()
+
+    def tearDown(self):
+        for p in reversed(self._patches):
+            p.stop()
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _w(self, rel, data, mode=0o644):
+        p = os.path.join(self.s1, rel)
+        os.makedirs(os.path.dirname(p), exist_ok=True)
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(data)
+        os.chmod(p, mode)
+
+    def _pack(self):
+        ok, msg = panel.backup_create_work(["sites"], note="t")
+        self.assertTrue(ok, msg)
+        pkg = [f for f in os.listdir(self.backup_dir) if f.endswith(".tar.gz")][0]
+        pkg_path = os.path.join(self.backup_dir, pkg)
+        with open(pkg_path + ".json", encoding="utf-8") as f:
+            man = json.load(f)
+        ext = os.path.join(self.tmp, "ext")
+        with tarfile.open(pkg_path) as tf:
+            members = {m.name: m for m in tf.getmembers()}
+            tf.extractall(ext)
+        return pkg_path, man, members, ext
+
+    # ---------- 打包 ----------
+    def test_excludes_and_keeps(self):
+        """排除 .git / node_modules / 缓存 / tmp / logs 下的 .log / 软链接；保留顶层 .log"""
+        arcs = sorted(a for _, a in panel.backup_collect(["sites"]))
+        self.assertEqual(arcs, ["data/www/site1/assets/app.js", "data/www/site1/index.html",
+                                "data/www/site1/real.log"])
+        for bad in (".git", "node_modules", "inc.cache", "/tmp/", "logs/access.log", "escape"):
+            self.assertFalse(any(bad in a for a in arcs), "不该打包：%s" % bad)
+
+    def test_package_records_dirs_perms_owner(self):
+        """包内必须有目录条目（含空目录）、权限/属主/mtime，且不含软链接"""
+        _, man, members, _ = self._pack()
+        dirs = [e["arc"] for e in man["files"] if e.get("is_dir")]
+        self.assertIn("data/www/site1/empty_dir", dirs, "空目录必须登记，否则恢复会丢")
+        self.assertIn("data/www/site1/assets", dirs)
+        self.assertFalse([m for m in members if members[m].issym()], "包内不该有软链接")
+        m = members["data/www/site1/assets/app.js"]
+        self.assertEqual(oct(m.mode), "0o600", "权限要进包")
+        self.assertEqual(m.uid, os.stat(os.path.join(self.s1, "assets/app.js")).st_uid)
+        self.assertEqual(m.gid, os.stat(os.path.join(self.s1, "assets/app.js")).st_gid)
+        self.assertTrue(members["data/www/site1/empty_dir"].isdir())
+
+    def test_skipped_symlinks_reported(self):
+        """软链接列入"跳过"清单，便于解释为什么少了文件"""
+        self.assertTrue(any("escape" in x for x in panel.backup_site_skipped()))
+
+    def test_size_stats(self):
+        """体积统计：文件数 + 字节（带条目上限标记）"""
+        st = panel.backup_sites_size()
+        self.assertEqual(st["files"], 3)
+        self.assertGreater(st["bytes"], 0)
+        self.assertFalse(st["truncated"])
+
+    def test_site_outside_base_is_skipped(self):
+        """站点目录不在站点根之内 → 不打包（恢复才不会写到别处）"""
+        other = os.path.join(self.tmp, "outside")
+        os.makedirs(other)
+        with open(os.path.join(other, "x.txt"), "w") as f:
+            f.write("x")
+        with unittest.mock.patch.object(panel, "SiteStore",
+                                        lambda: types.SimpleNamespace(sites=[{"root": other}])):
+            self.assertEqual(panel.backup_site_roots(), [])
+
+    # ---------- 恢复 ----------
+    def test_restore_writes_perms_and_keeps_extra_files(self):
+        _, man, _, ext = self._pack()
+        new = os.path.join(self.tmp, "www2")
+        os.makedirs(os.path.join(new, "site1"))
+        with open(os.path.join(new, "site1", "index.html"), "w") as f:
+            f.write("OLD")
+        with open(os.path.join(new, "site1", "keep_me.txt"), "w") as f:
+            f.write("KEEP")
+        with unittest.mock.patch.object(panel, "site_root_base", lambda cfg=None: new), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok, msg = panel.restore_site_files(os.path.join(ext, "data", "www"), man)
+        self.assertTrue(ok, msg)
+        with open(os.path.join(new, "site1", "index.html")) as f:
+            self.assertEqual(f.read(), "<h1>hi</h1>")
+        self.assertEqual(oct(os.stat(os.path.join(new, "site1", "assets", "app.js")).st_mode & 0o777), "0o600")
+        self.assertTrue(os.path.isdir(os.path.join(new, "site1", "empty_dir")))
+        self.assertTrue(os.path.isfile(os.path.join(new, "site1", "keep_me.txt")), "不该删除目标机多余文件")
+
+    def test_restore_chowns_to_recorded_owner(self):
+        """以 root 运行时应按记录 chown（数字 uid:gid 原样还原）"""
+        _, man, _, ext = self._pack()
+        new = os.path.join(self.tmp, "www3")
+        os.makedirs(new)
+        called = []
+        real_chown = os.chown
+
+        def fake_chown(path, uid, gid):
+            called.append((os.path.basename(path), uid, gid))
+            return real_chown(path, uid, gid)
+
+        with unittest.mock.patch.object(panel, "site_root_base", lambda cfg=None: new), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False), \
+             unittest.mock.patch.object(panel.os, "geteuid", lambda: 0), \
+             unittest.mock.patch.object(panel.os, "chown", fake_chown):
+            ok, msg = panel.restore_site_files(os.path.join(ext, "data", "www"), man)
+        self.assertTrue(ok, msg)
+        self.assertTrue(called, "root 环境下必须调用 chown")
+        self.assertIn("属主已按记录还原", msg)
+
+    def test_restore_reports_when_not_root(self):
+        """非 root 运行：如实说明属主未还原（不假装成功）"""
+        _, man, _, ext = self._pack()
+        new = os.path.join(self.tmp, "www4")
+        os.makedirs(new)
+        with unittest.mock.patch.object(panel, "site_root_base", lambda cfg=None: new), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False), \
+             unittest.mock.patch.object(panel.os, "geteuid", lambda: 1000):
+            ok, msg = panel.restore_site_files(os.path.join(ext, "data", "www"), man)
+        self.assertIn("属主未还原", msg)
+
+    def test_safe_dest_guard_rejects_traversal(self):
+        """直接打在两层的守卫上（穿越有独立两层：`..` 判定 + 落点必须在 base 之内）
+
+        v3.3.12 反向验证教训：只去掉其中一层，另一层仍能挡住（行为正确但用例不变红），
+        所以这里对守卫本身做断言 —— 任何一层被削掉都会立刻红。
+        """
+        self.assertEqual(panel._safe_dest_under("/var/www", "/abs"), "", "绝对路径必须拒绝")
+        self.assertEqual(panel._safe_dest_under("/var/www", ".."), "")
+        self.assertEqual(panel._safe_dest_under("/var/www", "../x"), "", "穿越必须拒绝")
+        self.assertEqual(panel._safe_dest_under("/var/www", "a/../../x"), "")
+        self.assertEqual(panel._safe_dest_under("/var/www", ""), "")
+        ok = panel._safe_dest_under("/var/www", "a/b.txt")
+        self.assertTrue(ok.endswith("/var/www/a/b.txt"), ok)
+        # 落点复核的独有价值：base 内存在指向外部的软链接目录时，路径不含 ".." 也要拒绝
+        outside = os.path.join(self.tmp, "outside_dir")
+        os.makedirs(outside, exist_ok=True)
+        linkdir = os.path.join(self.base, "linkdir")
+        if not os.path.islink(linkdir):
+            os.symlink(outside, linkdir)
+        self.assertEqual(panel._safe_dest_under(self.base, "linkdir/evil.txt"), "",
+                         "经 base 内软链接逃逸的落点必须拒绝")
+
+    def test_restore_rejects_traversal(self):
+        """包内相对路径穿越/绝对路径 → 拒绝，不写到站点根之外"""
+        _, man, _, ext = self._pack()
+        new = os.path.join(self.tmp, "www5")
+        os.makedirs(new)
+        bad = {"files": [{"arc": "data/www/../evil.txt", "size": 1, "sha256": ""},
+                         {"arc": "data/www//abs.txt", "size": 1, "sha256": ""}]}
+        with unittest.mock.patch.object(panel, "site_root_base", lambda cfg=None: new), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok, msg = panel.restore_site_files(os.path.join(ext, "data", "www"), bad)
+        self.assertFalse(ok)
+        self.assertIn("跳过", msg)
+        self.assertFalse(os.path.exists(os.path.join(self.tmp, "evil.txt")))
+        self.assertFalse(os.path.exists("/abs.txt"))
+
+    def test_restore_checksum_mismatch_skipped(self):
+        """包内文件被改过（sha256 不符）→ 跳过该文件"""
+        _, man, _, ext = self._pack()
+        with open(os.path.join(ext, "data", "www", "site1", "index.html"), "w") as f:
+            f.write("TAMPERED")
+        new = os.path.join(self.tmp, "www6")
+        os.makedirs(new)
+        with unittest.mock.patch.object(panel, "site_root_base", lambda cfg=None: new), \
+             unittest.mock.patch.object(panel, "DRY_RUN", False):
+            ok, msg = panel.restore_site_files(os.path.join(ext, "data", "www"), man)
+        self.assertIn("校验和不符", msg)
+        self.assertFalse(os.path.exists(os.path.join(new, "site1", "index.html")))
+
+    def test_dry_run_writes_nothing(self):
+        """演练模式：统计照算、不落盘"""
+        _, man, _, ext = self._pack()
+        new = os.path.join(self.tmp, "www7")
+        os.makedirs(new)
+        with unittest.mock.patch.object(panel, "site_root_base", lambda cfg=None: new), \
+             unittest.mock.patch.object(panel, "DRY_RUN", True):
+            ok, msg = panel.restore_site_files(os.path.join(ext, "data", "www"), man)
+        self.assertTrue(ok, msg)
+        self.assertEqual(os.listdir(new), [])
+
+    # ---------- 接线 ----------
+    def test_module_enabled_and_items_present(self):
+        """站点档已转正；恢复项与快照/回滚都覆盖站点文件"""
+        mod = [m for m in panel.BACKUP_MODULES if m["id"] == "sites"][0]
+        self.assertTrue(mod["ready"])
+        self.assertIn("权限与属主", mod["desc"])
+        self.assertIn("site_files", [i["id"] for i in panel.RESTORE_ITEMS])
+        self.assertTrue([i for i in panel.RESTORE_ITEMS if i["id"] == "site_files"][0]["on"])
+
+    def test_snapshot_includes_sites_when_small(self):
+        """站点体积可控时，恢复前快照要含站点档"""
+        self.assertIn("sites", panel.backup_snapshot_modules())
+
+    def test_snapshot_skips_sites_when_huge(self):
+        """站点体积超阈值时不进快照（避免快照本身巨大）"""
+        huge = {"bytes": panel.BACKUP_SNAPSHOT_SITE_MAX + 1, "files": 1, "truncated": False}
+        with unittest.mock.patch.object(panel, "backup_sites_size", lambda: huge):
+            self.assertNotIn("sites", panel.backup_snapshot_modules())
+
+    def test_hash_limited_for_huge_sites(self):
+        """站点体积超 256MB 时不再逐文件算 sha256（只记 size），避免备份慢一倍"""
+        man = panel.backup_make_manifest(["sites"], "t")
+        self.assertFalse(man["hash_limited"])
+        with unittest.mock.patch.object(panel, "BACKUP_HASH_MAX_BYTES", 1):
+            man2 = panel.backup_make_manifest(["sites"], "t")
+        self.assertTrue(man2["hash_limited"])
+        self.assertTrue(all(e["sha256"] == "" for e in man2["files"] if not e.get("is_dir")))
 
 
 class TestBackupAPI(unittest.TestCase):
