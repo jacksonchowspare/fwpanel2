@@ -2825,10 +2825,19 @@ function fmtRenew(r) {
 // v3.3.9：为什么这张证书不能在这里移除（悬停提示用）
 function removeWhy(c) {
   const users = (c.used_by_proxies || []).filter(Boolean);
-  const srcName = ({ proxy: "反代自动申请", site: "站点申请", "site-ref": "站点引用", system: "本机已有" })[c.source] || c.source;
+  const srcName = ({ proxy: "反代自动申请", app: "应用部署自动申请", site: "站点申请", "site-ref": "站点引用", system: "本机已有" })[c.source] || c.source;
+  if (c.used_by_panel) return `这是面板自身访问域名用的证书（${users.join("、") || c.domain}）——面板 HTTPS 依赖它，不能移除；要换证书请先在「反代证书」里改那条反代的证书引用`;
   if (users.length) return `该证书正被反向代理使用：${users.join("、")}——请先在反代里改用其它证书，再回来移除`;
   if (c.used_by_site) return "该证书被站点配置引用——请先在「网站」里改用其它证书";
   return `该证书来源是「${srcName}」，不在本页单独申请，因此这里不能直接移除（如需停用请到对应来源处处理）`;
+}
+
+/* v3.3.17：可移除 = 本页单独申请 且 没有任何地方在用（反代 / 站点 / 面板自身域名）
+   旧实现只看 source → 「正被反代使用」的证书仍显示可移除，v3.3.9 的那句悬停提示成了死代码
+   （用户实测：三个证书里只有应用自动申请的那个变灰，其余两个正在被反代使用的却是亮的） */
+function certCanRemove(c) {
+  const users = (c.used_by_proxies || []).filter(Boolean);
+  return c.source === "independent" && !users.length && !c.used_by_site && !c.used_by_panel;
 }
 
 async function loadCerts() {
@@ -2856,14 +2865,14 @@ async function loadCerts() {
         ? (c.cert_expiry ? `有效至 ${new Date(c.cert_expiry * 1000).toLocaleDateString()}` : "已签发")
         : "未签发";
       // v3.0.5：来源标签（站点自动申请/站点引用/本机已有的证书也要看得见来源）
-      const SRC_LABEL = { proxy: "反代", site: "站点申请", "site-ref": "站点引用", system: "本机已有" };
+      const SRC_LABEL = { proxy: "反代", app: "应用", site: "站点申请", "site-ref": "站点引用", system: "本机已有" };
       const srcTag = SRC_LABEL[c.source] ? '<span style="color:var(--muted);font-size:11px;margin-left:6px">' + SRC_LABEL[c.source] + "</span>" : "";
       tr.innerHTML = `<td>${c.domain}${c.method === "dns" ? '<span style="color:#f59e0b;font-size:11px;margin-left:6px">DNS</span>' : '<span style="color:var(--muted);font-size:11px;margin-left:6px">HTTP</span>'}${srcTag}</td><td style="color:var(--muted);font-size:12px">${exp}</td>
         <td style="text-align:right;white-space:nowrap">
           <span class="ops-grid">
           <span class="ops-slot"><button class="btn mini ghost" onclick="renewCertSolo('${c.domain}')">手动续期</button></span>
           <span class="ops-slot"><button class="btn mini ghost" onclick="showCertPathsSolo('${c.domain}')">显示路径</button></span>
-          ${(c.source === "independent")
+          ${certCanRemove(c)
             ? `<span class="ops-slot"><button class="btn mini danger" onclick="delCert('${c.domain}')">移除</button></span>`
             : `<span class="ops-slot" title="${attrEsc(removeWhy(c))}"><button class="btn mini danger" disabled>移除</button></span>`}
           </span>

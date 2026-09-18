@@ -1434,6 +1434,55 @@ class TestAPI(unittest.TestCase):
             {"scheme": "https", "target_host": "10.0.0.9", "target_port": 18099}), "")
         self._req("DELETE", "/api/proxy/" + pid, token=self._token())
 
+    def test_cert_list_marks_usage_and_panel_own_domain(self):
+        """证书列表要标出「被谁使用」：反代引用 / **面板自身访问域名**（v3.3.17）
+
+        用户实测反馈：三个证书里只有「应用部署自动申请」那个的「移除」是灰的，另两个正在被反代
+        使用的（其中一个是面板自身访问域名）却是亮的 —— 旧实现只看 source 不看是否在用，
+        v3.3.9 那句「请先在反代里改用其它证书」的悬停提示因此成了死代码。
+        """
+        token = self._token()
+        tmp = tempfile.mkdtemp(prefix="fwcertuse-")
+        real_le, real_cert = panel.LE_LIVE, panel.CERT_FILE
+        panel.LE_LIVE = tmp
+        panel.CERT_FILE = os.path.join(tmp, "certificates.json")
+        doms = ("panel.example.com", "used.example.com", "free.example.com")
+        try:
+            for dom in doms:
+                os.makedirs(os.path.join(tmp, dom), exist_ok=True)
+                with open(os.path.join(tmp, dom, "fullchain.pem"), "w") as f:
+                    f.write("x")
+            with open(panel.CERT_FILE, "w") as f:
+                json.dump({dom: {"method": "http", "source": "independent"} for dom in doms}, f)
+            pstore = types.SimpleNamespace(proxies=[
+                {"id": "c1", "domain": "panel.example.com", "target_host": "127.0.0.1",
+                 "target_port": 17999, "scheme": "http", "ssl": True, "cert_ref": ""},
+                {"id": "c2", "domain": "used.example.com", "target_host": "127.0.0.1",
+                 "target_port": 9099, "scheme": "http", "ssl": True, "cert_ref": "used.example.com"},
+            ])
+            fake_cfg = types.SimpleNamespace(get=lambda k, dflt=None: {"port": 17999}.get(k, dflt))
+            with unittest.mock.patch.object(panel, "Config", lambda: fake_cfg), \
+                 unittest.mock.patch.object(panel, "ProxyStore", lambda: pstore):
+                code, d = self._req("GET", "/api/cert", token=token)
+                self.assertEqual(code, 200, d)
+                got = {c["domain"]: c for c in d["certs"]}
+                self.assertTrue(got["panel.example.com"]["used_by_panel"], "面板自身反代域名要标出来")
+                self.assertEqual(got["panel.example.com"]["used_by_proxies"], ["panel.example.com"])
+                self.assertTrue(got["used.example.com"]["used_by_proxies"])
+                self.assertFalse(got["used.example.com"]["used_by_panel"])
+                self.assertEqual(got["free.example.com"]["used_by_proxies"], [])
+                self.assertFalse(got["free.example.com"]["used_by_panel"])
+                # 移除的是「记录」，被引用着仍允许但必须如实警告
+                code, d2 = self._req("POST", "/api/cert/panel.example.com",
+                                     {"action": "delete"}, token=token)
+                self.assertEqual(code, 200, d2)
+                self.assertIn("面板自身", d2.get("msg", ""))
+                self.assertIn("服务不受影响", d2.get("msg", ""))
+        finally:
+            panel.LE_LIVE = real_le
+            panel.CERT_FILE = real_cert
+            shutil.rmtree(tmp, ignore_errors=True)
+
     def test_proxy_hsts(self):
         """反代 HSTS：配置渲染包含 Strict-Transport-Security"""
         p = {"domain": "hsts.example.com", "target_host": "127.0.0.1",
@@ -8989,6 +9038,14 @@ class TestProxyCertTabWiring(unittest.TestCase):
             src = f.read()
         self.assertIn('"used_by_proxies": proxy_users.get(domain, [])', src)
         self.assertIn('"used_by_site": domain in refs', src)
+        # v3.3.17：面板自身反代域名也纳入「不可移除」判定（用户实测：被反代使用的证书却显示可移除）
+        self.assertIn('"used_by_panel": domain in panel_domains', src)
+        self.assertIn("function certCanRemove(c)", self.html, "可移除判定必须抽成函数")
+        self.assertIn('return c.source === "independent" && !users.length && !c.used_by_site && !c.used_by_panel;',
+                      self.html, "可移除 = 本页单独申请 且 没被反代/站点/面板自身使用")
+        self.assertIn("${certCanRemove(c)", self.html, "行模板要走 certCanRemove")
+        self.assertIn("面板 HTTPS 依赖它，不能移除", self.html, "面板自身域名的原因文案")
+        self.assertIn('app: "应用部署自动申请"', self.html, "应用自动申请的证书也要有来源说明")
         self.assertIn("for _p in ProxyStore().proxies:", src)
 
     def test_ops_slot_button_text_centered(self):

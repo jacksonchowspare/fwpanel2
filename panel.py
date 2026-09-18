@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.16"
+CURRENT_VERSION = "3.3.17"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -11147,14 +11147,26 @@ class PanelHandler(BaseHTTPRequestHandler):
             store[dom] = {"email": "", "method": "http", "provider": "certbot",
                           "source": src, "note": note}
         # v3.3.9：证书被谁引用着 —— 前端据此把「移除」显示为灰态并说明原因
+        # v3.3.17：补「面板自身反代域名」判定（面板 HTTPS 依赖它，同样不该给移除按钮）
         try:
             proxy_users = {}
+            panel_domains = set()
+            try:
+                panel_port = int(Config().get("port") or 0)
+            except (TypeError, ValueError):
+                panel_port = 0
             for _p in ProxyStore().proxies:
                 _ref = (str(_p.get("cert_ref") or "").strip() or str(_p.get("domain") or "").strip())
-                if _ref:
-                    proxy_users.setdefault(_ref, []).append(str(_p.get("domain") or ""))
+                if not _ref:
+                    continue
+                proxy_users.setdefault(_ref, []).append(str(_p.get("domain") or ""))
+                try:
+                    if panel_port and int(_p.get("target_port") or 0) == panel_port:
+                        panel_domains.add(_ref)
+                except (TypeError, ValueError):
+                    pass
         except Exception:
-            proxy_users = {}
+            proxy_users, panel_domains = {}, set()
         items = []
         for domain, entry in store.items():
             email, method, provider, source = _cert_meta(entry)
@@ -11162,6 +11174,7 @@ class PanelHandler(BaseHTTPRequestHandler):
                     "source": source,
                     "used_by_proxies": proxy_users.get(domain, []),
                     "used_by_site": domain in refs,
+                    "used_by_panel": domain in panel_domains,
                     "cert_exists": cert_files_exist(domain),
                     "cert_expiry": cert_status(domain)}
             if item["cert_exists"]:
@@ -11311,7 +11324,26 @@ class PanelHandler(BaseHTTPRequestHandler):
             real = load_cert_store()
             del real[domain]
             save_cert_store(real)
-            self._send(200, {"ok": True, "msg": f"{domain} 已从列表移除（证书文件保留，供服务引用）"})
+            # v3.3.17：移除的是「记录」，证书文件仍在、服务不受影响；但被引用着要如实说清
+            tail = ""
+            try:
+                users = []
+                try:
+                    panel_port = int(Config().get("port") or 0)
+                except (TypeError, ValueError):
+                    panel_port = 0
+                for _p in ProxyStore().proxies:
+                    _ref = (str(_p.get("cert_ref") or "").strip() or str(_p.get("domain") or "").strip())
+                    if _ref != domain:
+                        continue
+                    users.append(str(_p.get("domain") or ""))
+                    if panel_port and int(_p.get("target_port") or 0) == panel_port:
+                        tail = "；⚠ 这是面板自身访问域名用的证书（面板 HTTPS 依赖它，文件已保留、服务不受影响）"
+                if users and not tail:
+                    tail = "；⚠ 该证书仍被反代 %s 使用（证书文件已保留，服务不受影响）" % "、".join(users)
+            except Exception:
+                tail = ""
+            self._send(200, {"ok": True, "msg": f"{domain} 已从列表移除（证书文件保留，供服务引用）{tail}"})
         else:
             self._send(400, {"error": "action 必须是 renew 或 delete"})
 
