@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.18"
+CURRENT_VERSION = "3.3.19"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -1577,8 +1577,23 @@ def save_bans(bans):
         pass
 
 
+BF_FAIL_PAT = re.compile(r"Failed (?:password|publickey) for (?:invalid user )?\S+ from ([0-9a-fA-F:.]+) port")
+# 仅公钥登录的机器（sshd 推荐加固姿态）失败登录只留这一行；带 "authenticating user / invalid user"
+# 前缀的才算一次认证失败，裸的 "Connection closed by <ip> port ... [preauth]"（连上就断，健康检查/
+# 端口扫描）不计，避免误封监控探针
+BF_CLOSED_PAT = re.compile(r"Connection closed by (?:authenticating user \S+|invalid user \S+)"
+                           r" ([0-9a-fA-F:.]+) port \d+ \[preauth\]")
+
+
 def get_failed_ssh_attempts(window_seconds):
-    """从 journal 读取最近窗口内的 SSH 认证失败记录，返回 {ip: 次数}"""
+    """从 journal 读取最近窗口内的 SSH 认证失败记录，返回 {ip: 次数}
+
+    ⚠ ak 实机踩过（2026-09-18）：原来只匹配 `Failed password for ... from IP port`。
+    但面板自己默认推荐、以及任何加固过的机器都是**仅公钥登录**（PasswordAuthentication no）——
+    这种机器上每次失败登录只留下 `Connection closed by authenticating user <user> IP port [preauth]`，
+    原正则一次都匹配不到 → 计数恒为 0 → 防爆破开了也形同虚设（实测 sg1 连撞 3 次，面板数出 0 次）。
+    现在两类行都认，同一 IP 取两者的较大值（避免同一次失败被两行重复计数）。
+    """
     svc = ssh_service_name()
     try:
         r = subprocess.run(["journalctl", "-u", svc, "--since", f"-{int(window_seconds)}s",
@@ -1586,13 +1601,18 @@ def get_failed_ssh_attempts(window_seconds):
                            capture_output=True, text=True, timeout=10)
     except Exception:
         return {}
-    counts = {}
-    pat = re.compile(r"Failed password for .*? from ([0-9a-fA-F:.]+) port")
+    fail_counts, closed_counts = {}, {}
     for line in r.stdout.splitlines():
-        m = pat.search(line)
+        m = BF_FAIL_PAT.search(line)
         if m:
-            ip = m.group(1)
-            counts[ip] = counts.get(ip, 0) + 1
+            fail_counts[m.group(1)] = fail_counts.get(m.group(1), 0) + 1
+            continue
+        m = BF_CLOSED_PAT.search(line)
+        if m:
+            closed_counts[m.group(1)] = closed_counts.get(m.group(1), 0) + 1
+    counts = {}
+    for ip in set(fail_counts) | set(closed_counts):
+        counts[ip] = max(fail_counts.get(ip, 0), closed_counts.get(ip, 0))
     return counts
 
 
@@ -4788,7 +4808,11 @@ def app_deploy_work(aid):
         logs.append("nginx：" + msgp[:100])
         # 5) 证书：DNS 预检 → 后台签发（失败不回滚部署，仅提示）
         task_progress(f"{name}：正在检查域名解析并申请证书…", "DNS 预检 + HTTP-01 签发")
-        okdns, why = site_dns_precheck(domain, domain)
+        # ⚠ 这里传的必须是「本应用自己要签的域名」，不能当 cert_ref 传进去 ——
+        # site_dns_precheck 见到 cert_ref 非空会直接放行（那是「引用别人已签好的证书」的语义），
+        # 结果预检形同虚设：域名没解析到本机也照签，白等一次注定失败的 HTTP-01，
+        # 还把失败原因说成「检查云厂商安全组/80 是否被占用」（ak 实机 2026-09-18 实测）。
+        okdns, why = site_dns_precheck(domain)
         if okdns:
             okc, msgc = issue_cert(domain, str(Config().get("acme_email", "") or ""))
             logs.append("证书：" + msgc[:140])

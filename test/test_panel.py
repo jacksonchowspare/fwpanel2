@@ -6061,6 +6061,36 @@ class TestApps(unittest.TestCase):
         ids = [x["id"] for x in panel.AppStore().apps]
         self.assertIsNone(panel.AppStore().get(a["id"]))
         self.assertTrue(any(x.get("name") == "another" for x in panel.AppStore().apps), ids)
+    def test_deploy_dns_precheck_blocks_hopeless_cert(self):
+        """ak 实机：应用部署时把自身域名当 cert_ref 传给预检 → 预检直接放行，白等一次注定失败的签发
+
+        期望：域名没解析到本机时，预检拦下（日志写「证书跳过」），根本不去跑 certbot。
+        """
+        import socket as _sk
+        app = panel.AppStore().add({"template": "typecho", "name": "dns-check", "folder": "tc-dns",
+                                    "data_dir": panel.app_data_dir("tc-dns"), "port": 18086,
+                                    "container_port": 80, "domain": "no-such-host.example.invalid",
+                                    "expose_public": False, "upload_mb": 32, "images": {},
+                                    "status": "deploying", "db_pw": "x", "db_root_pw": "y",
+                                    "admin_pw": "z", "admin_token": "t", "proxy_id": "", "created": 0})
+        called = []
+        with unittest.mock.patch.object(panel, "DRY_RUN", True), \
+             unittest.mock.patch.object(panel, "get_server_ip", lambda: "203.0.113.9"), \
+             unittest.mock.patch.object(panel, "issue_cert",
+                                        lambda *a, **k: (called.append(a), (True, "不该被调用"))[1]), \
+             unittest.mock.patch.object(panel, "apply_all_nginx", lambda *a, **k: (True, "ok")):
+            ok, msg = panel.app_deploy_work(app["id"])
+        self.assertTrue(ok, msg)
+        self.assertEqual(called, [], "DNS 未指向本机时不该去签证书（预检必须真的拦住）")
+        log = " ".join(panel.AppStore().get(app["id"]).get("deploy_log") or [])
+        self.assertIn("证书跳过", log)
+        self.assertIn("解析", log)
+
+    def test_site_precheck_still_skips_when_cert_ref_given(self):
+        """引用别人已签好的证书（cert_ref 非空）时不预检 —— 这条语义不能被上一条修坏"""
+        ok, why = panel.site_dns_precheck("whatever.example.invalid", "other.example.com")
+        self.assertTrue(ok, why)
+
     def test_deploy_work_updates_status(self):
         """部署任务体：DRY_RUN 下也要把状态推进到 ready 并写出配置文件"""
         app = panel.AppStore().add({"template": "wordpress", "name": "dry", "folder": "wp-dry",
@@ -6077,6 +6107,76 @@ class TestApps(unittest.TestCase):
         env = os.path.join(panel.app_compose_dir("wp-dry"), ".env")
         self.assertTrue(os.path.isfile(env))
         self.assertEqual(stat.S_IMODE(os.stat(env).st_mode), 0o600, ".env 必须是 600")
+
+
+class TestBruteforceLogParsing(unittest.TestCase):
+    """SSH 防爆破的日志解析（ak 实机：仅公钥机器上原正则一条都匹配不到 → 永远不封）"""
+
+    def _counts(self, lines, window=300):
+        class _R:
+            returncode = 0
+            stdout = "\n".join(lines)
+            stderr = ""
+        with unittest.mock.patch.object(panel, "ssh_service_name", lambda: "sshd"), \
+             unittest.mock.patch.object(panel.subprocess, "run", lambda *a, **k: _R()):
+            return panel.get_failed_ssh_attempts(window)
+
+    def test_pubkey_only_failures_are_counted(self):
+        """仅公钥登录的机器：失败登录只有 'Connection closed by authenticating user ...' 这一种行"""
+        lines = ["Connection closed by authenticating user jackson 168.107.77.146 port 36904 [preauth]",
+                 "Connection closed by authenticating user jackson 168.107.77.146 port 36918 [preauth]",
+                 "Connection closed by authenticating user root 168.107.77.146 port 36934 [preauth]",
+                 "Connection closed by invalid user admin 9.9.9.9 port 40122 [preauth]"]
+        got = self._counts(lines)
+        self.assertEqual(got.get("168.107.77.146"), 3, got)
+        self.assertEqual(got.get("9.9.9.9"), 1, got)
+
+    def test_password_failures_still_counted(self):
+        """密码登录的机器：原来的 Failed password 行仍要计数"""
+        lines = ["Failed password for root from 1.2.3.4 port 51000 ssh2",
+                 "Failed password for invalid user admin from 1.2.3.4 port 51002 ssh2",
+                 "Failed publickey for jackson from 5.6.7.8 port 4022 ssh2"]
+        got = self._counts(lines)
+        self.assertEqual(got.get("1.2.3.4"), 2, got)
+        self.assertEqual(got.get("5.6.7.8"), 1, got)
+
+    def test_same_attempt_not_double_counted(self):
+        """同一次失败可能同时留下两行 → 取较大值，不能算两次（否则阈值提前触发误封）"""
+        lines = ["Failed publickey for jackson from 7.7.7.7 port 4001 ssh2",
+                 "Connection closed by authenticating user jackson 7.7.7.7 port 4001 [preauth]"]
+        got = self._counts(lines)
+        self.assertEqual(got.get("7.7.7.7"), 1, got)
+
+    def test_bare_connection_closed_not_counted(self):
+        """连上就断（健康检查/端口扫描）不算认证失败，避免把监控探针封了"""
+        lines = ["Connection closed by 8.8.8.8 port 36946",
+                 "Connection closed by 8.8.8.8 port 36956 [preauth]"]
+        self.assertEqual(self._counts(lines), {})
+
+    def test_bruteforce_cycle_bans_pubkey_attacker(self):
+        """端到端：仅公钥机器上被撞 5 次 → 真的写进 ip_deny 规则并记录封禁"""
+        store = panel.RuleStore()
+        store.rules = []
+        cfg = make_cfg()
+        cfg.data["bruteforce"] = {"enabled": True, "max_fails": 5, "ban_seconds": 60, "fail_window": 300}
+        lines = ["Connection closed by authenticating user root 6.6.6.6 port %d [preauth]" % (4000 + i)
+                 for i in range(5)]
+
+        class _R:
+            returncode = 0
+            stdout = "\n".join(lines)
+            stderr = ""
+
+        with unittest.mock.patch.object(panel, "ssh_service_name", lambda: "sshd"), \
+             unittest.mock.patch.object(panel.subprocess, "run", lambda *a, **k: _R()), \
+             unittest.mock.patch.object(panel, "load_bans", lambda: {}), \
+             unittest.mock.patch.object(panel, "save_bans", lambda b: None), \
+             unittest.mock.patch.object(panel, "get_established_ips", lambda p: set()), \
+             unittest.mock.patch.object(panel.NFTManager, "apply", lambda self: (True, "ok")):
+            logs = panel.bruteforce_cycle(cfg, store)
+        self.assertTrue(any("6.6.6.6" in x and "封禁" in x for x in logs), logs)
+        self.assertTrue(any(r.get("type") == "ip_deny" and r.get("ip") == "6.6.6.6"
+                            and r.get("comment") == panel.BAN_COMMENT for r in store.rules), store.rules)
 
 
 class TestSystem(unittest.TestCase):
