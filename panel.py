@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.21"
+CURRENT_VERSION = "3.3.22"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -6463,6 +6463,20 @@ def docker_status():
             "data_root": data_root, "compose_version": compose_version}
 
 
+def _apt_pkg_exists(name):
+    """apt 索引里是否真有这个包名。
+
+    ⚠ v3.3.22（DMIT Debian 13 实机）：把**不存在的包名**塞进 `apt-get install` 会让整条命令失败、
+    一个包都装不上（与卸载侧 `_installed_pkg_names` 同一个坑的镜像面）。所以装之前先探。
+    注意：apt-cache 读的是本地索引，调用前应已 `apt-get update`。
+    """
+    try:
+        r = subprocess.run(["apt-cache", "show", name], capture_output=True, text=True, timeout=20)
+        return r.returncode == 0 and bool((r.stdout or "").strip())
+    except Exception:
+        return False
+
+
 def install_docker_pkgs(source="official"):
     """一键安装 docker + compose 插件。
     source="official"：发行版官方源（docker.io / docker）
@@ -6487,13 +6501,18 @@ def install_docker_pkgs(source="official"):
                 r = subprocess.run(["apt-get", "update"], capture_output=True, text=True, timeout=300)
                 if r.returncode != 0:
                     return False, f"apt-get update 失败: {(r.stderr or r.stdout).strip()[:200]}"
-                # 官方源没有 docker-compose-plugin（那是 docker-ce 仓库的包名）：
-                # 先试 docker-compose-v2（Debian 12+/Ubuntu 22.10+），失败回退 docker-compose（老版 v1）
-                r = subprocess.run(["apt-get", "install", "-y", "docker.io", "docker-compose-v2"],
+                # ⚠ v3.3.22：包名必须按「该发行版真的有」来选，不能写死 ——
+                #  ① Debian 13 / Ubuntu 24.10+ 把命令行客户端拆成独立包 **docker-cli**：只装 docker.io 会得到
+                #     「dockerd 在跑、compose 插件也在，但 `docker` 命令不存在」→ 面板判定未安装、所有 Docker
+                #     功能都用不了（DMIT Debian 13 实机复现）；
+                #  ② `docker-compose-v2` 是 Ubuntu 22.10+ 的包名，Debian 上叫 `docker-compose`；两者都提供
+                #     /usr/bin/docker-compose，同时装会冲突 → 二选一，优先 v2。
+                want = ["docker.io"]
+                if _apt_pkg_exists("docker-cli"):
+                    want.append("docker-cli")
+                want.append("docker-compose-v2" if _apt_pkg_exists("docker-compose-v2") else "docker-compose")
+                r = subprocess.run(["apt-get", "install", "-y"] + want,
                                    capture_output=True, text=True, timeout=600)
-                if r.returncode != 0:
-                    r = subprocess.run(["apt-get", "install", "-y", "docker.io", "docker-compose"],
-                                       capture_output=True, text=True, timeout=600)
         elif mgr == "pacman":
             r = subprocess.run(["pacman", "-Sy", "--noconfirm", "docker", "docker-compose"],
                                capture_output=True, text=True, timeout=600)
@@ -6518,6 +6537,17 @@ def install_docker_pkgs(source="official"):
         return False, "安装超时（10 分钟）"
     if r.returncode != 0:
         return False, f"安装失败: {(r.stderr or r.stdout).strip()[:300]}"
+    # ⚠ v3.3.22：装完必须确认 `docker` **命令**真的存在 —— 面板所有 Docker 功能都是 shell 调 docker，
+    # 只有守护进程/compose 而缺 CLI 时界面会一直显示「未安装」，用户以为装不上（DMIT Debian 13 实测）。
+    # 缺了就兜底补装 docker-cli（Debian 13 / Ubuntu 24.10+ 的拆分包名），仍缺则明确说清怎么手动补。
+    if not shutil.which("docker"):
+        if mgr == "apt" and _apt_pkg_exists("docker-cli"):
+            subprocess.run(["apt-get", "install", "-y", "docker-cli"],
+                           capture_output=True, text=True, timeout=600)
+        if not shutil.which("docker"):
+            return False, ("Docker 包已安装，但缺少 docker 命令行客户端（部分发行版如 Debian 13 / "
+                           "Ubuntu 24.10+ 把它拆成了 docker-cli 包），面板的 Docker 功能依赖该命令。"
+                           "请手动执行: apt-get install -y docker-cli（或 dnf install -y docker-cli）")
     # 启动服务 + 开机自启
     try:
         subprocess.run(["systemctl", "enable", "--now", "docker"],

@@ -2430,11 +2430,15 @@ class TestDocker(unittest.TestCase):
                 setattr(panel, name, fn)
 
     def test_docker_install_official_apt_fallback(self):
-        """apt 官方源：docker-compose-v2 不存在时回退 docker-compose（v1）"""
+        """apt 官方源：索引里没有 docker-compose-v2 时直接用 docker-compose（v1）
+
+        v3.3.22 起不再「先试 v2 等它失败」—— 包名先在索引里探过：
+        不存在的包名塞进 apt-get install 会让整条命令失败（Debian 13 实测一个包都装不上）。"""
         import types
         real_run = panel.subprocess.run
         real_mgr = panel.pkg_mgr
         real_dry = panel.DRY_RUN
+        real_which = panel.shutil.which
         calls = []
 
         def fake_run(args, **kw):
@@ -2442,10 +2446,13 @@ class TestDocker(unittest.TestCase):
             # apt-get update 成功；install v2 失败（找不到包）；install v1 成功
             if args[0] == "apt-get" and args[1] == "update":
                 return types.SimpleNamespace(returncode=0, stdout="", stderr="")
-            if "docker-compose-v2" in args:
-                return types.SimpleNamespace(
-                    returncode=100, stdout="",
-                    stderr="E: Unable to locate package docker-compose-v2")
+            # 索引里只有 docker-compose（Debian 的包名），没有 docker-cli / docker-compose-v2
+            if args[:1] == ["apt-cache"]:
+                pkg = args[2]
+                if pkg == "docker-compose":
+                    return types.SimpleNamespace(returncode=0, stdout="Package: docker-compose\n", stderr="")
+                return types.SimpleNamespace(returncode=100, stdout="",
+                                             stderr="E: No packages found")
             # systemctl is-active docker → active（安装后轮询确认服务启动）
             if args[:2] == ["systemctl", "is-active"]:
                 return types.SimpleNamespace(returncode=0, stdout="active", stderr="")
@@ -2454,16 +2461,21 @@ class TestDocker(unittest.TestCase):
         try:
             panel.pkg_mgr = lambda: "apt"
             panel.DRY_RUN = False
+            panel.shutil.which = lambda n: "/usr/bin/docker" if n == "docker" else None   # v3.3.22：新增 CLI 校验，桩里给个路径
             panel.subprocess.run = fake_run
             ok, msg = panel.install_docker_pkgs("official")
             self.assertTrue(ok)
-            # 断言第二次 install 用了 docker-compose（v1 回退）
-            self.assertTrue(any("docker-compose" in a and "docker-compose-v2" not in a
-                                for a in calls))
+            inst = [a for a in calls if a[:3] == ["apt-get", "install", "-y"]]
+            self.assertTrue(inst, "应有安装命令")
+            self.assertEqual(inst[0][3:], ["docker.io", "docker-compose"],
+                             "索引里没有 v2/docker-cli 时就用 docker-compose，且不带不存在的包名")
+            self.assertFalse(any("docker-compose-v2" in a for a in inst),
+                             "不能把不存在的包名塞进 apt-get install")
         finally:
             panel.subprocess.run = real_run
             panel.pkg_mgr = real_mgr
             panel.DRY_RUN = real_dry
+            panel.shutil.which = real_which
 
     def test_docker_install_official_apt_both_fail(self):
         """apt 官方源：v2 和 v1 都失败 → 返回失败"""
@@ -4627,6 +4639,7 @@ class TestFed(unittest.TestCase):
         real_run = panel.subprocess.run
         real_mgr = panel.pkg_mgr
         real_dry = panel.DRY_RUN
+        real_which = panel.shutil.which
         real_sleep = panel.time.sleep
         calls = []
 
@@ -4645,6 +4658,7 @@ class TestFed(unittest.TestCase):
         try:
             panel.pkg_mgr = lambda: "apt"
             panel.DRY_RUN = False
+            panel.shutil.which = lambda n: "/usr/bin/docker" if n == "docker" else None   # v3.3.22：新增 CLI 校验，桩里给个路径
             panel.subprocess.run = fake_run
             panel.time.sleep = lambda s: None
             ok, msg = panel.install_docker_pkgs("official")
@@ -4654,6 +4668,7 @@ class TestFed(unittest.TestCase):
             panel.subprocess.run = real_run
             panel.pkg_mgr = real_mgr
             panel.DRY_RUN = real_dry
+            panel.shutil.which = real_which
             panel.time.sleep = real_sleep
 
     def test_install_docker_service_never_active_reports_error(self):
@@ -4662,6 +4677,7 @@ class TestFed(unittest.TestCase):
         real_run = panel.subprocess.run
         real_mgr = panel.pkg_mgr
         real_dry = panel.DRY_RUN
+        real_which = panel.shutil.which
         real_sleep = panel.time.sleep
 
         def fake_run(args, **kw):
@@ -4674,6 +4690,7 @@ class TestFed(unittest.TestCase):
         try:
             panel.pkg_mgr = lambda: "apt"
             panel.DRY_RUN = False
+            panel.shutil.which = lambda n: "/usr/bin/docker" if n == "docker" else None   # v3.3.22：新增 CLI 校验，桩里给个路径
             panel.subprocess.run = fake_run
             panel.time.sleep = lambda s: None
             ok, msg = panel.install_docker_pkgs("official")
@@ -4683,6 +4700,7 @@ class TestFed(unittest.TestCase):
             panel.subprocess.run = real_run
             panel.pkg_mgr = real_mgr
             panel.DRY_RUN = real_dry
+            panel.shutil.which = real_which
             panel.time.sleep = real_sleep
 
 
@@ -6276,6 +6294,96 @@ class TestLoginLockoutPerIp(unittest.TestCase):
             tok, msg = a.login("admin", "wrong")
         self.assertIsNone(tok)
         self.assertTrue(msg)
+
+
+class TestDockerInstallPkgSelection(unittest.TestCase):
+    """一键安装（国外直连=发行版官方源）的包名选择与 CLI 校验
+
+    DMIT Debian 13 实机：面板装的是 docker.io + docker-compose-v2（后者 Debian 上没有 → apt 整条失败），
+    回退装 docker.io + docker-compose 后 daemon 在跑、compose 插件也在，但 Debian 13 把命令行客户端
+    拆成了独立的 docker-cli 包 → `/usr/bin/docker` 不存在 → 面板 docker_status 报 installed=False，
+    用户看到的就是「装不上」。修法：装之前探包名（docker-cli/compose-v2 有才写进命令）+ 装完校验 docker 命令。
+    """
+
+    class _R:
+        def __init__(self, out="", rc=0):
+            self.stdout, self.stderr, self.returncode = out, "", rc
+
+    def _run_install(self, exists, which_docker, active=True, fallback_fixes_cli=False):
+        calls = []
+        state = {"which": which_docker, "cli_install_seen": 0}
+
+        def fake_run(cmd, *a, **kw):
+            calls.append(cmd)
+            if cmd[:1] == ["apt-cache"]:
+                return self._R("Package: x\n" if cmd[2] in exists else "", 0 if cmd[2] in exists else 1)
+            if cmd[:2] == ["apt-get", "update"]:
+                return self._R("ok")
+            if cmd[:3] == ["apt-get", "install", "-y"]:
+                if "docker-cli" in cmd:
+                    state["cli_install_seen"] += 1
+                    # 第一次（主命令）不产生 CLI；第二次（兜底补装）按参数决定是否修好
+                    if fallback_fixes_cli and state["cli_install_seen"] > 1:
+                        state["which"] = "/usr/bin/docker"
+                return self._R("done")
+            if cmd[:2] == ["systemctl", "is-active"]:
+                return self._R("active" if active else "inactive", 0 if active else 3)
+            return self._R("")
+
+        import shutil as _sh
+        real_run, real_mgr, real_dry, real_which = panel.subprocess.run, panel.pkg_mgr, panel.DRY_RUN, _sh.which
+        try:
+            panel.pkg_mgr = lambda: "apt"
+            panel.DRY_RUN = False
+            panel.subprocess.run = fake_run
+            _sh.which = lambda name: (state["which"] if name == "docker" else real_which(name))
+            return panel.install_docker_pkgs("official"), calls
+        finally:
+            panel.subprocess.run, panel.pkg_mgr, panel.DRY_RUN = real_run, real_mgr, real_dry
+            _sh.which = real_which
+
+    def test_debian13_installs_docker_cli(self):
+        """有新拆分包时：命令里必须带 docker-cli（否则装完没有 docker 命令）"""
+        (ok, msg), calls = self._run_install({"docker-cli", "docker-compose"}, "/usr/bin/docker")
+        self.assertTrue(ok, msg)
+        inst = [c for c in calls if c[:3] == ["apt-get", "install", "-y"]]
+        self.assertEqual(inst and inst[0][3:], ["docker.io", "docker-cli", "docker-compose"],
+                         "Debian 13 应装 docker.io + docker-cli + docker-compose")
+
+    def test_prefers_compose_v2_when_available(self):
+        """同时存在时优先 docker-compose-v2（新包名），不和旧包一起装（两者都提供 /usr/bin/docker-compose）"""
+        (ok, _msg), calls = self._run_install({"docker-cli", "docker-compose-v2"}, "/usr/bin/docker")
+        self.assertTrue(ok)
+        inst = [c for c in calls if c[:3] == ["apt-get", "install", "-y"]][0]
+        self.assertIn("docker-compose-v2", inst)
+        self.assertNotIn("docker-compose", inst)
+
+    def test_debian12_no_cli_package(self):
+        """老发行版（CLI 在 docker.io 里）不能硬塞 docker-cli —— 不存在的包名会让 apt 整条失败"""
+        (ok, _msg), calls = self._run_install({"docker-compose"}, "/usr/bin/docker")
+        self.assertTrue(ok)
+        inst = [c for c in calls if c[:3] == ["apt-get", "install", "-y"]][0]
+        self.assertNotIn("docker-cli", inst)
+        self.assertNotIn("docker-compose-v2", inst)
+
+    def test_fallback_install_recovers_missing_cli(self):
+        """兜底补装 docker-cli 成功后应报成功（这才是修复的日常路径）"""
+        (ok, msg), calls = self._run_install({"docker-cli", "docker-compose"}, None, fallback_fixes_cli=True)
+        self.assertTrue(ok, msg)
+
+    def test_missing_cli_after_install_is_reported_clearly(self):
+        """兜底也补不上时：必须明确说是缺 docker-cli，不能假成功"""
+        (ok, msg), calls = self._run_install({"docker-cli", "docker-compose"}, None, fallback_fixes_cli=False)
+        self.assertFalse(ok, "缺 CLI 必须报失败，否则面板显示未安装、用户以为没装上")
+        self.assertIn("docker-cli", msg)
+        self.assertIn("命令行客户端", msg)
+        cli_installs = [c for c in calls if c[:3] == ["apt-get", "install", "-y"] and "docker-cli" in c]
+        self.assertGreaterEqual(len(cli_installs), 2, "应尝试兜底补装 docker-cli")
+
+    def test_cli_missing_skips_service_poll(self):
+        """CLI 彻底补不上时不必再等服务轮询（白等 30 秒），直接报错"""
+        (_ok, _msg), calls = self._run_install({"docker-cli", "docker-compose"}, None, fallback_fixes_cli=False)
+        self.assertFalse(any(c[:2] == ["systemctl", "is-active"] for c in calls))
 
 
 class TestDockerUninstallGuards(unittest.TestCase):
