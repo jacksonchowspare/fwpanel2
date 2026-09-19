@@ -1907,7 +1907,14 @@ function confirmPanel(msg, onOk, title, contentEl) {
 }
 function closeCfm() { $("cfm_modal").classList.add("hidden"); cfmCallback = null; }
 function cfmOk() { const cb = cfmCallback; closeCfm(); if (cb) cb(); }
+// v3.3.24：登录失效标记。一旦确认 401，就不再白发请求（一次刷新会打十几个接口），
+// 也在页面上给出可理解的原因；登录成功时复位。
+let authLost = false;
+
 async function api(method, path, body, timeoutMs) {
+  if (authLost && path !== "/api/login") {
+    throw new Error("登录已失效（面板可能刚重启或升级过），请重新登录");
+  }
   const opt = { method, headers: {}, cache: "no-store" };
   if (token) opt.headers["Authorization"] = "Bearer " + token;
   if (body) { opt.headers["Content-Type"] = "application/json"; opt.body = JSON.stringify(body); }
@@ -1927,7 +1934,22 @@ async function api(method, path, body, timeoutMs) {
   clearTimeout(t);
   let data = {};
   try { data = await r.json(); } catch (e) {}
-  if (r.status === 401 && path !== "/api/login") { showLogin(); throw new Error(data.error || "未登录"); }
+  if (r.status === 401 && path !== "/api/login") {
+    // ⚠ v3.3.24（用户实测：面板升级/重启后「点什么都没反应，像卡死」，F12 里是一整片 401）：
+    // 面板重启会清空内存里的登录态，老页面的 token 就死了。旧实现每收到一个 401 就再调一次 showLogin()，
+    // 却**不告诉用户发生了什么**，一次刷新能打出十几个 401 请求 —— 用户只看到「界面点不动」。
+    // 现在：只提示一次 + 只切一次登录页；其余请求由 api() 开头的短路直接拒绝，不再白发。
+    if (!authLost) {
+      authLost = true;
+      // 顺手清掉本地那个已失效的 token：否则刷新页面又会带着它再打一轮 401（用户实测的控制台风暴）。
+      // ⚠ /api/version 是免登录的，所以启动探活会"成功"，前端会误以为会话还有效，紧接着 refreshAll 并发打十几个接口全 401。
+      try { localStorage.removeItem("fw_token"); } catch (e) {}
+      token = "";
+      toast("登录已失效（面板可能刚重启或升级过），请重新登录", "err");
+      showLogin();
+    }
+    throw new Error(data.error || "未登录或登录已过期");
+  }
   if (!r.ok) {
     // 把后端的修复建议带出来：例如 NTP 没装服务时会返回 fix="install_ntp"，
     // 前端据此直接弹「一键安装并开启」，而不是只丢一句失败提示
@@ -2445,6 +2467,7 @@ async function login() {
   try {
     const d = await api("POST", "/api/login", { username: $("lg_user").value, password: $("lg_pass").value });
     token = d.token; localStorage.setItem("fw_token", token);
+    authLost = false;   // v3.3.24：登录成功，解除「登录失效」短路（否则新会话里所有请求都被直接拒绝）
     if (/iPhone|iPad|iPod/.test(navigator.userAgent)) {
       // iOS 26 聚焦智能缩放残留修复：
       // 1) 主动失焦，触发 iOS 自动恢复缩放
@@ -5859,7 +5882,10 @@ function csPortChanged(name) {
   }).catch(() => {});
 }
 async function renderSvc() {
-  const rules = (await api("GET", "/api/rules")).rules;
+  let rules;
+  // v3.3.24：这里以前直接 await，401/网络抖动会抛成「未捕获的 Promise 异常」（用户 F12 里能看到），
+  // 并且后续渲染全部中断、界面半截空白 —— 改成失败就安静跳过，由 api() 统一提示。
+  try { rules = (await api("GET", "/api/rules")).rules; } catch (e) { return; }
   const sshPort = (status && status.ssh_port) || 22;
   const list = $("svc_list"); list.innerHTML = "";
   for (const [name, port, proto, label] of SVCS) {
@@ -5971,7 +5997,9 @@ function typeTag(r) {
   return `<span class="tag ${cls}">${txt}</span>`;
 }
 async function renderRules() {
-  const { rules } = await api("GET", "/api/rules");
+  let rules;
+  // v3.3.24：同 renderSvc —— 不带 try/catch 的 await 会变成未捕获异常（用户实测控制台可见）
+  try { ({ rules } = await api("GET", "/api/rules")); } catch (e) { return; }
   const tbody = $("rule_rows"); tbody.innerHTML = "";
   $("no_rules").style.display = "none";   // SSH 保护常驻，列表不会为空
   // 第一行：SSH 保护（跟随当前 SSH 端口，防锁死不可删除，不分页）

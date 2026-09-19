@@ -97,7 +97,8 @@ sandbox.FitAddon = { FitAddon: class { fit() {} } };
 sandbox.window = sandbox; sandbox.globalThis = sandbox;
 
 const ctx = vm.createContext(sandbox);
-vm.runInContext(chunks.join("\n"), ctx);
+// api() 会读模块级 authLost（v3.3.24 登录失效短路），沙箱里要先声明，否则调用时 ReferenceError
+vm.runInContext("let authLost = false;\n" + chunks.join("\n"), ctx);
 // 让沙箱里的 api() 用本测试的 API/token 变量（它们是全局 let，需显式赋值）
 vm.runInContext("var __set = (a, t) => { API = a; token = t; };", ctx);
 
