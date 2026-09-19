@@ -1966,14 +1966,34 @@ async function apiTask(method, path, body, onProgress) {
   const d = await api(method, path, body);
   if (!d.task) return d;                       // 服务端同步完成（无后台任务）
   const tid = d.task;
+  const t0 = Date.now();
+  const LIMIT_MS = 30 * 60 * 1000;             // 兜底总超时：再长的任务也不该无限等
   for (;;) {
     await new Promise(r => setTimeout(r, 1500));
+    if (Date.now() - t0 > LIMIT_MS) {
+      const e = new Error("任务等待超时（可能面板重启导致状态丢失），请刷新页面后重新执行");
+      e.task = tid; throw e;
+    }
     let t;
     try { t = await api("GET", "/api/tasks/" + tid); }
-    catch (e) { if (e.message !== "未登录") continue; throw e; }   // 瞬时网络错误继续轮询
+    catch (e) {
+      // ⚠ v3.3.23：任务记录没了（面板重启过、记录被清理）时必须立刻报错，
+      // 旧实现把所有非「未登录」的失败都 continue —— 404 会变成无限轮询：界面永不提示、看着像卡死。
+      if (/不存在|过期|丢失/.test(e.message || "")) {
+        const err = new Error("任务记录已丢失（面板可能重启过），请刷新页面后重新执行");
+        err.task = tid; throw err;
+      }
+      if (e.message !== "未登录") continue;
+      throw e;
+    }
     if (onProgress) onProgress(t);
     if (t.status === "ok") return { ok: true, msg: t.msg || "完成", task: tid };
-    if (t.status === "error") { const e = new Error(t.msg || "任务执行失败"); e.task = tid; throw e; }
+    // 任何「非 running」都是终态：error / interrupted（面板重启打断）/ 其它未知状态 + done 标记
+    if (t.status !== "running" || t.done) {
+      const e = new Error(t.msg || (t.status === "interrupted"
+        ? "任务被面板重启中断（未完成），请重新执行一次" : "任务执行失败"));
+      e.task = tid; throw e;
+    }
     // running → 继续等
   }
 }

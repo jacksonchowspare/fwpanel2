@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.22"
+CURRENT_VERSION = "3.3.23"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -275,6 +275,8 @@ def get_task(tid):
         if t is None:
             return None
         return dict(t)
+
+
 
 # 升级源（国内友好优先）：jsDelivr → GitHub raw → ghproxy.net → ghfast.top → gh-proxy.com
 # ⚠ ghproxy.com 已废弃（返回 200 但内容为 HTML 错误页），不可用；后三个镜像 2026-08 实测返回真实文件
