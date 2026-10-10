@@ -1036,16 +1036,18 @@ window.addEventListener("error", function (ev) {
       <div id="add_proxy_row">
         <input id="px_domain" placeholder="域名（如 app.example.com）">
         <input id="px_host" placeholder="目标 IP/主机">
-        <input id="px_port" placeholder="端口" inputmode="numeric">
+        <input id="px_port" placeholder="端口" inputmode="numeric" oninput="pxPortWarn()">
         <select id="px_scheme"><option value="http">http</option><option value="https">https</option></select>
-        <select id="px_cert" title="选择已申请的证书复用（泛域名也可），或自动申请"><option value="">自动申请</option></select>
+        <select id="px_cert" title="空 = 不引用已有证书，用代理域名自己的证书（需要先申请/勾选左侧「立即申请证书」）；也可选已申请的其它证书复用（含泛域名）" onchange="pxPortWarn()"><option value="">不引用已有证书（用本域名自己的）</option></select>
       </div>
       <div id="add_proxy_opts">
+        <label class="opt-chip" title="添加后立即用 HTTP-01 为代理域名申请证书（需该域名 80 端口从公网可达）。不勾选则证书要稍后在列表 SSL 列点「申请证书」。"><input type="checkbox" id="px_issue_cert" checked onchange="optChipSync(this); pxPortWarn()">立即申请证书</label>
         <label class="opt-chip" title="保持 WebSocket 长连接（聊天/推送类应用需要）"><input type="checkbox" id="px_ws" onchange="optChipSync(this)">WebSocket</label>
         <label class="opt-chip" title="HTTP Strict Transport Security：强制浏览器 HTTPS 访问（仅 HTTPS 代理生效）"><input type="checkbox" id="px_hsts" onchange="optChipSync(this)">HSTS</label>
         <button class="btn" onclick="addProxy()">添加代理</button>
       </div>
-      <div style="color:var(--muted);font-size:12px;margin-bottom:12px">自动放行 443、自动禁止公网直连目标端口（80 需自行放行，证书申请需要）</div>
+      <div id="px_panelport_warn" style="display:none;color:var(--danger);font-size:12px;margin-bottom:10px;line-height:1.6"></div>
+      <div style="color:var(--muted);font-size:12px;margin-bottom:12px">添加时自动放行入口端口（80，有证书时含 443）、自动禁止公网直连目标端口。证书走 HTTP-01 验证，需该域名 80 端口从公网可达；未勾「立即申请证书」时可在列表 SSL 列点「申请证书」。</div>
       <div style="border-top:1px dashed var(--border);margin:0 0 10px"></div>
       <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;flex-wrap:wrap;gap:8px">
         <span style="display:flex;align-items:center;font-size:13px;font-weight:600"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 4V2h6v2M9 10h6M9 14h6M9 18h4"/></svg> 代理列表</span>
@@ -1713,12 +1715,13 @@ window.addEventListener("error", function (ev) {
         <select id="pxe_scheme" style="flex:1" title="回源协议：nginx 连接目标服务时用的协议（不是站点对外协议）。面板部署的 Docker 应用与端口站都是明文 HTTP，选 https 会让 nginx 用 TLS 去连明文端口 → 502">
           <option value="http">http</option><option value="https">https</option></select>
         <span style="font-size:13px;flex:none">证书</span>
-        <select id="pxe_cert" style="flex:1" title="引用的证书：空 = 用本站域名自己的证书；也可引用已申请的其它证书（含泛域名）"></select>
+        <select id="pxe_cert" style="flex:1" title="引用的证书：空 = 用本站域名自己的证书；也可引用已申请的其它证书（含泛域名）" onchange="pxEditPortWarn()"></select>
       </div>
       <div style="color:var(--muted);font-size:11px;margin-bottom:10px">
         协议 = <b>回源协议</b>（nginx → 目标服务）：Docker 应用/网站容器一般是 <b>http</b>；
         站点对外是否 HTTPS 由「证书 + 80→443 跳转」决定，与这里无关。
       </div>
+      <div id="pxe_panelport_warn" style="display:none;color:var(--danger);font-size:11px;margin-bottom:10px;line-height:1.6"></div>
       <label style="display:flex;align-items:center;gap:6px;margin-bottom:8px;cursor:pointer"><input type="checkbox" id="pxe_ws" style="width:auto;flex:none"> WebSocket 支持</label>
       <label style="display:flex;align-items:center;gap:6px;cursor:pointer" title="HTTP Strict Transport Security：强制浏览器 HTTPS 访问（仅 HTTPS 代理生效）"><input type="checkbox" id="pxe_hsts" style="width:auto;flex:none"> HSTS（强制 HTTPS，1 年含子域名）</label>
     </div>
@@ -5140,6 +5143,8 @@ function showKernel() {
 }
 /* ---------- 代理编辑 ---------- */
 let pxeId = null;
+let pxeTargetPort = 0;      // v3.3.25：面板端口红线提示要用
+let pxeCertExists = false;
 async function editProxy(id) {
   try {
     const d = await api("GET", "/api/proxy");
@@ -5153,6 +5158,9 @@ async function editProxy(id) {
     $("pxe_cert").value = p.cert_ref || "";
     $("pxe_ws").checked = !!p.websocket;
     $("pxe_hsts").checked = !!p.hsts;
+    pxeTargetPort = Number(p.target_port) || 0;
+    pxeCertExists = !!p.cert_exists;
+    pxEditPortWarn();
     $("pxe_modal").classList.remove("hidden");
   } catch (e) { toast(e.message, "err"); }
 }
@@ -5184,7 +5192,7 @@ async function loadCertOptions() {
   return certOptionsCache;
 }
 function certOptionsHtml(selected) {
-  let html = '<option value="">自动申请（为代理域名申请）</option>';
+  let html = '<option value="">不引用已有证书（用本域名自己的）</option>';
   for (const c of certOptionsCache) {
     const exp = c.cert_expiry ? `（${new Date(c.cert_expiry * 1000).toLocaleDateString()} 到期）` : "";
     const sel = selected === c.domain ? " selected" : "";
@@ -5245,6 +5253,7 @@ async function loadProxy() {
       } else if (p.ssl) {
         certText = "未签发";
       } else {
+        certText = `<span style="color:var(--muted)">未申请</span>`;
         certBtns = `<button class="btn mini" onclick="issueSsl('${p.id}')">申请证书</button><span></span>`;   // 占位对齐
       }
       // 窄窗口下文本会用省略号截断 → 加 title 让鼠标悬停能看全
@@ -5298,7 +5307,47 @@ function optChipSync(el) {
 }
 function optChipInit() { document.querySelectorAll(".opt-chip input").forEach(i => optChipSync(i)); }
 
+// v3.3.25：目标是面板自身端口时的红线提示。
+// 真机事故（hk24）：反代指向面板端口、证书没签成 → https 被 443 兜底拒绝握手，而面板端口的
+// 公网直连又被「禁止公网直连」deny 关掉 → 两条入口全死，用户以为面板坏了、只剩 SSH。
+function proxyPanelPortWarnText(targetPort, certRef, certExists) {
+  const pp = (status && status.panel_port) || 0;
+  if (!pp || Number(targetPort) !== Number(pp)) return "";
+  if (!certRef && !certExists) {
+    return "⚠ 目标是面板自身端口，且还没有可用证书：此刻 https://域名 会直接握手失败（443 返回拒绝），"
+         + "证书就绪后公网直连 IP:端口 会被自动关闭 → 面板只能走 https://域名。"
+         + "请先确认域名已解析到本机、证书能签发成功。";
+  }
+  return "提示：该代理指向面板自身端口。证书就绪后会自动关闭公网直连 IP:端口，"
+       + "届时面板只能通过 https://域名 访问（设计如此）。";
+}
+function pxPortWarn() {
+  const el = $("px_panelport_warn");
+  if (!el) return;
+  const sel = $("px_cert");
+  el.innerHTML = proxyPanelPortWarnText($("px_port").value.trim(), sel ? sel.value : "", false);
+  el.style.display = el.innerHTML ? "block" : "none";
+}
+function pxEditPortWarn() {
+  const el = $("pxe_panelport_warn");
+  if (!el) return;
+  const sel = $("pxe_cert");
+  el.innerHTML = proxyPanelPortWarnText(pxeTargetPort, sel ? sel.value : "", pxeCertExists);
+  el.style.display = el.innerHTML ? "block" : "none";
+}
+// 面板自身端口的反代签好证书后，直连 IP:端口 会被自动关闭 → 当前页面会「哑掉」，
+// 主动把用户送到 https://域名（否则他只会看到「点什么都没反应」）。
+function maybeJumpToPanelDomain(domain, targetPort) {
+  const pp = (status && status.panel_port) || 0;
+  if (!domain || !pp || Number(targetPort) !== Number(pp)) return false;
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(location.hostname)) return false;
+  const url = "https://" + domain + "/";
+  toast("证书已签发：面板直连 IP:端口 已按设计关闭，2.5 秒后跳到 " + url, "okk");
+  setTimeout(() => { location.href = url; }, 2500);
+  return true;
+}
 async function addProxy() {
+  const wantCert = $("px_issue_cert") && $("px_issue_cert").checked && !$("px_cert").value;
   try {
     const d = await api("POST", "/api/proxy", {
       domain: $("px_domain").value.trim(), target_host: $("px_host").value.trim(),
@@ -5307,9 +5356,23 @@ async function addProxy() {
       websocket: $("px_ws").checked,
       hsts: $("px_hsts").checked,
     });
-    toast(d.msg || "代理已添加", "okk");
+    const p = d.proxy || {};
     $("px_domain").value = ""; $("px_host").value = ""; $("px_port").value = "";
-    loadProxy(); renderRules();
+    pxPortWarn();
+    if (wantCert && p.id) {
+      // v3.3.25：勾了「立即申请证书」就顺手申请（旧版这里从不申请，只有 SSL 列的按钮会 → 用户以为在申请）
+      toast("代理已添加，正在为 " + p.domain + " 申请证书（HTTP-01，约 10-60 秒）...");
+      try {
+        const r = await apiTask("POST", "/api/proxy/" + p.id, { action: "ssl", email: "" });
+        if (!maybeJumpToPanelDomain(p.domain, p.target_port)) toast(r.msg || "证书已申请", "okk");
+      } catch (e2) {
+        toast("代理已添加，但证书申请失败：" + e2.message + "（可在列表 SSL 列点『申请证书』重试）", "err");
+      }
+    } else {
+      const extra = $("px_cert").value ? "" : "（证书尚未申请，点列表 SSL 列『申请证书』即可）";
+      toast((d.msg || "代理已添加") + extra, "okk");
+    }
+    loadProxy(); renderRules(); loadCerts();
   } catch (e) { toast(e.message, "err"); }
 }
 async function toggleProxy(id, on) {
@@ -5330,6 +5393,12 @@ async function issueSsl(id) {
     const d = await apiTask("POST", "/api/proxy/" + id, { action: "ssl", email });
     toast(d.msg || "证书已申请", "okk");
     loadProxy(); loadCerts();
+    // v3.3.25：该反代若指向面板自身端口，证书就绪后直连会被关闭 → 主动跳到 https://域名，别让页面哑掉
+    try {
+      const dl = await api("GET", "/api/proxy");
+      const px = (dl.proxies || []).find(x => x.id === id);
+      if (px && maybeJumpToPanelDomain(px.domain, px.target_port)) return;
+    } catch (e3) { /* 跳转失败不阻断原有跳转逻辑 */ }
     // 证书生效后 nginx 会把 http 301 到 https——域名访问时主动跳转 https，避免列表状态停留在旧页面
     if (location.protocol === "http:" && !/^\d+\.\d+\.\d+\.\d+$/.test(location.hostname)) {
       setTimeout(() => { location.href = location.href.replace(/^http:/, "https:"); }, 800);

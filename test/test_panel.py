@@ -1376,6 +1376,45 @@ class TestAPI(unittest.TestCase):
                 return d["token"]
         self.fail("无法获取测试 token")
 
+    def test_add_proxy_targeting_panel_port_keeps_direct_access(self):
+        """v3.3.25 真机事故回归：目标是面板**自身端口**的反代，证书就绪前不许关闭公网直连。
+
+        现场（hk24，2026-10-10）：用户在 IP:面板端口 上操作面板 → 建了一个指向面板端口、
+        还没证书的反代 → 旧代码立刻加「反代目标端口-禁止公网直连」deny（排在所有 accept 之前）
+        → 当前页面每个 API 请求被丢包（用户原话「卡住了」），刷新后彻底进不去；
+        而 https://域名 又因没证书被 443 兜底拒绝握手 → 只剩 SSH。
+        """
+        token = self._token()
+        # ⚠ 这个用例会通过「添加反代」自动放行入口端口 80 —— 共享 store 会多出一条规则，
+        #   而 full_flow 等用例按精确条数断言，所以先快照、跑完还原（含断言失败时）
+        snapshot = [dict(r) for r in self.store.rules]
+        self.addCleanup(lambda: setattr(self.store, "rules", [dict(r) for r in snapshot]))
+        code, d = self._req("GET", "/api/status", token=token)
+        self.assertEqual(code, 200, d)
+        pp = int(d["panel_port"])
+        # 面板端口防锁死自检读的是 CONFIG_FILE 里的端口 → 指向临时配置，保证与 status 一致
+        tmpdir = tempfile.mkdtemp(prefix="fwpanel-cfg-")
+        self.addCleanup(shutil.rmtree, tmpdir, True)
+        cfg_path = os.path.join(tmpdir, "config.json")
+        with open(cfg_path, "w") as f:
+            json.dump({"port": pp}, f)
+        old_cfg = panel.CONFIG_FILE
+        panel.CONFIG_FILE = cfg_path
+        self.addCleanup(lambda: setattr(panel, "CONFIG_FILE", old_cfg))
+        code, d = self._req("POST", "/api/proxy", {
+            "domain": "selfpanel.example.com", "target_host": "127.0.0.1",
+            "target_port": pp, "scheme": "http"}, token=token)
+        self.assertEqual(code, 200, d)
+        pid = d["proxy"]["id"]
+        # ⚠ 必须挂 addCleanup：断言失败时也不能把这条反代留在共享 store 里（会污染后续用例）
+        self.addCleanup(lambda: self._req("DELETE", f"/api/proxy/{pid}", token=self._token()))
+        code, d = self._req("GET", "/api/rules", token=token)
+        self.assertFalse(any(r.get("type") == "port_deny" and r.get("port") == pp for r in d["rules"]),
+                         "证书就绪前不许关闭面板端口的公网直连（否则用户被自己的面板锁在门外）")
+        # 清理，别污染后续用例
+        code, d = self._req("DELETE", f"/api/proxy/{pid}", token=token)
+        self.assertEqual(code, 200, d)
+
     def test_proxy_edit(self):
         """代理编辑：修改 scheme/websocket/hsts"""
         # 先添加一个代理（dry-run 环境 apply_proxies 安全）
@@ -3744,11 +3783,15 @@ class TestProxyEntryPorts(unittest.TestCase):
                             for r in self.store.rules))
 
     def test_panel_port_deny_kept_when_proxy_serves_it(self):
-        """反代确实在接管面板端口（nginx 正常）→ 保留 deny（面板只走域名，设计如此）"""
+        """反代接管面板端口 **且证书已就绪（https 通道可用）** → 保留 deny（面板只走域名，设计如此）
+
+        v3.3.25 收紧：只看「有反代 + nginx 在跑」是不够的 —— 没有证书时 https 打不开，
+        deny 一挂就是彻底自锁（见 test_panel_port_deny_released_when_proxy_has_no_cert）。"""
         p = self._proxy(target_port=42608, cert_ref="*.example.com")
         panel.ProxyStore._load = lambda self: [p]
         self._with_config_port(42608)
         self._fake_nginx()
+        self._with_cert("fwpanel.example.com", "*.example.com")   # 证书文件存在 = https 通道可用
         self.store.rules = [
             {"id": "d1", "type": "port_deny", "proto": "tcp", "port": 42608,
              "comment": panel.PROXY_TARGET_DENY_COMMENT},
@@ -3756,6 +3799,56 @@ class TestProxyEntryPorts(unittest.TestCase):
         panel.ensure_proxy_entry_ports(self.store)
         self.assertTrue(any(r.get("type") == "port_deny" for r in self.store.rules),
                         "反代在接管面板端口时 deny 要保留")
+
+
+    def test_panel_port_deny_released_when_proxy_has_no_cert(self):
+        """v3.3.25 真机事故（hk24）：反代在跑但**没有证书**（只有 http）→ 必须解除 deny。
+
+        现场：用户在 IP:面板端口 上建了指向面板端口的反代（未签证书）→ 旧代码立刻挂 deny
+        → 页面每个 API 请求被丢包（「卡住、点了没反应」），而 https://域名 又因无证书被 443 兜底
+        ssl_reject_handshake 拒绝握手 → 公网两条入口同时死掉，只剩 SSH。
+        """
+        p = self._proxy(target_port=42608, cert_ref="", ssl=False)
+        panel.ProxyStore._load = lambda self: [p]
+        self._with_config_port(42608)
+        self._fake_nginx()                      # nginx 正常在跑 —— 旧判据正是在这里选择保留 deny
+        tmp = tempfile.mkdtemp(prefix="fwpanel-le-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        old_le = panel.LE_LIVE
+        panel.LE_LIVE = tmp                     # 一个证书文件都没有
+        self.addCleanup(lambda: setattr(panel, "LE_LIVE", old_le))
+        self.store.rules = [
+            {"id": "d1", "type": "port_deny", "proto": "tcp", "port": 42608,
+             "comment": panel.PROXY_TARGET_DENY_COMMENT},
+        ]
+        panel.ensure_proxy_entry_ports(self.store)
+        self.assertFalse(any(r.get("type") == "port_deny" for r in self.store.rules),
+                         "没有证书（https 通道不可用）时必须解除 deny，保住公网直连这条命")
+        self.assertTrue(any(r.get("type") == "port_allow" and r["port"] == 42608
+                            for r in self.store.rules), "面板端口本身必须放行")
+
+    def test_panel_port_deny_added_only_after_cert(self):
+        """deny 的挂/解随证书状态双向翻转：先不加，证书签好后由证书路径补上"""
+        p = self._proxy(target_port=42608)
+        panel.ProxyStore._load = lambda self: [p]
+        self._with_config_port(42608)
+        self._fake_nginx()
+        tmp = tempfile.mkdtemp(prefix="fwpanel-le-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        old_le = panel.LE_LIVE
+        panel.LE_LIVE = tmp
+        self.addCleanup(lambda: setattr(panel, "LE_LIVE", old_le))
+        self.store.rules = []
+        panel.ensure_proxy_entry_ports(self.store)
+        self.assertFalse(any(r.get("type") == "port_deny" for r in self.store.rules),
+                         "没证书时不该挂 deny")
+        old_le2 = panel.LE_LIVE
+        panel.LE_LIVE = tmp
+        self._with_cert(p["domain"])            # 证书签好了（sync_entry_ports_after_cert 链路的输入）
+        panel.ensure_proxy_entry_ports(self.store)
+        self.assertTrue(any(r.get("type") == "port_deny" and r["port"] == 42608
+                            for r in self.store.rules),
+                        "https 通道就绪后必须补上「禁止公网直连」保护")
 
 
 class TestCertHttp01Port(unittest.TestCase):

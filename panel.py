@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.24"
+CURRENT_VERSION = "3.3.25"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -11680,7 +11680,14 @@ class PanelHandler(BaseHTTPRequestHandler):
                 changed = True
         # 禁止公网直连目标端口（80/443 除外——入口端口由 nginx 兜底 444 控制）
         # 拒绝规则含回环豁免，不影响 nginx 本机转发
-        if port not in (80, 443) and not any(
+        # ⚠ v3.3.25：目标端口 == 面板端口时**不能立刻加**这条 deny —— 只有该反代确实在提供
+        # HTTPS（证书文件存在、nginx 为它监听 443）时才允许关掉面板端口的直连兜底；否则
+        # 「反代在跑但证书没签成」会把主人锁在门外：https 被 ssl_reject_handshake 拒、
+        # IP:端口 被 deny 丢包，两条入口全死只剩 SSH（2026-10-10 hk24 真机事故）。
+        if port == _panel_config_port():
+            if _release_panel_port_deny(pstore, store):
+                changed = True
+        elif port not in (80, 443) and not any(
                 r.get("type") == "port_deny" and r.get("port") == port
                 and r.get("comment") == PROXY_TARGET_DENY_COMMENT for r in store.rules):
             store.add({"type": "port_deny", "proto": "tcp", "port": port,
@@ -11711,6 +11718,9 @@ class PanelHandler(BaseHTTPRequestHandler):
         if action == "enable":
             p["enabled"] = bool(data.get("enabled", True))
             pstore.save()
+            # v3.3.25：停用/启用指向面板端口的反代会改变「https 通道是否可用」→ 重算保护
+            if ensure_proxy_entry_ports(self.server.store):
+                self.server.nft.apply()
             ok, msg = apply_proxies(pstore)
             self._send(200, {"ok": True, "msg": f"代理 {p['domain']} 已{'启用' if p['enabled'] else '停用'}（{msg}）"})
         elif action == "ssl":
@@ -11804,6 +11814,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             p["websocket"] = bool(data.get("websocket", p.get("websocket", False)))
             p["hsts"] = bool(data.get("hsts", p.get("hsts", False)))
             pstore.save()
+            # v3.3.25：换证书 / 清空证书都会改变「https 通道是否可用」→ 重算面板端口保护
+            if ensure_proxy_entry_ports(self.server.store):
+                self.server.nft.apply()
             ok, msg = apply_proxies(pstore)
             tail = "" if ok else f"；配置应用失败: {msg}"
             # v3.3.16：把改了哪些字段回显出来，并对可疑的回源协议给出提示（用户实测反馈）
@@ -11837,6 +11850,9 @@ class PanelHandler(BaseHTTPRequestHandler):
                                        and r.get("comment") == PROXY_TARGET_DENY_COMMENT)]
                 store.save()
                 self.server.nft.apply()
+        # v3.3.25：删掉指向面板端口的反代 → 解除保护并把面板端口放行补回来（公网直连恢复）
+        if ensure_proxy_entry_ports(self.server.store):
+            self.server.nft.apply()
         ok, msg = apply_proxies(pstore)
         self._send(200, {"ok": True, "msg": f"代理 {domain} 已删除（{msg}）"})
 
@@ -12560,13 +12576,19 @@ def ensure_proxy_entry_ports(store):
 
 
 def _release_panel_port_deny(pstore, store):
-    """面板端口防锁死自检（v3.2.40）。
+    """面板端口「禁止公网直连」保护的条件化维护（v3.2.40 建立，v3.3.25 收紧）。
 
     面板自己走反代时，创建反代会顺手加一条「反代目标端口-禁止公网直连」的 deny 指着面板端口
     ——deny 渲染在所有 accept 之前（黑名单优先，防 SSH 被绕过），所以「严格模式自动放行面板端口」
     那条规则实际是死的，公网只剩「反代域名」这一条路。
-    风险：反代一旦不成立（被删/停用、nginx 没装或没起来），公网就彻底进不来面板，只剩 SSH。
-    兜底：没有启用的反代指向面板端口、或 nginx 不可用/未运行 → 解除该 deny 并确保面板端口放行。
+
+    ⚠ v3.3.25 收紧（hk24 真机事故）：只有「指向面板端口的反代确实在提供 HTTPS」时才允许保留
+    这条 deny。旧判据是「有启用的反代指向面板端口 + nginx 可用」，覆盖不到最危险的组合——
+    反代在跑、但只有 http（证书没签成、或压根没签）：443 上是兜底 ssl_reject_handshake 直接
+    拒绝握手，而 IP:面板端口 又被 deny 丢包 → 公网两条入口同时死掉，只剩 SSH
+    （用户原话「做面板反代时卡住了、面板页面打不开」）。
+    不满足条件 → 解除 deny + 确保面板端口放行，保住直连这条命；等证书真签发后，由
+    sync_entry_ports_after_cert → ensure_proxy_entry_ports → 本函数把 deny 补回来。
     返回值 = 是否有改动。
     """
     panel_port = _panel_config_port()
@@ -12582,23 +12604,40 @@ def _release_panel_port_deny(pstore, store):
                 break
         except Exception:
             continue
-    if deny is None:
-        return False
     try:
-        serving = any(q.get("enabled", True) and int(q.get("target_port") or 0) == panel_port
-                      for q in pstore.proxies)
+        serving = [q for q in pstore.proxies
+                   if q.get("enabled", True) and int(q.get("target_port") or 0) == panel_port]
     except Exception:
-        serving = False
+        serving = []
     try:
         nginx_ok = nginx_available() and nginx_active()
     except Exception:
         nginx_ok = False
+    # https 通道是否真的可用：与 nginx 渲染口径一致 —— 看「证书文件是否存在」
+    # （render_proxy_conf 用 _proxy_cert() 决定要不要 listen 443，与 ssl 字段无关）
+    https_ready = False
     if serving and nginx_ok:
-        return False          # 反代确实在接管面板端口 → 保留 deny（设计如此）
+        for q in serving:
+            try:
+                if _proxy_cert(q["domain"], q.get("cert_ref"))[0]:
+                    https_ready = True
+                    break
+            except Exception:
+                continue
+    if https_ready:
+        if deny is None:
+            store.add({"type": "port_deny", "proto": "tcp", "port": panel_port,
+                       "comment": PROXY_TARGET_DENY_COMMENT})
+            log(f"[ensure_proxy_entry_ports] 面板端口 {panel_port} 的 https 通道已就绪"
+                f"（反代 {serving[0].get('domain')} 有证书），启用「禁止公网直连」保护")
+            return True
+        return False          # https 通道可用 → 保留 deny（设计如此）
+    if deny is None:
+        return False          # 没有这条保护可解 → 不动（补放行规则是模式切换/改端口的职责）
     store.remove(deny["id"])
-    log(f"[ensure_proxy_entry_ports] 反代未接管面板端口 {panel_port}"
-        f"（有反代指向它={serving} / nginx 可用={nginx_ok}），已解除「禁止公网直连」保护，"
-        f"避免公网彻底连不上面板")
+    log(f"[ensure_proxy_entry_ports] 面板端口 {panel_port} 还没有可用的 https 通道"
+        f"（有反代指向它={bool(serving)} / nginx 可用={nginx_ok}），"
+        f"已解除「禁止公网直连」保护，避免公网彻底连不上面板")
     if not any(r.get("type") == "port_allow"
                and str(r.get("port")) == str(panel_port) for r in store.rules):
         store.add({"type": "port_allow", "proto": "tcp", "port": panel_port,
