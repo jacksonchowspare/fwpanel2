@@ -1376,6 +1376,40 @@ class TestAPI(unittest.TestCase):
                 return d["token"]
         self.fail("无法获取测试 token")
 
+    def test_add_proxy_defaults_to_block_ip(self):
+        """v3.3.26：新建反代默认开启「禁止 IP 直连」（与站点向导一致）。
+
+        用户实测反馈：添加代理后操作列那颗按钮显示的是「禁止IP+端口访问」（= 未禁止，需点一下），
+        但同一动作后端其实已自动给目标端口加了防火墙拒绝规则 → 按钮文案与实际状态自相矛盾。
+        现在缺省即开启；显式传 block_ip:false 才关闭。
+        """
+        token = self._token()
+        snapshot = [dict(r) for r in self.store.rules]
+        self.addCleanup(lambda: setattr(self.store, "rules", [dict(r) for r in snapshot]))
+        code, d = self._req("POST", "/api/proxy", {
+            "domain": "blockip.example.com", "target_host": "127.0.0.1",
+            "target_port": 8099, "scheme": "http"}, token=token)
+        self.assertEqual(code, 200, d)
+        pid = d["proxy"]["id"]
+        self.addCleanup(lambda: self._req("DELETE", f"/api/proxy/{pid}", token=self._token()))
+        self.assertTrue(d["proxy"].get("block_ip"), "缺省应视为开启「禁止 IP 直连」")
+        code, d = self._req("GET", "/api/proxy", token=token)
+        row = [p for p in d["proxies"] if p["id"] == pid][0]
+        self.assertTrue(row.get("block_ip"),
+                        "列表里也要是「禁止中」——否则用户得手动点一下才对得上")
+        # 显式关闭仍然允许（想用 IP 直连的场景）
+        code, d = self._req("POST", "/api/proxy", {
+            "domain": "blockip2.example.com", "target_host": "127.0.0.1",
+            "target_port": 8098, "scheme": "http", "block_ip": False}, token=token)
+        self.assertEqual(code, 200, d)
+        pid2 = d["proxy"]["id"]
+        self.addCleanup(lambda: self._req("DELETE", f"/api/proxy/{pid2}", token=self._token()))
+        self.assertFalse(d["proxy"].get("block_ip"), "显式传 false 时应保持关闭")
+        code, d = self._req("DELETE", f"/api/proxy/{pid}", token=token)
+        self.assertEqual(code, 200, d)
+        code, d = self._req("DELETE", f"/api/proxy/{pid2}", token=token)
+        self.assertEqual(code, 200, d)
+
     def test_add_proxy_targeting_panel_port_keeps_direct_access(self):
         """v3.3.25 真机事故回归：目标是面板**自身端口**的反代，证书就绪前不许关闭公网直连。
 
@@ -9541,7 +9575,13 @@ class TestAddProxyFormLayout(unittest.TestCase):
         self.assertIn(".opt-chip.on, .opt-chip:has(input:checked) { border-color: var(--accent2); color: var(--accent2);",
                       self.html, "勾选态高亮规则缺失（:has 为主 + .on 兜底）")
         self.assertIn(".opt-chip input:checked { background: var(--accent2); border-color: var(--accent2); }", self.html)
-        self.assertEqual(self.html.count('onchange="optChipSync(this)"'), 2, "两枚胶囊都要挂 optChipSync")
+        self.assertEqual(self.html.count('onchange="optChipSync(this)"'), 3,
+                         "三枚纯勾选胶囊（禁止IP直连 / WebSocket / HSTS）都要挂 optChipSync")
+        for cid in ("px_blockip", "px_ws", "px_hsts"):
+            self.assertRegex(self.html, r'id="%s"[^>]*onchange="optChipSync\(this\)"' % cid,
+                             "%s 要挂 optChipSync（v3.3.26 起新增「禁止 IP 直连」胶囊）" % cid)
+        self.assertIn('id="px_issue_cert" checked onchange="optChipSync(this); pxPortWarn()"', self.html,
+                      "「立即申请证书」胶囊：默认勾上 + 同步勾选态 + 顺带触发面板端口红线提示")
         self.assertIn("function optChipSync(el) {", self.html)
         self.assertIn("optChipInit();", self.html, "启动时必须初始化一次（预置勾选态）")
         self.assertIn("showMain()  { window.__FW_UI_READY__ = true; optChipInit();", self.html)

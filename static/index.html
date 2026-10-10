@@ -1042,6 +1042,7 @@ window.addEventListener("error", function (ev) {
       </div>
       <div id="add_proxy_opts">
         <label class="opt-chip" title="添加后立即用 HTTP-01 为代理域名申请证书（需该域名 80 端口从公网可达）。不勾选则证书要稍后在列表 SSL 列点「申请证书」。"><input type="checkbox" id="px_issue_cert" checked onchange="optChipSync(this); pxPortWarn()">立即申请证书</label>
+        <label class="opt-chip" title="只允许用域名访问：nginx 拒绝 Host 不是该域名的请求（IP 直连 444），目标端口的公网直连也由防火墙拒绝。想允许 IP 直连就取消勾选。"><input type="checkbox" id="px_blockip" checked onchange="optChipSync(this)">禁止 IP 直连</label>
         <label class="opt-chip" title="保持 WebSocket 长连接（聊天/推送类应用需要）"><input type="checkbox" id="px_ws" onchange="optChipSync(this)">WebSocket</label>
         <label class="opt-chip" title="HTTP Strict Transport Security：强制浏览器 HTTPS 访问（仅 HTTPS 代理生效）"><input type="checkbox" id="px_hsts" onchange="optChipSync(this)">HSTS</label>
         <button class="btn" onclick="addProxy()">添加代理</button>
@@ -5355,6 +5356,7 @@ async function addProxy() {
       cert_ref: $("px_cert").value,
       websocket: $("px_ws").checked,
       hsts: $("px_hsts").checked,
+      block_ip: $("px_blockip") ? $("px_blockip").checked : true,   // v3.3.26：默认开启（与站点向导一致）
     });
     const p = d.proxy || {};
     $("px_domain").value = ""; $("px_host").value = ""; $("px_port").value = "";

@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.25"
+CURRENT_VERSION = "3.3.26"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -4844,7 +4844,7 @@ def app_deploy_work(aid):
         if not entry:
             entry = ps.add({"domain": domain, "target_host": "127.0.0.1", "target_port": app["port"],
                             "scheme": "http", "websocket": bool(t.get("websocket")),
-                            "hsts": False, "ssl": True, "cert_ref": domain,
+                            "hsts": False, "block_ip": True, "ssl": True, "cert_ref": domain,
                             "client_max_body_size": _norm_upload_mb(app.get("upload_mb")),
                             "note": "应用：%s" % (app.get("name") or t.get("name"))})
             store.update(aid, proxy_id=entry.get("id"))
@@ -11650,6 +11650,9 @@ class PanelHandler(BaseHTTPRequestHandler):
             "domain": domain, "target_host": host, "target_port": port,
             "scheme": scheme, "websocket": bool(data.get("websocket")),
             "hsts": bool(data.get("hsts")),
+            # v3.3.26：新建反代默认「禁止 IP 直连」（与站点向导的默认一致）。
+            # 旧版这里没这个字段 → 列表显示「未禁止」，用户得手动点一次才知道该不该点。
+            "block_ip": bool(data.get("block_ip", True)),
             "ssl": bool(data.get("ssl")),
             "cert_ref": cert_ref,
             "client_max_body_size": _norm_upload_mb(data.get("client_max_body_size")),

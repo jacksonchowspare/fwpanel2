@@ -66,9 +66,10 @@ function mkSandbox(opts) {
     id, value: "", checked: false, innerHTML: "", style: {}, classList: { add() {}, remove() {} },
   });
   ["px_domain", "px_host", "px_port", "px_scheme", "px_cert", "px_ws", "px_hsts", "px_issue_cert",
-   "px_panelport_warn", "pxe_cert", "pxe_panelport_warn"].forEach(el);
+   "px_blockip", "px_panelport_warn", "pxe_cert", "pxe_panelport_warn"].forEach(el);
   st.els.px_scheme.value = "http";
   st.els.px_issue_cert.checked = opts.issueCert !== undefined ? opts.issueCert : true;
+  st.els.px_blockip.checked = opts.blockIp !== undefined ? opts.blockIp : true;   // 表单默认勾上
   st.els.px_cert.value = opts.certRef || "";
   st.els.px_port.value = opts.port !== undefined ? String(opts.port) : "";
   st.els.px_domain.value = "hk24panel.isusz.com";
@@ -90,6 +91,7 @@ function mkSandbox(opts) {
     pxSearch: "",
     api: async (method, url, body) => {
       st.calls.push(method + " " + url);
+      if (method === "POST" && url === "/api/proxy") st.postBody = body;
       if (!st.fetchImpl) return { ok: true, msg: "代理已添加", proxy: { id: "abc123", domain: "hk24panel.isusz.com", target_port: 42608 } };
       return st.fetchImpl(method, url, body);
     },
@@ -186,7 +188,24 @@ async function run() {
           "反代目标不是面板端口（IP 直连不受影响）→ 不跳转");
   }
 
+  console.log("── ⑧ 新建反代的「禁止 IP 直连」默认值（护栏三）");
+  {
+    const { sb, st } = mkSandbox({ issueCert: false, blockIp: true, port: 8080 });
+    await sb.addProxy();
+    check(!!st.postBody && st.postBody.block_ip === true,
+          "表单默认勾选「禁止 IP 直连」→ 添加请求带 block_ip:true（新建即显示「禁止IP访问中」）",
+          JSON.stringify(st.postBody));
+  }
+  {
+    const { sb, st } = mkSandbox({ issueCert: false, blockIp: false, port: 8080 });
+    await sb.addProxy();
+    check(!!st.postBody && st.postBody.block_ip === false,
+          "取消勾选 → block_ip:false（允许 IP 直连）", JSON.stringify(st.postBody));
+  }
+
   console.log("── ⑦ 源码级：文案与默认值");
+  check(/id="px_blockip" checked/.test(html),
+        "添加表单存在「禁止 IP 直连」勾选框且默认勾上");
   check(/id="px_issue_cert" checked/.test(html), "添加表单的「立即申请证书」勾选框默认勾上");
   check(/<option value="">不引用已有证书（用本域名自己的）<\/option>/.test(js),
         "证书下拉首项不再写「自动申请」（改为不引用已有证书）");
