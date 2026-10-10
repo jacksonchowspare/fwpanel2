@@ -5338,13 +5338,38 @@ function pxEditPortWarn() {
 }
 // 面板自身端口的反代签好证书后，直连 IP:端口 会被自动关闭 → 当前页面会「哑掉」，
 // 主动把用户送到 https://域名（否则他只会看到「点什么都没反应」）。
-function maybeJumpToPanelDomain(domain, targetPort) {
+// 判定：目标端口 == 面板自身端口 且 当前是通过 IP 访问（在域名上就不用跳）。
+// ⚠ 用户明确要求：**只有加面板自己的反代才自动跳转**，加普通反代（指向应用/别的服务）不要跳。
+function panelPortJumpTarget(domain, targetPort) {
   const pp = (status && status.panel_port) || 0;
-  if (!domain || !pp || Number(targetPort) !== Number(pp)) return false;
-  if (!/^\d+\.\d+\.\d+\.\d+$/.test(location.hostname)) return false;
-  const url = "https://" + domain + "/";
-  toast("证书已签发：面板直连 IP:端口 已按设计关闭，2.5 秒后跳到 " + url, "okk");
-  setTimeout(() => { location.href = url; }, 2500);
+  if (!domain || !pp || Number(targetPort) !== Number(pp)) return null;
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(location.hostname)) return null;
+  return "https://" + domain + "/";
+}
+// v3.3.27（用户实测「添加面板反代后卡在那里不动」）：证书一签好，面板端口的公网直连就被关掉，
+// 而当前页面正是走 IP:端口 的 —— 它接着要轮询 /api/tasks/<id> 看申请结果，那条连接此时被防火墙
+// **静默丢包**（不报错、不返回）→ 页面永久卡住，写在轮询成功分支里的跳转永远走不到。
+// 修法：**不等面板 API 回话**，直接在页面里探测域名通道（https 握手成功即说明证书已就绪），
+// 通了自己跳过去；全程不依赖那条已经不通的连接。探测不到就留在原地给出提示（不乱跳）。
+function waitAndJumpToDomain(domain, targetPort, tries) {
+  const url = panelPortJumpTarget(domain, targetPort);
+  if (!url) return false;
+  toast("面板直连将随证书就绪而关闭：正在等 " + url + " 可用，可用后自动跳转…");
+  const max = tries || 40;      // 40 × 3s ≈ 2 分钟
+  let n = 0;
+  const tick = async () => {
+    n++;
+    try {
+      // 证书没签好时 443 是兜底 ssl_reject_handshake（直接拒绝握手）→ 探测必定失败；
+      // 证书签发后同地址即可访问（no-cors：只要不是网络错误就算通）
+      await fetch(url, { mode: "no-cors", cache: "no-store" });
+      location.href = url;
+      return;
+    } catch (e) { /* 还没就绪，继续等 */ }
+    if (n < max) { setTimeout(tick, 3000); return; }
+    toast("域名通道还没就绪（证书可能没签成 / 解析不对），请稍后手动打开 " + url, "err");
+  };
+  setTimeout(tick, 3000);
   return true;
 }
 async function addProxy() {
@@ -5361,12 +5386,18 @@ async function addProxy() {
     const p = d.proxy || {};
     $("px_domain").value = ""; $("px_host").value = ""; $("px_port").value = "";
     pxPortWarn();
-    if (wantCert && p.id) {
+    if (wantCert && p.id && panelPortJumpTarget(p.domain, p.target_port)) {
+      // 面板自己的反代：证书就绪后当前这条 IP 通道会被关闭 → 别等它回话（会卡住），改探测域名后自动跳
+      waitAndJumpToDomain(p.domain, p.target_port);
+      apiTask("POST", "/api/proxy/" + p.id, { action: "ssl", email: "" }).catch(e2 => {
+        toast("证书申请未完成：" + e2.message + "（可在列表 SSL 列点『申请证书』重试）", "err");
+      });
+    } else if (wantCert && p.id) {
       // v3.3.25：勾了「立即申请证书」就顺手申请（旧版这里从不申请，只有 SSL 列的按钮会 → 用户以为在申请）
       toast("代理已添加，正在为 " + p.domain + " 申请证书（HTTP-01，约 10-60 秒）...");
       try {
         const r = await apiTask("POST", "/api/proxy/" + p.id, { action: "ssl", email: "" });
-        if (!maybeJumpToPanelDomain(p.domain, p.target_port)) toast(r.msg || "证书已申请", "okk");
+        toast(r.msg || "证书已申请", "okk");
       } catch (e2) {
         toast("代理已添加，但证书申请失败：" + e2.message + "（可在列表 SSL 列点『申请证书』重试）", "err");
       }
@@ -5390,17 +5421,24 @@ async function delProxy(id) {
 async function issueSsl(id) {
   const email = prompt("请输入邮箱（用于证书过期通知，可留空）：", "");
   if (email === null) return;
+  // v3.3.27：面板自身端口的反代 —— 先判断要不要跳（要跳就探测定域通道，不等可能需要重连的 API）
+  let px = null;
+  try {
+    const dl = await api("GET", "/api/proxy");
+    px = (dl.proxies || []).find(x => x.id === id) || null;
+  } catch (e0) { /* 拿不到就按普通反代走 */ }
+  if (px && waitAndJumpToDomain(px.domain, px.target_port)) {
+    apiTask("POST", "/api/proxy/" + id, { action: "ssl", email }).catch(e2 => {
+      toast("证书申请未完成：" + e2.message + "（可再点一次『申请证书』）", "err");
+    });
+    loadCerts();
+    return;
+  }
   toast("⏳ 证书申请中（约 10-60 秒），请稍候...");
   try {
     const d = await apiTask("POST", "/api/proxy/" + id, { action: "ssl", email });
     toast(d.msg || "证书已申请", "okk");
     loadProxy(); loadCerts();
-    // v3.3.25：该反代若指向面板自身端口，证书就绪后直连会被关闭 → 主动跳到 https://域名，别让页面哑掉
-    try {
-      const dl = await api("GET", "/api/proxy");
-      const px = (dl.proxies || []).find(x => x.id === id);
-      if (px && maybeJumpToPanelDomain(px.domain, px.target_port)) return;
-    } catch (e3) { /* 跳转失败不阻断原有跳转逻辑 */ }
     // 证书生效后 nginx 会把 http 301 到 https——域名访问时主动跳转 https，避免列表状态停留在旧页面
     if (location.protocol === "http:" && !/^\d+\.\d+\.\d+\.\d+$/.test(location.hostname)) {
       setTimeout(() => { location.href = location.href.replace(/^http:/, "https:"); }, 800);

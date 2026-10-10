@@ -48,7 +48,8 @@ function check(cond, label, extra) {
   else { fail++; console.log("  ✗ " + label + (extra ? "  → " + extra : "")); }
 }
 
-const NEEDED = ["addProxy", "proxyPanelPortWarnText", "pxPortWarn", "maybeJumpToPanelDomain"];
+const NEEDED = ["addProxy", "proxyPanelPortWarnText", "pxPortWarn",
+                "panelPortJumpTarget", "waitAndJumpToDomain"];
 const srcs = {};
 for (const n of NEEDED) {
   srcs[n] = extractFn(n);
@@ -59,7 +60,7 @@ for (const n of NEEDED) {
 function mkSandbox(opts) {
   opts = opts || {};
   const st = {
-    els: {}, calls: [], toasts: [], timers: [],
+    els: {}, calls: [], toasts: [], timers: [], fetches: [], fetchFail: true,
     fetchImpl: null,
   };
   const el = (id) => (st.els[id] = st.els[id] || {
@@ -89,10 +90,12 @@ function mkSandbox(opts) {
     loadCertOptions: async () => {},
     pxPage: 1,
     pxSearch: "",
+    // 域名通道探测用（waitAndJumpToDomain）：默认失败=证书还没就绪
+    fetch: async (url) => { st.fetches.push(url); if (st.fetchFail) throw new Error("Failed to fetch"); return { ok: true, type: "opaque" }; },
     api: async (method, url, body) => {
       st.calls.push(method + " " + url);
       if (method === "POST" && url === "/api/proxy") st.postBody = body;
-      if (!st.fetchImpl) return { ok: true, msg: "代理已添加", proxy: { id: "abc123", domain: "hk24panel.isusz.com", target_port: 42608 } };
+      if (!st.fetchImpl) return { ok: true, msg: "代理已添加", proxy: { id: "abc123", domain: "hk24panel.isusz.com", target_port: 8080 } };
       return st.fetchImpl(method, url, body);
     },
     apiTask: async (method, url, body) => {
@@ -165,27 +168,49 @@ async function run() {
           "目标不是面板端口 → 不显示任何警告");
   }
 
-  console.log("── ⑥ 面板端口反代签好证书后的自动跳转（防页面「哑掉」）");
+  console.log("── ⑥ 面板端口反代：探测域名通道就绪后自动跳转（v3.3.27，防页面「哑掉」）");
+  const flush = () => new Promise(r => setTimeout(r, 8));
   {
+    // IP 访问 + 指向面板端口 → 启动探测；第一次探测失败（证书没好）→ 继续等；第二次成功 → 跳转
     const { sb, st } = mkSandbox({ hostname: "101.32.40.219", panelPort: 42608 });
-    const jumped = sb.maybeJumpToPanelDomain("hk24panel.isusz.com", 42608);
-    check(jumped === true, "从 IP 访问 + 反代指向面板端口 → 决定跳转");
-    check(st.timers.length === 1 && st.timers[0].ms === 2500, "延迟 2.5 秒再跳（先让提示可见）");
-    st.timers[0].fn();
+    const started = sb.waitAndJumpToDomain("hk24panel.isusz.com", 42608, 5);
+    check(started === true, "IP 访问 + 反代指向面板端口 → 启动等待");
+    check(st.timers.length === 1 && st.timers[0].ms === 3000, "先等 3 秒再探测（不阻塞页面）");
+    st.timers.shift().fn();            // 第 1 次探测
+    await flush();
+    check(st.fetches.length === 1 && st.fetches[0] === "https://hk24panel.isusz.com/",
+          "探测的是 https://域名/（证书没就绪时 443 会拒绝握手 → 判定为未就绪）", JSON.stringify(st.fetches));
+    check(st.timers.length === 1, "未就绪 → 继续等下一轮（不跳）");
+    st.fetchFail = false;              // 证书签好了
+    st.timers.shift().fn();            // 第 2 次探测
+    await flush();
+    await flush();
     check(sb.location.href === "https://hk24panel.isusz.com/",
-          "跳转目标 = https://域名/", sb.location.href);
-    check(st.toasts.some(t => /直连 IP:端口 已按设计关闭/.test(t.msg)),
-          "跳转前有明确提示（说明为什么跳）");
+          "探测通 → 跳到 https://域名/", sb.location.href);
+    check(st.toasts.some(x => /自动跳转/.test(x.msg)), "跳转前有明确提示（说明为什么跳）");
   }
   {
+    // 一直是域名访问 → 不跳
     const { sb, st } = mkSandbox({ hostname: "hk24panel.isusz.com", panelPort: 42608 });
-    check(sb.maybeJumpToPanelDomain("hk24panel.isusz.com", 42608) === false && st.timers.length === 0,
-          "已经是域名访问 → 不跳转");
+    check(sb.waitAndJumpToDomain("hk24panel.isusz.com", 42608) === false && st.timers.length === 0,
+          "已经在域名上访问 → 不跳转");
   }
   {
+    // 普通反代（目标不是面板端口）→ 一律不跳（用户明确要求）
     const { sb, st } = mkSandbox({ hostname: "101.32.40.219", panelPort: 42608 });
-    check(sb.maybeJumpToPanelDomain("app.example.com", 8080) === false && st.timers.length === 0,
-          "反代目标不是面板端口（IP 直连不受影响）→ 不跳转");
+    check(sb.waitAndJumpToDomain("app.example.com", 8080) === false && st.timers.length === 0,
+          "普通反代（目标=应用端口）→ 不自动跳转，页面留在原地");
+  }
+  {
+    // 探测到头都不通（证书没签成）→ 留在原地 + 明确提示，不乱跳到一个打不开的地址
+    const { sb, st } = mkSandbox({ hostname: "101.32.40.219", panelPort: 42608 });
+    sb.waitAndJumpToDomain("hk24panel.isusz.com", 42608, 2);
+    st.timers.shift().fn(); await flush();
+    st.timers.shift().fn(); await flush();
+    await flush();
+    check(sb.location.href === "", "全都不通 → 不跳转（留在能用的页面上）");
+    check(st.toasts.some(x => x.kind === "err" && /还没就绪/.test(x.msg)),
+          "给出「域名通道还没就绪」的明确提示", JSON.stringify(st.toasts));
   }
 
   console.log("── ⑧ 新建反代的「禁止 IP 直连」默认值（护栏三）");
@@ -201,6 +226,20 @@ async function run() {
     await sb.addProxy();
     check(!!st.postBody && st.postBody.block_ip === false,
           "取消勾选 → block_ip:false（允许 IP 直连）", JSON.stringify(st.postBody));
+  }
+
+  {
+    // 目标 = 面板端口：不等签发结果（那条 IP 连接随时会被关掉），直接进入「等域名就绪」
+    const { sb, st } = mkSandbox({ issueCert: true, certRef: "", port: 42608, panelPort: 42608 });
+    st.fetchImpl = (m, u) => (u === "/api/proxy"
+      ? { ok: true, msg: "代理已添加", proxy: { id: "p1", domain: "hk24panel.isusz.com", target_port: 42608 } }
+      : null);
+    await sb.addProxy();
+    check(st.timers.length >= 1 && st.toasts.some(x => /正在等/.test(x.msg)),
+          "目标=面板端口的添加 → 直接进入「等域名就绪」模式，不再干等可能已断的 API",
+          JSON.stringify(st.toasts));
+    check(st.calls.some(c => c.startsWith("TASK")),
+          "证书申请照常发起（后台任务继续跑，页面跳走也不影响）");
   }
 
   console.log("── ⑦ 源码级：文案与默认值");
