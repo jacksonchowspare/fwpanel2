@@ -1661,6 +1661,13 @@ window.addEventListener("error", function (ev) {
       <div style="color:#eab308;font-size:12px;line-height:1.7;margin-bottom:12px">
         ⚠ 命令里的令牌只显示这一次；丢了就在探针后台「重发令牌」，再用新命令装一次。
       </div>
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px">
+        <button class="btn" id="probe_auto_btn" onclick="doProbeAutoInstall()">在这台节点上自动安装</button>
+        <span id="probe_auto_hint" style="color:var(--muted);font-size:12px;line-height:1.6"></span>
+      </div>
+      <pre id="probe_log" style="display:none;max-height:180px;overflow:auto;background:var(--input-bg,#123);
+        border:1px solid var(--border);border-radius:8px;padding:10px 12px;font-size:12px;line-height:1.6;
+        white-space:pre-wrap;word-break:break-all;margin:0 0 10px"></pre>
     </div>
     <div class="btnrow">
       <button class="btn ghost" onclick="closeProbeModal()">关闭</button>
@@ -2741,12 +2748,16 @@ async function saveProbeCfg() {
   } catch (e) { toast(e.message, "err"); }
 }
 let PROBE_NODE = null;
+let PROBE_RESULT = { server: "", token: "" };
 function openProbeInstall(n) {
   PROBE_NODE = n;
   $("probe_form").style.display = "";
   $("probe_result").style.display = "none";
   $("probe_gen_btn").style.display = "";
   $("probe_copy_btn").style.display = "none";
+  $("probe_log").style.display = "none";
+  $("probe_log").textContent = "";
+  $("probe_auto_btn").disabled = false;
   $("probe_alias").value = n.name || "";
   $("probe_group").value = "";
   $("probe_tag").value = "";
@@ -2764,17 +2775,59 @@ async function doProbeProvision() {
   $("probe_gen_btn").disabled = true;
   try {
     const d = await api("POST", "/api/probe/provision", body);
+    PROBE_RESULT = { server: d.server || "", token: d.token || "" };
     $("probe_cmd").textContent = d.command || "";
     $("probe_form").style.display = "none";
     $("probe_result").style.display = "";
     $("probe_gen_btn").style.display = "none";
     $("probe_copy_btn").style.display = "";
+    updateProbeAuto();
   } catch (e) {
     toast(e.message, "err");
   } finally {
     $("probe_gen_btn").disabled = false;
   }
 }
+function updateProbeAuto() {
+  const btn = $("probe_auto_btn"), hint = $("probe_auto_hint");
+  const v = (PROBE_NODE && PROBE_NODE.version) || "";
+  // 简单版本比较：把各段补齐后逐段比
+  const parts = s => (s || "0").split(".").map(n => parseInt(n, 10) || 0);
+  const cmp = (a, b) => { const x = parts(a), y = parts(b); for (let i = 0; i < 3; i++) { if ((x[i]||0) !== (y[i]||0)) return (x[i]||0) - (y[i]||0); } return 0; };
+  if (!v) {
+    btn.style.display = "none";
+    hint.textContent = "这台节点现在探测不到（离线或地址不通），只能用下面的命令手动装。";
+  } else if (cmp(v, "3.3.31") < 0) {
+    btn.style.display = "none";
+    hint.textContent = `节点面板是 v${v}，要 v3.3.31 以上才能远程装；先用下面的命令手动装，或先把面板升级。`;
+  } else {
+    btn.style.display = "";
+    hint.textContent = `节点 v${v}，点左边按钮由它自己下载安装（约 10–30 秒）。`;
+  }
+}
+async function doProbeAutoInstall() {
+  if (!PROBE_NODE || !PROBE_RESULT.token) return;
+  const btn = $("probe_auto_btn"), log = $("probe_log");
+  btn.disabled = true;
+  log.style.display = "";
+  log.textContent = "正在让节点下载并安装探针…";
+  try {
+    const d = await api("POST", "/api/fed/" + PROBE_NODE.id + "/api/probe/install",
+                        { server: PROBE_RESULT.server, token: PROBE_RESULT.token });
+    log.textContent = (d.output || "") + (d.ok ? `\n\n✓ 安装完成，agent 版本 ${d.version || "?"}` : "\n\n✗ 安装失败");
+    btn.style.display = "none";
+    $("probe_auto_hint").textContent = d.ok
+      ? "已装好，30 秒内这张卡就会出现在探针状态页上。"
+      : "自动安装失败，可以复制下面的命令手动装（看上面日志找原因）。";
+    toast(d.ok ? "探针已装好" : "安装失败", d.ok ? "ok" : "err");
+  } catch (e) {
+    log.textContent = "调用失败：" + e.message + "\n（节点可能离线，或面板版本低于 v3.3.31）";
+    toast(e.message, "err");
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function copyProbeCmd() {
   const t = $("probe_cmd").textContent || "";
   navigator.clipboard.writeText(t).then(() => toast("命令已复制"), () => toast("复制失败，请手动选中", "err"));

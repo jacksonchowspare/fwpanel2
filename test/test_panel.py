@@ -4959,6 +4959,56 @@ class TestProbeCenter(unittest.TestCase):
         code, d = self._req("POST", "/api/probe/provision", {"alias": "  "})
         self.assertEqual(code, 400)
 
+    def test_6_node_install_endpoint(self):
+        """节点侧装探针：未登录 401、参数校验 400、正常路径真的去跑安装脚本"""
+        code, _ = self._req_static("POST", "/api/probe/install", {"server": "https://x", "token": "abcdefgh1234"})
+        self.assertEqual(code, 401)
+        code, d = self._req("POST", "/api/probe/install", {"server": "ftp://x", "token": "abcdefgh1234"})
+        self.assertEqual(code, 400)
+        code, d = self._req("POST", "/api/probe/install", {"server": "https://x", "token": "bad token!"})
+        self.assertEqual(code, 400)
+
+        calls = []
+
+        def fake_run(args, **kw):
+            calls.append((args, kw.get("input")))
+            if any("systemctl" in str(a) for a in args):
+                return types.SimpleNamespace(returncode=0, stdout="active\n", stderr="")
+            return types.SimpleNamespace(returncode=0, stdout="装好了\n", stderr="")
+
+        with unittest.mock.patch.object(panel, "_probe_fetch_script",
+                                        lambda *a, **k: "#!/bin/bash\n# fwprobe installer\nexit 0\n"), \
+             unittest.mock.patch.object(panel.subprocess, "run", fake_run), \
+             unittest.mock.patch("os.geteuid", return_value=0):
+            code, d = self._req("POST", "/api/probe/install",
+                                {"server": "https://probe.test", "token": "abcdefgh1234"})
+        self.assertEqual(code, 200, d)
+        self.assertTrue(d["ok"])
+        self.assertIn("装好了", d["output"])
+        bash_call = [c for c in calls if c[0][0] == "/bin/bash"][0]
+        self.assertIn("--token", bash_call[0])
+        self.assertIn("abcdefgh1234", bash_call[0])
+        self.assertIn("fwprobe installer", bash_call[1])      # 脚本走 stdin，不拼 shell
+
+        # 卸载：带 --uninstall，且不需要 token
+        calls.clear()
+        with unittest.mock.patch.object(panel, "_probe_fetch_script",
+                                        lambda *a, **k: "#!/bin/bash\n# fwprobe installer\nexit 0\n"), \
+             unittest.mock.patch.object(panel.subprocess, "run", fake_run), \
+             unittest.mock.patch("os.geteuid", return_value=0):
+            code, d = self._req("POST", "/api/probe/uninstall", {"server": "https://probe.test"})
+        self.assertEqual(code, 200, d)
+        self.assertIn("--uninstall", [c for c in calls if c[0][0] == "/bin/bash"][0][0])
+
+    def test_7_node_install_requires_root(self):
+        """面板不是 root 就明确拒绝，别装一半"""
+        with unittest.mock.patch.object(panel, "_probe_fetch_script",
+                                        lambda *a, **k: "#!/bin/bash\n# fwprobe\n"), \
+             unittest.mock.patch("os.geteuid", return_value=1000):
+            code, d = self._req("POST", "/api/probe/install",
+                                {"server": "https://probe.test", "token": "abcdefgh1234"})
+        self.assertEqual(code, 403)
+
     def test_5_provision_requires_config(self):
         cfg = self.cfg
         old_url = cfg.get("probe_url")

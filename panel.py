@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.30"
+CURRENT_VERSION = "3.3.31"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -726,6 +726,13 @@ class Auth:
         self.config.set("fed_hash", "")
 
 
+def _probe_fetch_script(url, timeout=30):
+    """取 iProbe 的 install-agent.sh 文本（单独抽出来便于测试打桩）"""
+    req = urllib.request.Request(url, headers={"User-Agent": "fwpanel2"})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+
 # ------------------------------- 联邦存储（主面板侧节点配置） -------------------------------
 
 FED_NODES_FILE = os.path.join(BASE_DIR, "fed_nodes.json")
@@ -744,6 +751,8 @@ FED_LONG_TASK_PREFIXES = (
     "/api/sites/",                       # v3.0.0：网站文件上传/解压可能较慢
     "/api/backup/",                      # v3.3.0：备份/恢复可能很久（否则主控 25s 假超时）
     "/api/backup",
+    "/api/probe/install",                # v3.3.31：在节点上装 iProbe 探针（下载+装服务，可能一两分钟）
+    "/api/probe/uninstall",
 )
 
 
@@ -9297,6 +9306,80 @@ class PanelHandler(BaseHTTPRequestHandler):
         log(f"iProbe 探针：已为「{alias}」在中心建节点 {out.get('id')}")
         self._send(200, out)
 
+    # ---------- 节点侧：本机安装 / 卸载 iProbe 探针（主面板经联邦代理调用） ----------
+    def _run_agent_installer(self, server, token, uninstall=False):
+        """下载中心的 install-agent.sh 并执行；脚本走 stdin、参数走 argv（不拼 shell 字符串，免注入）"""
+        if os.geteuid() != 0:
+            self._send(403, {"error": "面板不是以 root 运行，装不了探针"})
+            return
+        url = server + "/install-agent.sh"
+        try:
+            script = _probe_fetch_script(url)
+        except Exception as e:
+            self._send(502, {"error": f"下载安装脚本失败（{type(e).__name__}）：{url}"})
+            return
+        if "fwprobe" not in script:
+            self._send(502, {"error": "下载到的安装脚本不是 iProbe 的，已中止"})
+            return
+        args = ["/bin/bash", "-s", "--", "--server", server]
+        if uninstall:
+            args.append("--uninstall")
+        else:
+            args += ["--token", token]
+        try:
+            r = subprocess.run(args, input=script, capture_output=True, text=True, timeout=600)
+        except subprocess.TimeoutExpired:
+            self._send(504, {"error": "安装超时（10 分钟）"})
+            return
+        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        ok = r.returncode == 0
+        version = ""
+        try:
+            with open("/usr/local/lib/fwprobe-agent/agent.py", encoding="utf-8") as fh:
+                for line in fh:
+                    if line.startswith("VERSION"):
+                        version = line.split("=")[1].strip().strip('"')
+                        break
+        except OSError:
+            pass
+        active = False
+        if not uninstall:
+            try:
+                active = subprocess.run(["/bin/systemctl", "is-active", "fwprobe-agent"],
+                                        capture_output=True, text=True, timeout=10).stdout.strip() == "active"
+            except Exception:
+                active = False
+            if ok and not active:
+                ok = False
+                out += "\n[面板校验] 脚本说完成了，但 fwprobe-agent 没在运行"
+        log(f"iProbe 探针{'卸载' if uninstall else '安装'}（本机）：{'成功' if ok else '失败'} 版本={version or '-'}")
+        self._send(200 if ok else 500, {"ok": ok, "version": version, "active": active,
+                                        "output": out[-1800:]})
+
+    def _api_probe_install(self):
+        if self._require_auth() is None:
+            return
+        data = self._read_json()
+        server = (data.get("server") or "").strip().rstrip("/")
+        token = (data.get("token") or "").strip()
+        if not (server.startswith("https://") or server.startswith("http://")):
+            self._send(400, {"error": "server 需以 http(s):// 开头"})
+            return
+        if not re.fullmatch(r"[A-Za-z0-9_\-]{8,128}", token or ""):
+            self._send(400, {"error": "token 格式不对"})
+            return
+        self._run_agent_installer(server, token, uninstall=False)
+
+    def _api_probe_uninstall(self):
+        if self._require_auth() is None:
+            return
+        data = self._read_json()
+        server = (data.get("server") or "").strip().rstrip("/")
+        if not (server.startswith("https://") or server.startswith("http://")):
+            self._send(400, {"error": "server 需以 http(s):// 开头"})
+            return
+        self._run_agent_installer(server, "", uninstall=True)
+
     def _api_fed_node_add(self):
         """添加节点：预探测连通+令牌，成功后落盘"""
         if self._require_local() is None:
@@ -9683,6 +9766,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_probe_config_set()
         elif path == "/api/probe/provision":
             self._api_probe_provision()
+        elif path == "/api/probe/install":
+            self._api_probe_install()
+        elif path == "/api/probe/uninstall":
+            self._api_probe_uninstall()
         elif path == "/api/fed":
             self._api_fed_manage()
         elif path == "/api/term/key":
