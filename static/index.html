@@ -2814,7 +2814,9 @@ async function doProbeAutoInstall() {
   try {
     const d = await api("POST", "/api/fed/" + PROBE_NODE.id + "/api/probe/install",
                         { server: PROBE_RESULT.server, token: PROBE_RESULT.token });
-    log.textContent = (d.output || "") + (d.ok ? `\n\n✓ 安装完成，agent 版本 ${d.version || "?"}` : "\n\n✗ 安装失败");
+    // 安装脚本输出带 ANSI 颜色码，终端里好看，塞进 pre 块全是乱码 → 先剥掉
+    const clean = (d.output || "").replace(/\x1b\[[0-9;]*m/g, "");
+    log.textContent = clean + (d.ok ? `\n\n✓ 安装完成，agent 版本 ${d.version || "?"}` : "\n\n✗ 安装失败");
     btn.style.display = "none";
     $("probe_auto_hint").textContent = d.ok
       ? "已装好，30 秒内这张卡就会出现在探针状态页上。"

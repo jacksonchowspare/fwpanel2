@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.31"
+CURRENT_VERSION = "3.3.32"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -9331,7 +9331,7 @@ class PanelHandler(BaseHTTPRequestHandler):
         except subprocess.TimeoutExpired:
             self._send(504, {"error": "安装超时（10 分钟）"})
             return
-        out = ((r.stdout or "") + (r.stderr or "")).strip()
+        out = re.sub(r"\x1b\[[0-9;]*m", "", ((r.stdout or "") + (r.stderr or ""))).strip()
         ok = r.returncode == 0
         version = ""
         try:
