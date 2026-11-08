@@ -5336,14 +5336,24 @@ function pxEditPortWarn() {
   el.innerHTML = proxyPanelPortWarnText(pxeTargetPort, sel ? sel.value : "", pxeCertExists);
   el.style.display = el.innerHTML ? "block" : "none";
 }
-// 面板自身端口的反代签好证书后，直连 IP:端口 会被自动关闭 → 当前页面会「哑掉」，
-// 主动把用户送到 https://域名（否则他只会看到「点什么都没反应」）。
-// 判定：目标端口 == 面板自身端口 且 当前是通过 IP 访问（在域名上就不用跳）。
-// ⚠ 用户明确要求：**只有加面板自己的反代才自动跳转**，加普通反代（指向应用/别的服务）不要跳。
-function panelPortJumpTarget(domain, targetPort) {
-  const pp = (status && status.panel_port) || 0;
-  if (!domain || !pp || Number(targetPort) !== Number(pp)) return null;
-  if (!/^\d+\.\d+\.\d+\.\d+$/.test(location.hostname)) return null;
+// 证书就绪后该把用户送到哪个地址（null = 什么都不做）。
+// 只有两种情况需要主动跳：
+//  ① **IP:面板端口 + 这条反代指向面板自身端口** —— 证书就绪后直连会被防火墙关掉，
+//     不跳等于把用户留在一个马上失效的入口上（v3.3.27）；
+//  ② **http://域名 + 这条反代就是这个域名** —— 证书就绪后 nginx 把 80 301 到 443，
+//     但已经加载好的页面不会自己升级，只能主动跳，否则用户只能自己补 https（v3.3.29 补）。
+// 其余一律不动：普通反代、已经是 https、域名不匹配（用户明确要求「只有加面板自己的反代才自动跳转」）。
+function httpsJumpTarget(domain, targetPort) {
+  if (!domain) return null;
+  const host = String(location.hostname || "").toLowerCase();
+  const dom = String(domain).toLowerCase();
+  if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) {
+    const pp = (status && status.panel_port) || 0;
+    if (pp && Number(targetPort) === Number(pp)) return "https://" + domain + "/";
+    return null;                                  // IP 上访问普通反代 → 不打断用户
+  }
+  if (location.protocol !== "http:") return null; // 已经 https 了不用再跳
+  if (host !== dom) return null;                  // 不在这个域名上，别乱跳
   return "https://" + domain + "/";
 }
 // v3.3.27（用户实测「添加面板反代后卡在那里不动」）：证书一签好，面板端口的公网直连就被关掉，
@@ -5352,9 +5362,11 @@ function panelPortJumpTarget(domain, targetPort) {
 // 修法：**不等面板 API 回话**，直接在页面里探测域名通道（https 握手成功即说明证书已就绪），
 // 通了自己跳过去；全程不依赖那条已经不通的连接。探测不到就留在原地给出提示（不乱跳）。
 function waitAndJumpToDomain(domain, targetPort, tries) {
-  const url = panelPortJumpTarget(domain, targetPort);
+  const url = httpsJumpTarget(domain, targetPort);
   if (!url) return false;
-  toast("面板直连将随证书就绪而关闭：正在等 " + url + " 可用，可用后自动跳转…");
+  const onIp = /^\d+\.\d+\.\d+\.\d+$/.test(String(location.hostname || ""));
+  toast(onIp ? "面板直连将随证书就绪而关闭：正在等 " + url + " 可用，可用后自动跳转…"
+             : "证书就绪后会自动切到 " + url + "（当前页面还是 http）…");
   const max = tries || 40;      // 40 × 3s ≈ 2 分钟
   let n = 0;
   const tick = async () => {
@@ -5386,24 +5398,27 @@ async function addProxy() {
     const p = d.proxy || {};
     $("px_domain").value = ""; $("px_host").value = ""; $("px_port").value = "";
     pxPortWarn();
-    if (wantCert && p.id && panelPortJumpTarget(p.domain, p.target_port)) {
-      // 面板自己的反代：证书就绪后当前这条 IP 通道会被关闭 → 别等它回话（会卡住），改探测域名后自动跳
-      waitAndJumpToDomain(p.domain, p.target_port);
-      apiTask("POST", "/api/proxy/" + p.id, { action: "ssl", email: "" }).catch(e2 => {
-        toast("证书申请未完成：" + e2.message + "（可在列表 SSL 列点『申请证书』重试）", "err");
-      });
-    } else if (wantCert && p.id) {
+    // 先决定「要不要把用户送到 https」：面板端口反代（证书就绪后直连会被关掉）或
+    // 当前就在这个域名的 http 页面上（证书就绪后 80 会 301，页面不会自己升级）。
+    const jumped = p.id ? waitAndJumpToDomain(p.domain, p.target_port) : false;
+    if (wantCert && p.id) {
       // v3.3.25：勾了「立即申请证书」就顺手申请（旧版这里从不申请，只有 SSL 列的按钮会 → 用户以为在申请）
-      toast("代理已添加，正在为 " + p.domain + " 申请证书（HTTP-01，约 10-60 秒）...");
-      try {
-        const r = await apiTask("POST", "/api/proxy/" + p.id, { action: "ssl", email: "" });
-        toast(r.msg || "证书已申请", "okk");
-      } catch (e2) {
-        toast("代理已添加，但证书申请失败：" + e2.message + "（可在列表 SSL 列点『申请证书』重试）", "err");
+      const task = apiTask("POST", "/api/proxy/" + p.id, { action: "ssl", email: "" });
+      if (jumped) {
+        // 已经在等跳转：这条连接可能随时被关掉，不要拿它的结果去提示（提示也送不到用户眼前）
+        task.catch(e2 => toast("证书申请未完成：" + e2.message + "（可在列表 SSL 列点『申请证书』重试）", "err"));
+      } else {
+        toast("代理已添加，正在为 " + p.domain + " 申请证书（HTTP-01，约 10-60 秒）...");
+        try {
+          const r = await task;
+          toast(r.msg || "证书已申请", "okk");
+        } catch (e2) {
+          toast("代理已添加，但证书申请失败：" + e2.message + "（可在列表 SSL 列点『申请证书』重试）", "err");
+        }
       }
     } else {
-      const extra = $("px_cert").value ? "" : "（证书尚未申请，点列表 SSL 列『申请证书』即可）";
-      toast((d.msg || "代理已添加") + extra, "okk");
+      const extra = ($("px_cert").value || jumped) ? "" : "（证书尚未申请，点列表 SSL 列『申请证书』即可）";
+      if (!jumped) toast((d.msg || "代理已添加") + extra, "okk");
     }
     loadProxy(); renderRules(); loadCerts();
   } catch (e) { toast(e.message, "err"); }

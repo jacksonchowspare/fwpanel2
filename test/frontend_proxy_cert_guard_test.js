@@ -16,7 +16,8 @@
  *  ⑤ 目标是面板自身端口时：无证书 → 红字警告写明 https 会握手失败 + 直连会被关闭；
  *     有证书 → 提示直连将关闭；端口不是面板端口 → 不提示；
  *  ⑥ 面板端口反代签好证书后：从 IP 进面板的页面要主动跳到 https://域名（否则页面「哑掉」）；
- *     已经是域名访问则不跳；
+ *     http://域名 进面板的页面也要主动升级到 https（v3.3.29，否则用户只能手输地址）；
+ *     已 https / 域名不匹配 / 普通反代 一律不跳；
  *  ⑦ 源码级：证书下拉首项不再叫「自动申请」、SSL 列无证书时显示「未申请」、勾选框默认勾上。
  *
  * 用法：node frontend_proxy_cert_guard_test.js [index.html]
@@ -49,7 +50,7 @@ function check(cond, label, extra) {
 }
 
 const NEEDED = ["addProxy", "proxyPanelPortWarnText", "pxPortWarn",
-                "panelPortJumpTarget", "waitAndJumpToDomain"];
+                "httpsJumpTarget", "waitAndJumpToDomain"];
 const srcs = {};
 for (const n of NEEDED) {
   srcs[n] = extractFn(n);
@@ -190,10 +191,43 @@ async function run() {
     check(st.toasts.some(x => /自动跳转/.test(x.msg)), "跳转前有明确提示（说明为什么跳）");
   }
   {
-    // 一直是域名访问 → 不跳
-    const { sb, st } = mkSandbox({ hostname: "hk24panel.isusz.com", panelPort: 42608 });
+    // http://域名 上操作面板（v3.3.29 用户实测场景）：证书签好后 80 → 443，页面必须自己升级
+    const { sb, st } = mkSandbox({ hostname: "hk24panel.isusz.com", protocol: "http:", panelPort: 42608 });
+    check(sb.httpsJumpTarget("hk24panel.isusz.com", 42608) === "https://hk24panel.isusz.com/",
+          "http://同域名 访问 → 判定出 https 目标");
+    const started = sb.waitAndJumpToDomain("hk24panel.isusz.com", 42608, 3);
+    check(started === true && st.timers.length === 1, "启动等待（先探测再跳，不盲跳）");
+    st.fetchFail = false;
+    st.timers.shift().fn();
+    await flush(); await flush();
+    check(sb.location.href === "https://hk24panel.isusz.com/",
+          "https 探测通过 → 自动跳到 https（不用手输地址）", sb.location.href);
+  }
+  {
+    // 已经是 https → 不跳（避免刷新循环）
+    const { sb, st } = mkSandbox({ hostname: "hk24panel.isusz.com", protocol: "https:", panelPort: 42608 });
     check(sb.waitAndJumpToDomain("hk24panel.isusz.com", 42608) === false && st.timers.length === 0,
-          "已经在域名上访问 → 不跳转");
+          "已经是 https://域名 → 不跳转（不会反复刷新）");
+  }
+  {
+    // http 域名上给「别的域名」建反代 → 不跳（用户明确要求：普通反代不打断当前页面）
+    const { sb, st } = mkSandbox({ hostname: "panel.example.com", protocol: "http:", panelPort: 42608 });
+    check(sb.waitAndJumpToDomain("app.example.com", 8080) === false && st.timers.length === 0,
+          "http://A域名 上给 B域名 建反代 → 不跳转");
+  }
+  {
+    // 在 http://域名 上添加面板自身反代 + 勾选申请 → 直接进入等待，而不是干等 API
+    const { sb, st } = mkSandbox({ issueCert: true, certRef: "", port: 42608, panelPort: 42608,
+                                   hostname: "hk24panel.isusz.com", protocol: "http:" });
+    st.fetchImpl = (m, u) => (u === "/api/proxy"
+      ? { ok: true, msg: "代理已添加", proxy: { id: "p2", domain: "hk24panel.isusz.com", target_port: 42608 } }
+      : null);
+    await sb.addProxy();
+    check(st.timers.length >= 1 && st.toasts.some(x => /自动切到 https/.test(x.msg)),
+          "http://域名 上添加面板反代 → 出现「证书就绪后自动切到 https」提示并开始探测",
+          JSON.stringify(st.toasts));
+    check(st.calls.some(c => c.startsWith("TASK") && c.includes('"action":"ssl"')),
+          "证书申请照常发起（跳转不影响签发）");
   }
   {
     // 普通反代（目标不是面板端口）→ 一律不跳（用户明确要求）
