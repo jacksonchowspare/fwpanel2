@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.32"
+CURRENT_VERSION = "3.3.33"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -8900,6 +8900,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._send(200, {"ok": True})
         elif path == "/api/probe/config":
             self._api_probe_config_get()
+        elif path == "/api/probe/state":
+            self._api_probe_state()
+        elif path == "/api/probe/nodes":
+            self._api_probe_nodes()
         elif path == "/api/fed":
             self._api_fed_status()
         elif path == "/api/fed/nodes":
@@ -9333,6 +9337,18 @@ class PanelHandler(BaseHTTPRequestHandler):
             return
         out = re.sub(r"\x1b\[[0-9;]*m", "", ((r.stdout or "") + (r.stderr or ""))).strip()
         ok = r.returncode == 0
+        version, active = self._probe_local_state()
+        if not uninstall:
+            if ok and not active:
+                ok = False
+                out += "\n[面板校验] 脚本说完成了，但 fwprobe-agent 没在运行"
+        log(f"iProbe 探针{'卸载' if uninstall else '安装'}（本机）：{'成功' if ok else '失败'} 版本={version or '-'}")
+        self._send(200 if ok else 500, {"ok": ok, "version": version, "active": active,
+                                        "output": out[-1800:]})
+
+    @staticmethod
+    def _probe_local_state():
+        """本机探针状态：(版本, 服务是否在跑)。装完复查、以及主面板按钮显示都靠它。"""
         version = ""
         try:
             with open("/usr/local/lib/fwprobe-agent/agent.py", encoding="utf-8") as fh:
@@ -9341,20 +9357,80 @@ class PanelHandler(BaseHTTPRequestHandler):
                         version = line.split("=")[1].strip().strip('"')
                         break
         except OSError:
-            pass
+            version = ""
         active = False
-        if not uninstall:
+        try:
+            active = subprocess.run(["/bin/systemctl", "is-active", "fwprobe-agent"],
+                                    capture_output=True, text=True, timeout=10).stdout.strip() == "active"
+        except Exception:
+            active = False
+        return version, active
+
+    def _api_probe_state(self):
+        """本机是否装了探针（主面板据此把按钮显示成「卸载探针」）"""
+        if self._require_auth() is None:
+            return
+        version, active = self._probe_local_state()
+        self._send(200, {"installed": bool(version), "version": version, "active": active})
+
+    def _probe_center_get(self, path):
+        """带供应令牌调中心 GET，返回 (ok, dict)"""
+        url = (self.server.config.get("probe_url") or "").rstrip("/")
+        tok = self.server.config.get("probe_token") or ""
+        if not url or not tok:
+            return False, {"error": "未配置探针中心"}
+        req = urllib.request.Request(url + path, method="GET")
+        req.add_header("Authorization", "Bearer " + tok)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                return True, json.loads(resp.read() or b"{}")
+        except Exception as e:
+            return False, {"error": f"{type(e).__name__}"}
+
+    def _api_probe_nodes(self):
+        """主面板：中心里已有哪些探针节点（按钮兜底判断用；不必等节点面板升到 3.3.33）"""
+        if self._require_local() is None:
+            return
+        ok, out = self._probe_center_get("/api/provision/nodes")
+        if not ok:
+            self._send(502, {"error": out.get("error", "中心不可达")})
+            return
+        self._send(200, {"nodes": out.get("nodes") or []})
+
+    def _api_probe_remove(self):
+        """主面板：探针卸完后把中心里的节点记录一起删掉（用供应令牌，不需要管理 token）"""
+        if self._require_local() is None:
+            return
+        data = self._read_json()
+        alias = (data.get("alias") or "").strip()
+        if not alias:
+            self._send(400, {"error": "alias 必填"})
+            return
+        url = (self.server.config.get("probe_url") or "").rstrip("/")
+        tok = self.server.config.get("probe_token") or ""
+        if not url or not tok:
+            self._send(400, {"error": "未配置探针中心"})
+            return
+        body = json.dumps({"alias": alias}).encode()
+        req = urllib.request.Request(url + "/api/provision/remove", data=body, method="POST")
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Authorization", "Bearer " + tok)
+        try:
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                out = json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
             try:
-                active = subprocess.run(["/bin/systemctl", "is-active", "fwprobe-agent"],
-                                        capture_output=True, text=True, timeout=10).stdout.strip() == "active"
+                detail = json.loads(e.read() or b"{}").get("error", "")
             except Exception:
-                active = False
-            if ok and not active:
-                ok = False
-                out += "\n[面板校验] 脚本说完成了，但 fwprobe-agent 没在运行"
-        log(f"iProbe 探针{'卸载' if uninstall else '安装'}（本机）：{'成功' if ok else '失败'} 版本={version or '-'}")
-        self._send(200 if ok else 500, {"ok": ok, "version": version, "active": active,
-                                        "output": out[-1800:]})
+                detail = ""
+            self._send(400 if e.code == 404 else 502,
+                       {"error": detail or f"中心返回 {e.code}"})
+            return
+        except Exception as e:
+            self._send(502, {"error": f"连不上探针中心（{type(e).__name__}）"})
+            return
+        log(f"iProbe 中心节点已删除：{alias}")
+        self._send(200, {"ok": True, "removed": out.get("removed", "")})
 
     def _api_probe_install(self):
         if self._require_auth() is None:
@@ -9770,6 +9846,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_probe_install()
         elif path == "/api/probe/uninstall":
             self._api_probe_uninstall()
+        elif path == "/api/probe/remove":
+            self._api_probe_remove()
         elif path == "/api/fed":
             self._api_fed_manage()
         elif path == "/api/term/key":

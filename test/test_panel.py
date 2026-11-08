@@ -4844,6 +4844,19 @@ class TestProbeCenter(unittest.TestCase):
             def log_message(self, *a):
                 pass
 
+            def do_GET(self):
+                TestProbeCenter.received.append({"path": self.path,
+                                                 "auth": self.headers.get("Authorization", ""),
+                                                 "body": {}})
+                raw = json.dumps({"ok": True, "nodes": [
+                    {"id": "abc123", "alias": "新加坡SG1-Oracle", "groups": ["SG"],
+                     "agent_ver": "0.5.11", "online": True}]}).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
             def do_POST(self):
                 n = int(self.headers.get("Content-Length") or 0)
                 body = self.rfile.read(n) if n else b"{}"
@@ -4999,6 +5012,53 @@ class TestProbeCenter(unittest.TestCase):
             code, d = self._req("POST", "/api/probe/uninstall", {"server": "https://probe.test"})
         self.assertEqual(code, 200, d)
         self.assertIn("--uninstall", [c for c in calls if c[0][0] == "/bin/bash"][0][0])
+
+    def test_8_probe_state_endpoint(self):
+        """节点侧探针状态：主面板据此把按钮显示成「卸载探针」"""
+        code, _ = self._req_static("GET", "/api/probe/state")
+        self.assertEqual(code, 401)
+        with unittest.mock.patch.object(panel.PanelHandler, "_probe_local_state",
+                                        return_value=("0.5.11", True)):
+            code, d = self._req("GET", "/api/probe/state")
+        self.assertEqual(code, 200, d)
+        self.assertTrue(d["installed"])
+        self.assertEqual(d["version"], "0.5.11")
+        self.assertTrue(d["active"])
+        with unittest.mock.patch.object(panel.PanelHandler, "_probe_local_state",
+                                        return_value=("", False)):
+            code, d = self._req("GET", "/api/probe/state")
+        self.assertFalse(d["installed"])
+
+    def test_9_probe_center_nodes_endpoint(self):
+        """老节点面板没有 /api/probe/state 时，用中心节点列表兜底判断"""
+        code, _ = self._req_static("GET", "/api/probe/nodes")
+        self.assertEqual(code, 401)
+        TestProbeCenter.received.clear()
+        TestProbeCenter.center_status = 200
+        code, d = self._req("GET", "/api/probe/nodes")
+        self.assertEqual(code, 200, d)
+        got = [x for x in TestProbeCenter.received if x["path"].endswith("/api/provision/nodes")]
+        self.assertEqual(len(got), 1)
+        self.assertTrue(got[0]["auth"].startswith("Bearer pv_"))
+
+    def test_9b_probe_remove_endpoint(self):
+        """卸载后让中心删节点：走供应令牌，浏览器不接触令牌"""
+        TestProbeCenter.received.clear()
+        TestProbeCenter.center_status = 200
+        code, d = self._req("POST", "/api/probe/remove", {"alias": "新加坡SG1-Oracle"})
+        self.assertEqual(code, 200, d)
+        got = [x for x in TestProbeCenter.received if x["path"].endswith("/api/provision/remove")]
+        self.assertEqual(len(got), 1)
+        self.assertEqual(got[0]["body"]["alias"], "新加坡SG1-Oracle")
+        self.assertTrue(got[0]["auth"].startswith("Bearer pv_"))
+        # 别名必填
+        code, d = self._req("POST", "/api/probe/remove", {"alias": "  "})
+        self.assertEqual(code, 400)
+        # 中心 404 → 面板回 400 并带原因
+        TestProbeCenter.center_status = 404
+        code, d = self._req("POST", "/api/probe/remove", {"alias": "x"})
+        self.assertEqual(code, 400)
+        TestProbeCenter.center_status = 200
 
     def test_7_node_install_requires_root(self):
         """面板不是 root 就明确拒绝，别装一半"""
