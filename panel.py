@@ -9411,7 +9411,8 @@ class PanelHandler(BaseHTTPRequestHandler):
         if not url or not tok:
             self._send(400, {"error": "未配置探针中心"})
             return
-        body = json.dumps({"alias": alias}).encode()
+        body = json.dumps({"alias": alias,
+                           "source": (data.get("source") or "").strip()}).encode()
         req = urllib.request.Request(url + "/api/provision/remove", data=body, method="POST")
         req.add_header("Content-Type", "application/json")
         req.add_header("Authorization", "Bearer " + tok)

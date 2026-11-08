@@ -2728,7 +2728,7 @@ function fedCardEl(n) {
   const btns = document.createElement("div");
   btns.id = "fed_btns_" + n.id;
   btns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;margin-top:2px";
-  const mk = (txt, cls, fn) => { const b = document.createElement("button"); b.className = "btn mini" + (cls ? " " + cls : ""); b.textContent = txt; b.onclick = fn; btns.appendChild(b); };
+  const mk = (txt, cls, fn) => { const b = document.createElement("button"); b.className = "btn mini" + (cls ? " " + cls : ""); b.textContent = txt; b.onclick = fn; btns.appendChild(b); return b; };
   mk("管理此节点", "", () => enterFed(n));
   const pb = mk("安装探针", "", () => (NODE_PROBE[n.id] && NODE_PROBE[n.id].installed
     ? openProbeUninstall(n) : openProbeInstall(n)));
@@ -2822,7 +2822,7 @@ async function doProbeUninstall() {
     log.textContent = (d.output || "").replace(/\x1b\[[0-9;]*m/g, "");
     if (!d.ok) throw new Error("节点侧卸载失败，日志见上方");
     try {
-      await api("POST", "/api/probe/remove", { alias: n.name || "" });
+      await api("POST", "/api/probe/remove", { alias: n.name || "", source: n.id });
       log.textContent += "\n\n✓ 已从探针中心移除该节点";
     } catch (e2) {
       log.textContent += "\n\n⚠ 节点侧已卸载，但中心记录没删掉：" + e2.message +
@@ -2860,7 +2860,7 @@ async function doProbeProvision() {
   if (!PROBE_CFG.url) { closeProbeModal(); openProbeCfg(); toast("先配置探针中心地址和供应令牌", "err"); return; }
   const alias = $("probe_alias").value.trim();
   if (!alias) { toast("探针别名必填", "err"); return; }
-  const body = { alias, group: $("probe_group").value.trim() };
+  const body = { alias, group: $("probe_group").value.trim(), source: (PROBE_NODE && PROBE_NODE.id) || "" };
   const tag = $("probe_tag").value.trim();
   if (tag) body.tags = [{ t: tag }];
   $("probe_gen_btn").disabled = true;

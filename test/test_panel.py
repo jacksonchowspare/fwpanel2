@@ -5050,6 +5050,7 @@ class TestProbeCenter(unittest.TestCase):
         got = [x for x in TestProbeCenter.received if x["path"].endswith("/api/provision/remove")]
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]["body"]["alias"], "新加坡SG1-Oracle")
+        self.assertIn("source", got[0]["body"])          # 带面板节点 id，中心按它精确匹配
         self.assertTrue(got[0]["auth"].startswith("Bearer pv_"))
         # 别名必填
         code, d = self._req("POST", "/api/probe/remove", {"alias": "  "})
