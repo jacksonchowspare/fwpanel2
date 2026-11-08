@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """fwpanel 单元测试 + HTTP API 冒烟测试（无需 root，使用临时目录 + dry-run）"""
+import http.server
 import json
 import os
 import shutil
@@ -4829,6 +4830,145 @@ class TestFed(unittest.TestCase):
             panel.DRY_RUN = real_dry
             panel.shutil.which = real_which
             panel.time.sleep = real_sleep
+
+
+class TestProbeCenter(unittest.TestCase):
+    """iProbe 探针中心：配置保存 + 按需建节点（用一个假中心验证客户端逻辑）"""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.received = []
+        cls.center_status = 200
+
+        class FakeCenter(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = self.rfile.read(n) if n else b"{}"
+                try:
+                    data = json.loads(body or b"{}")
+                except ValueError:
+                    data = {}
+                TestProbeCenter.received.append({
+                    "path": self.path,
+                    "auth": self.headers.get("Authorization", ""),
+                    "body": data})
+                code = TestProbeCenter.center_status
+                if code == 200:
+                    out = {"id": "abc123", "token": "tok-xyz", "server": "https://probe.test",
+                           "command": "curl -fsSL https://probe.test/install-agent.sh | sudo bash -s -- --token tok-xyz --server https://probe.test"}
+                else:
+                    out = {"error": "供应令牌无效"}
+                raw = json.dumps(out).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+
+        cls.center = http.server.ThreadingHTTPServer(("127.0.0.1", 17993), FakeCenter)
+        threading.Thread(target=cls.center.serve_forever, daemon=True).start()
+
+        cls.cfg = make_cfg(user="probeuser", pwd="ProbePass123", mode="strict")
+        cls.cfg.data["port"] = 17994
+        cls.cfg.data["probe_url"] = ""
+        cls.cfg.data["probe_token"] = ""
+        cls.store = panel.RuleStore(); cls.store.rules = []
+        cls.nft = panel.NFTManager(cls.store, cls.cfg)
+        cls.auth = panel.Auth(cls.cfg)
+        cls.server = panel.PanelServer(("127.0.0.1", 17994), panel.PanelHandler,
+                                       cls.cfg, cls.store, cls.nft, cls.auth)
+        threading.Thread(target=cls.server.serve_forever, daemon=True).start()
+        cls.base = "http://127.0.0.1:17994"
+        code, d = cls._req_static("POST", "/api/login",
+                                  {"username": "probeuser", "password": "ProbePass123"})
+        cls.tok = d["token"]
+
+    @classmethod
+    def _req_static(cls, method, path, data=None, token=None, fed=None):
+        r = urllib.request.Request(cls.base + path, method=method)
+        if token:
+            r.add_header("Authorization", "Bearer " + token)
+        if fed:
+            r.add_header(panel.FED_HEADER, fed)
+        body = None
+        if data is not None:
+            body = json.dumps(data).encode()
+            r.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(r, body, timeout=15) as resp:
+                return resp.status, json.loads(resp.read() or b"{}")
+        except urllib.error.HTTPError as e:
+            try:
+                return e.code, json.loads(e.read() or b"{}")
+            except Exception:
+                return e.code, {}
+
+    def _req(self, method, path, data=None, token=None, fed=None):
+        return self._req_static(method, path, data, token or self.tok, fed)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.server.shutdown(); cls.server.server_close()
+        cls.center.shutdown(); cls.center.server_close()
+
+    def test_1_config_requires_login(self):
+        code, _ = self._req_static("GET", "/api/probe/config")
+        self.assertEqual(code, 401)
+        # 联邦令牌也不行（这是主面板本机配置）
+        code, _ = self._req_static("GET", "/api/probe/config", fed="whatever")
+        self.assertEqual(code, 401)
+
+    def test_2_config_save_and_read(self):
+        code, d = self._req("POST", "/api/probe/config",
+                            {"url": "http://127.0.0.1:17993/", "token": "pv_test"})
+        self.assertEqual(code, 200, d)
+        self.assertEqual(d["url"], "http://127.0.0.1:17993")
+        self.assertTrue(d["token_set"])
+        code, d = self._req("GET", "/api/probe/config")
+        self.assertEqual(d["url"], "http://127.0.0.1:17993")
+        self.assertTrue(d["token_set"])
+        # 地址必须是 http(s)
+        code, d = self._req("POST", "/api/probe/config", {"url": "ftp://x"})
+        self.assertEqual(code, 400)
+
+    def test_3_provision_creates_and_returns_command(self):
+        TestProbeCenter.received.clear()
+        TestProbeCenter.center_status = 200
+        code, d = self._req("POST", "/api/probe/provision",
+                            {"alias": "香港-探针", "group": "HK", "tags": [{"t": "免费"}]})
+        self.assertEqual(code, 200, d)
+        self.assertIn("install-agent.sh", d["command"])
+        self.assertEqual(len(TestProbeCenter.received), 1)
+        got = TestProbeCenter.received[0]
+        self.assertEqual(got["path"], "/api/provision/node")
+        self.assertEqual(got["auth"], "Bearer pv_test")     # 令牌不下发浏览器
+        self.assertEqual(got["body"]["alias"], "香港-探针")
+        self.assertEqual(got["body"]["groups"], ["HK"])
+        self.assertEqual(got["body"]["tags"], [{"t": "免费"}])
+
+    def test_4_provision_errors(self):
+        TestProbeCenter.center_status = 401
+        code, d = self._req("POST", "/api/probe/provision", {"alias": "x"})
+        self.assertEqual(code, 400)
+        self.assertIn("供应令牌", d.get("error", ""))
+        TestProbeCenter.center_status = 200
+        # 别名为空
+        code, d = self._req("POST", "/api/probe/provision", {"alias": "  "})
+        self.assertEqual(code, 400)
+
+    def test_5_provision_requires_config(self):
+        cfg = self.cfg
+        old_url = cfg.get("probe_url")
+        cfg.set("probe_url", "")
+        try:
+            code, d = self._req("POST", "/api/probe/provision", {"alias": "x"})
+            self.assertEqual(code, 400)
+            self.assertIn("探针中心", d.get("error", ""))
+        finally:
+            cfg.set("probe_url", old_url)
 
 
 class TestTasks(unittest.TestCase):

@@ -56,7 +56,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
 # ------------------------------- 常量与路径 -------------------------------
-CURRENT_VERSION = "3.3.29"
+CURRENT_VERSION = "3.3.30"
 PANEL_START_TS = time.time()   # 进程启动时间（/api/version 用来判断"是否刚重启"）
 
 # 面板进程的时间一律跟随**系统时区**（/etc/localtime）。
@@ -8889,6 +8889,8 @@ class PanelHandler(BaseHTTPRequestHandler):
             if token:
                 self.server.auth.logout(token)
             self._send(200, {"ok": True})
+        elif path == "/api/probe/config":
+            self._api_probe_config_get()
         elif path == "/api/fed":
             self._api_fed_status()
         elif path == "/api/fed/nodes":
@@ -9217,6 +9219,83 @@ class PanelHandler(BaseHTTPRequestHandler):
                 "token_set": bool(n.get("token"))}
                for nid, n in nodes.items()]
         self._send(200, {"nodes": lst})
+
+    # ---------- iProbe 探针中心（按需给节点装探针） ----------
+    def _probe_conf(self):
+        return ((self.server.config.get("probe_url") or "").rstrip("/"),
+                self.server.config.get("probe_token") or "")
+
+    def _api_probe_config_get(self):
+        if self._require_local() is None:
+            return
+        url, tok = self._probe_conf()
+        self._send(200, {"url": url, "token_set": bool(tok)})
+
+    def _api_probe_config_set(self):
+        if self._require_local() is None:
+            return
+        data = self._read_json()
+        url = (data.get("url") or "").strip().rstrip("/")
+        tok = (data.get("token") or "").strip()
+        if url and not (url.startswith("https://") or url.startswith("http://")):
+            self._send(400, {"error": "中心地址需以 http:// 或 https:// 开头"})
+            return
+        cfg = self.server.config
+        if url:
+            cfg.set("probe_url", url)
+        if tok:                              # 留空 = 不改已有令牌
+            cfg.set("probe_token", tok)
+        if data.get("clear"):
+            cfg.set("probe_token", "")
+        log(f"iProbe 探针中心配置已更新：{url or '(未改地址)'}")
+        self._send(200, {"ok": True, "url": (cfg.get("probe_url") or "").rstrip("/"),
+                         "token_set": bool(cfg.get("probe_token"))})
+
+    def _api_probe_provision(self):
+        """让探针中心建一个节点，返回可直接执行的安装命令（令牌只在中心与面板之间走，不下发浏览器）"""
+        if self._require_local() is None:
+            return
+        url, tok = self._probe_conf()
+        if not url or not tok:
+            self._send(400, {"error": "还没配置探针中心地址和供应令牌"})
+            return
+        data = self._read_json()
+        alias = (data.get("alias") or "").strip()[:40]
+        if not alias:
+            self._send(400, {"error": "探针别名必填"})
+            return
+        body = {"alias": alias}
+        if data.get("groups"):
+            body["groups"] = data["groups"]
+        elif data.get("group"):
+            body["groups"] = [str(data["group"]).strip()]
+        if data.get("tags"):
+            body["tags"] = data["tags"]
+        try:
+            req = urllib.request.Request(url + "/api/provision/node",
+                                         data=json.dumps(body, ensure_ascii=False).encode(),
+                                         method="POST")
+            req.add_header("Content-Type", "application/json")
+            req.add_header("Authorization", "Bearer " + tok)
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                out = json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = json.loads(e.read().decode("utf-8", "replace")).get("error", "")
+            except Exception:
+                pass
+            if e.code == 401:
+                self._send(400, {"error": "探针中心拒绝了供应令牌（可能已删除），请重新生成并更新配置"})
+            else:
+                self._send(e.code if e.code < 500 else 502,
+                           {"error": detail or f"探针中心返回 {e.code}"})
+            return
+        except Exception as e:
+            self._send(502, {"error": f"连不上探针中心（{type(e).__name__}）：{url}"})
+            return
+        log(f"iProbe 探针：已为「{alias}」在中心建节点 {out.get('id')}")
+        self._send(200, out)
 
     def _api_fed_node_add(self):
         """添加节点：预探测连通+令牌，成功后落盘"""
@@ -9600,6 +9679,10 @@ class PanelHandler(BaseHTTPRequestHandler):
             self._api_docker_compose_down()
         elif path == "/api/docker/dirs":
             self._api_docker_dirs_create()
+        elif path == "/api/probe/config":
+            self._api_probe_config_set()
+        elif path == "/api/probe/provision":
+            self._api_probe_provision()
         elif path == "/api/fed":
             self._api_fed_manage()
         elif path == "/api/term/key":

@@ -1566,6 +1566,12 @@ window.addEventListener("error", function (ev) {
       </div>
       <div id="fed_cards" style="display:flex;flex-direction:column;gap:10px"></div>
 
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;font-size:12px;color:var(--muted);margin:14px 0 0;padding-top:12px;border-top:1px dashed var(--border)">
+        <span>iProbe 探针中心：</span>
+        <span id="probe_state">读取中…</span>
+        <button class="btn mini ghost" onclick="openProbeCfg()">配置</button>
+      </div>
+
       <div style="border-top:1px dashed var(--border);margin:18px 0 12px"></div>
       <div style="display:flex;align-items:center;font-size:13px;font-weight:600;margin-bottom:6px"><svg class="h-ico-sm" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg> 本机联邦令牌（本机作为节点被其他面板管理）</div>
       <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">
@@ -1613,6 +1619,53 @@ window.addEventListener("error", function (ev) {
     <div class="btnrow">
       <button class="btn ghost" onclick="closeFedModal()">取消</button>
       <button class="btn" onclick="saveFedNode()">校验并保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- iProbe 探针中心配置 -->
+<div id="probe_cfg_modal" class="modal-mask hidden">
+  <div class="modal" style="width:480px">
+    <h3>iProbe 探针中心</h3>
+    <div class="form-row"><input id="probe_url" placeholder="中心地址 https://status.example.com"
+      style="font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"></div>
+    <div class="form-row"><input id="probe_token" placeholder="供应令牌 pv_…（留空 = 不修改）"
+      style="font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace"></div>
+    <div style="color:var(--muted);font-size:12px;margin-bottom:12px;line-height:1.7">
+      供应令牌在探针中心本机生成：<code style="font-family:'0xProto',monospace">probe.py ptoken add fwpanel2</code>，
+      只能用来建节点，不能改其他配置；不需要了用 <code style="font-family:'0xProto',monospace">probe.py ptoken rm &lt;id&gt;</code> 吊销。
+    </div>
+    <div class="btnrow">
+      <button class="btn ghost" onclick="closeProbeCfg()">取消</button>
+      <button class="btn" onclick="saveProbeCfg()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 安装探针 -->
+<div id="probe_modal" class="modal-mask hidden">
+  <div class="modal" style="width:520px">
+    <h3>安装 iProbe 探针</h3>
+    <div id="probe_form">
+      <div class="form-row"><input id="probe_alias" placeholder="探针别名（状态页上显示的名字）" maxlength="40"></div>
+      <div class="form-row"><input id="probe_group" placeholder="分组（可留空，如 HK / 生产）" maxlength="20"></div>
+      <div class="form-row"><input id="probe_tag" placeholder="自定义标签（可留空，如 免费 / $49.99/mo）" maxlength="24"></div>
+      <div style="color:var(--muted);font-size:12px;margin-bottom:12px;line-height:1.7">
+        只对这台机器装探针，其他节点不受影响。生成后把命令贴到该机器的 root shell 执行即可。
+      </div>
+    </div>
+    <div id="probe_result" style="display:none">
+      <div style="background:var(--input-bg,#123);border:1px solid var(--border);border-radius:8px;padding:12px 14px;
+        font-family:'0xProto',ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.5px;word-break:break-all;
+        line-height:1.6;margin-bottom:8px" id="probe_cmd">-</div>
+      <div style="color:#eab308;font-size:12px;line-height:1.7;margin-bottom:12px">
+        ⚠ 命令里的令牌只显示这一次；丢了就在探针后台「重发令牌」，再用新命令装一次。
+      </div>
+    </div>
+    <div class="btnrow">
+      <button class="btn ghost" onclick="closeProbeModal()">关闭</button>
+      <button class="btn" id="probe_copy_btn" style="display:none" onclick="copyProbeCmd()">复制命令</button>
+      <button class="btn" id="probe_gen_btn" onclick="doProbeProvision()">生成安装命令</button>
     </div>
   </div>
 </div>
@@ -2606,6 +2659,7 @@ async function renderFed() {
     }
     d.nodes.forEach(n => box.appendChild(fedCardEl(n)));
     d.nodes.forEach(n => fedProbeOne(n));
+    loadProbeState();
     fedLoaded = true;
   } catch (e) {
     fedLoaded = false;   // 渲染失败(如登录态过期/网络)可重试,不残留"已渲染"标记
@@ -2647,6 +2701,7 @@ function fedCardEl(n) {
   btns.style.cssText = "display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;margin-top:2px";
   const mk = (txt, cls, fn) => { const b = document.createElement("button"); b.className = "btn mini" + (cls ? " " + cls : ""); b.textContent = txt; b.onclick = fn; btns.appendChild(b); };
   mk("管理此节点", "", () => enterFed(n));
+  mk("安装探针", "", () => openProbeInstall(n));
   // 编辑:与反代代理列表的编辑按钮同款样式(accent 实底 mini)
   const eb = document.createElement("button");
   eb.className = "btn mini";
@@ -2658,6 +2713,73 @@ function fedCardEl(n) {
   card.appendChild(btns);
   return card;
 }
+/* ---------- iProbe 探针中心：配置 / 按需安装 ---------- */
+let PROBE_CFG = { url: "", token_set: false };
+async function loadProbeState() {
+  try {
+    PROBE_CFG = await api("GET", "/api/probe/config");
+    const el = $("probe_state");
+    if (el) el.innerHTML = PROBE_CFG.url
+      ? "已配置 <b style=\"color:var(--text)\">" + esc(PROBE_CFG.url) + "</b>" + (PROBE_CFG.token_set ? "" : "（缺少令牌）")
+      : "未配置 —— 点「配置」填中心地址和供应令牌";
+  } catch (e) { /* 未登录时不打扰 */ }
+}
+function openProbeCfg() {
+  $("probe_url").value = PROBE_CFG.url || "";
+  $("probe_token").value = "";
+  $("probe_cfg_modal").classList.remove("hidden");
+}
+function closeProbeCfg() { $("probe_cfg_modal").classList.add("hidden"); }
+async function saveProbeCfg() {
+  const url = $("probe_url").value.trim(), tok = $("probe_token").value.trim();
+  try {
+    const d = await api("POST", "/api/probe/config", { url, token: tok });
+    PROBE_CFG = { url: d.url, token_set: d.token_set };
+    closeProbeCfg();
+    loadProbeState();
+    toast("探针中心配置已保存");
+  } catch (e) { toast(e.message, "err"); }
+}
+let PROBE_NODE = null;
+function openProbeInstall(n) {
+  PROBE_NODE = n;
+  $("probe_form").style.display = "";
+  $("probe_result").style.display = "none";
+  $("probe_gen_btn").style.display = "";
+  $("probe_copy_btn").style.display = "none";
+  $("probe_alias").value = n.name || "";
+  $("probe_group").value = "";
+  $("probe_tag").value = "";
+  $("probe_modal").classList.remove("hidden");
+  if (!PROBE_CFG.url) loadProbeState();
+}
+function closeProbeModal() { $("probe_modal").classList.add("hidden"); }
+async function doProbeProvision() {
+  if (!PROBE_CFG.url) { closeProbeModal(); openProbeCfg(); toast("先配置探针中心地址和供应令牌", "err"); return; }
+  const alias = $("probe_alias").value.trim();
+  if (!alias) { toast("探针别名必填", "err"); return; }
+  const body = { alias, group: $("probe_group").value.trim() };
+  const tag = $("probe_tag").value.trim();
+  if (tag) body.tags = [{ t: tag }];
+  $("probe_gen_btn").disabled = true;
+  try {
+    const d = await api("POST", "/api/probe/provision", body);
+    $("probe_cmd").textContent = d.command || "";
+    $("probe_form").style.display = "none";
+    $("probe_result").style.display = "";
+    $("probe_gen_btn").style.display = "none";
+    $("probe_copy_btn").style.display = "";
+  } catch (e) {
+    toast(e.message, "err");
+  } finally {
+    $("probe_gen_btn").disabled = false;
+  }
+}
+function copyProbeCmd() {
+  const t = $("probe_cmd").textContent || "";
+  navigator.clipboard.writeText(t).then(() => toast("命令已复制"), () => toast("复制失败，请手动选中", "err"));
+}
+
 async function fedProbeOne(n) {
   const dot = $("fed_dot_" + n.id), met = $("fed_met_" + n.id);
   if (!dot) return;   // 卡片未渲染(静默刷新时可能被删),跳过
