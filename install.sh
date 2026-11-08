@@ -23,7 +23,7 @@ set -Eeuo pipefail
 
 # ------------------------------ 常量 ------------------------------
 readonly SCRIPT_NAME="FW-Panel2 VPS管理面板2.0安装包"
-readonly SCRIPT_VERSION="3.3.27"
+readonly SCRIPT_VERSION="3.3.28"
 readonly RAW_INSTALL_URL="https://raw.githubusercontent.com/jacksonchowspare/fwpanel2/main/install.sh"
 readonly WRAPPER_PATH="${FW_WRAPPER:-/usr/local/bin/fwp}"   # 快捷命令（由本脚本生成/卸载时删除）
 readonly CACHED_SCRIPT_NAME="install.sh"            # 缓存到 $APP_DIR 下的脚本副本
@@ -1110,23 +1110,144 @@ except Exception:
 EOF
 }
 
+# ------------------------- 本机 / 公网地址探测 -------------------------
+# 云主机（Oracle / AWS / 阿里云 / 腾讯云…）的网卡上只有内网地址（10.x / 172.x），
+# 安装收尾只打内网地址，用户还得自己去控制台翻公网 IP —— 这里补一条公网探测：
+#   ① 网卡本身就是公网地址 → 直接用（公网直连的 VPS 零延迟，绝大多数机器走这条）
+#   ② 网卡是内网 → 先问云厂商元数据（链路本地，秒级内，且是权威值）
+#   ③ 仍拿不到 → 再问公共回显服务（每个源最多 3 秒，全失败静默返回空，绝不打断安装）
+# 结果缓存 24 小时（默认 $ETC_DIR/public_ip.cache），避免每次进菜单都出网。
+# 环境变量：FW_NO_PUBLIC_IP=1 关掉探测；FW_PUBLIC_IP_CACHE=<文件> 换缓存路径。
+local_ip() {   # 默认路由出口网卡的 IPv4（取不到则第一个非回环地址），失败输出空
+    local ip=""
+    ip="$({ ip route get 1.1.1.1 2>/dev/null || true; } | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1 || true)"
+    if [ -z "$ip" ]; then
+        ip="$({ hostname -I 2>/dev/null || true; } | awk '{print $1}' || true)"
+    fi
+    printf '%s\n' "$ip"
+}
+
+_is_ipv4() {
+    case "$1" in ''|*[!0-9.]*) return 1 ;; esac
+    if printf '%s\n' "$1" | awk -F. 'NF != 4 { exit 1 } { for (i = 1; i <= 4; i++) if ($i == "" || $i > 255) exit 1 }' >/dev/null 2>&1; then
+        return 0
+    fi
+    return 1
+}
+
+_is_public_ipv4() {   # 合法 IPv4 且不是私网/回环/链路本地/CGNAT
+    _is_ipv4 "$1" || return 1
+    case "$1" in
+        10.*|127.*|169.254.*|192.168.*|0.*|255.*) return 1 ;;
+        172.1[6-9].*|172.2[0-9].*|172.3[01].*)    return 1 ;;
+        100.6[4-9].*|100.[7-9][0-9].*|100.1[0-1][0-9].*|100.12[0-7].*) return 1 ;;
+    esac
+    return 0
+}
+
+_is_private_ipv4() {   # 合法 IPv4 但不是公网地址（含 10/172.16-31/192.168/100.64/CGNAT）
+    _is_ipv4 "$1" || return 1
+    _is_public_ipv4 "$1" && return 1
+    return 0
+}
+
+_http_get() {   # $1=url $2=超时秒 $3=可选 HTTP 头；失败一律输出空、绝不报错
+    local url="$1" t="${2:-3}" hdr="${3:-}"
+    if command -v curl >/dev/null 2>&1; then
+        if [ -n "$hdr" ]; then
+            curl -fsS -4 --connect-timeout "$t" --max-time "$t" -H "$hdr" "$url" 2>/dev/null || true
+        else
+            curl -fsS -4 --connect-timeout "$t" --max-time "$t" "$url" 2>/dev/null || true
+        fi
+    elif command -v wget >/dev/null 2>&1; then
+        wget -q -4 -T "$t" -t 1 -O - "$url" 2>/dev/null || true
+    fi
+}
+
+detect_public_ip() {   # 输出公网 IPv4；判定不出来就输出空（最坏约 8 秒，不阻塞安装）
+    if [ "${FW_NO_PUBLIC_IP:-0}" = "1" ]; then return 0; fi
+    local cache="${FW_PUBLIC_IP_CACHE:-$ETC_DIR/public_ip.cache}"
+    local cand="" body="" u mt now
+    # ① 缓存（24 小时内直接复用）
+    if [ -s "$cache" ]; then
+        mt="$(stat -c %Y "$cache" 2>/dev/null || echo 0)"
+        now="$(date +%s)"
+        if [ "$mt" -gt 0 ] && [ $((now - mt)) -lt 86400 ]; then
+            cand="$(head -n 1 "$cache" 2>/dev/null | tr -d '[:space:]' || true)"
+            if _is_public_ipv4 "$cand"; then
+                printf '%s\n' "$cand"
+                return 0
+            fi
+        fi
+    fi
+    cand=""
+    # ② 云厂商元数据（链路本地地址，1 秒超时；问到的就是权威值）
+    body="$(_http_get "http://169.254.169.254/opc/v2/vnics/" 1 "Authorization: Bearer Oracle")"   # Oracle Cloud
+    if [ -n "$body" ]; then
+        cand="$(printf '%s' "$body" | grep -oE '"publicIp"[[:space:]]*:[[:space:]]*"[0-9.]+"' | head -1 | grep -oE '[0-9]+(\.[0-9]+){3}' || true)"
+    fi
+    if ! _is_public_ipv4 "$cand"; then   # AWS EC2
+        cand="$(_http_get "http://169.254.169.254/latest/meta-data/public-ipv4" 1 | tr -d '[:space:]' || true)"
+    fi
+    if ! _is_public_ipv4 "$cand"; then   # 阿里云
+        cand="$(_http_get "http://100.100.100.200/latest/meta-data/eipv4" 1 | tr -d '[:space:]' || true)"
+    fi
+    if ! _is_public_ipv4 "$cand"; then   # 腾讯云
+        cand="$(_http_get "http://metadata.tencentyun.com/latest/meta-data/public-ipv4" 1 | tr -d '[:space:]' || true)"
+    fi
+    if ! _is_public_ipv4 "$cand"; then   # Google Cloud
+        cand="$(_http_get "http://169.254.169.254/computeMetadata/v1/instance/network-interfaces/0/access-configs/0/external-ip" 1 "Metadata-Flavor: Google" | tr -d '[:space:]' || true)"
+    fi
+    # ③ 公共回显服务（每个 3 秒上限，最多试 3 个源）
+    if ! _is_public_ipv4 "$cand"; then
+        cand=""
+        for u in https://api.ipify.org https://ipv4.icanhazip.com https://ifconfig.me/ip; do
+            cand="$(_http_get "$u" 3 | tr -d '[:space:]' || true)"
+            if _is_public_ipv4 "$cand"; then break; fi
+            cand=""
+        done
+    fi
+    if ! _is_public_ipv4 "$cand"; then return 0; fi
+    printf '%s\n' "$cand"
+    { mkdir -p "$(dirname "$cache")" 2>/dev/null && printf '%s\n' "$cand" > "$cache" 2>/dev/null; } || true
+}
+
+_public_ip() {   # 网卡是内网地址时才去探测公网（公网直连的机器直接返回空，省一次出网）
+    local lip
+    lip="$(local_ip)"
+    if ! _is_private_ipv4 "$lip"; then return 0; fi
+    detect_public_ip
+}
+
+_print_public_line() {   # $1=端口 [$2=已知的公网地址] → 打印「公网地址」两行；无需打印时静默
+    local port="$1" pip="${2:-}" lip
+    if [ -z "$pip" ]; then pip="$(_public_ip)"; fi
+    if [ -z "$pip" ]; then return 0; fi
+    lip="$(local_ip)"
+    printf '  公网地址 : http://%s:%s\n' "$pip" "$port"
+    printf '             （网卡只有内网地址 %s，公网访问请用上面这条；云安全组/厂商防火墙也要放行 %s）\n' "${lip:-未知}" "$port"
+}
+
 do_show_login_info() {
     check_root
     cleanup_plaintext_credentials    # 任何需要 root 的入口都顺手清掉旧版明文凭据文件（幂等）
     [ -f "$ETC_DIR/config.json" ] || error "面板未安装，无法查看登录信息"
 
-    local ip port bind user domain ans
-    ip="$({ ip route get 1.1.1.1 2>/dev/null || true; } | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1 || true)"
-    [ -n "$ip" ] || ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    local ip port bind user domain ans pip
+    ip="$(local_ip)"
     [ -n "$ip" ] || ip="<服务器IP>"
+    pip="$(_public_ip)"
     port="$(cfg_field port)"
     bind="$(cfg_field bind)"
     user="$(cfg_field username)"
 
     echo ""
-    echo "  面板地址 : http://${ip}:${port}"
     if [ "$bind" = "127.0.0.1" ]; then
-        echo "             （配置为仅本机监听：本机 ssh -L ${port}:127.0.0.1:${port} root@${ip} 后访问 127.0.0.1:${port}）"
+        echo "  面板地址 : http://127.0.0.1:${port}  （配置为仅本机监听）"
+        echo "             先做隧道再访问：ssh -L ${port}:127.0.0.1:${port} root@${pip:-$ip}"
+    else
+        echo "  面板地址 : http://${ip}:${port}"
+        _print_public_line "$port" "$pip"
     fi
     if [ -f "$ETC_DIR/proxies.json" ]; then
         domain="$(python3 - "$ETC_DIR/proxies.json" "$port" <<'EOF' 2>/dev/null || true
@@ -1686,19 +1807,18 @@ EOF
 }
 
 _print_panel_url() {   # 升级/重装收尾打印真实地址（取自 config.json，不靠命令行变量）
-    local ip rport rbind user
-    ip="$({ ip route get 1.1.1.1 2>/dev/null || true; } | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1 || true)"
-    if [ -z "$ip" ]; then
-        ip="$({ hostname -I 2>/dev/null || true; } | awk '{print $1}' || true)"
-    fi
+    local ip rport rbind user pip
+    ip="$(local_ip)"
+    pip="$(_public_ip)"
     rport="$(cfg_field port)"
     rbind="$(cfg_field bind)"
     user="$(cfg_field username)"
     echo "------------------------------------------------------------------"
     if [ "$rbind" = "127.0.0.1" ]; then
-        echo "  面板地址 : http://127.0.0.1:${rport}  （仅本机；远程: ssh -L ${rport}:127.0.0.1:${rport} <用户>@${ip:-服务器IP}）"
+        echo "  面板地址 : http://127.0.0.1:${rport}  （仅本机；远程: ssh -L ${rport}:127.0.0.1:${rport} <用户>@${pip:-${ip:-服务器IP}}）"
     else
         echo "  面板地址 : http://${ip:-<服务器IP>}:${rport}"
+        _print_public_line "$rport" "$pip"
     fi
     if panel_http_ok "$rport" 3; then
         echo "  自检结果 : 本机 http://127.0.0.1:${rport} 返回 200 ✓"
@@ -1717,12 +1837,10 @@ _print_panel_url() {   # 升级/重装收尾打印真实地址（取自 config.j
 }
 
 print_summary() {
-    local ip pv _pdomain
-    ip="$({ ip route get 1.1.1.1 2>/dev/null || true; } | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -1 || true)"
-    if [ -z "$ip" ]; then
-        ip="$({ hostname -I 2>/dev/null || true; } | awk '{print $1}' || true)"
-    fi
+    local ip pv _pdomain pip
+    ip="$(local_ip)"
     [ -n "$ip" ] || ip="<服务器IP>"
+    pip="$(_public_ip)"
 
     echo ""
     echo "=================================================================="
@@ -1737,9 +1855,13 @@ print_summary() {
     [ -n "$rbind" ] || rbind="$PANEL_BIND"
     if [ "$rbind" = "0.0.0.0" ]; then
         echo "  面板地址 : ${C_BOLD}http://${ip}:${rport}${C_RESET}"
+        if [ -n "$pip" ]; then
+            echo "  公网地址 : ${C_BOLD}http://${pip}:${rport}${C_RESET}"
+            echo "             （网卡只有内网地址 ${ip}，公网访问请用上面这条；云安全组/厂商防火墙也要放行 ${rport}）"
+        fi
     else
         echo "  面板地址 : ${C_BOLD}http://127.0.0.1:${rport}${C_RESET}  （仅本机）"
-        echo "  远程访问 : 在本机执行 ssh -L ${rport}:127.0.0.1:${rport} root@${ip}"
+        echo "  远程访问 : 在本机执行 ssh -L ${rport}:127.0.0.1:${rport} root@${pip:-$ip}"
         echo "             然后浏览器打开 http://127.0.0.1:${rport}"
     fi
     # 自检结论：地址必须和真实监听端口一致且本机可访问（v3.2.40 —— 不再只喊「安装完成」）

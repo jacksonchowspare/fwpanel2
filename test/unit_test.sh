@@ -1468,6 +1468,78 @@ case "$OUT3" in *"已保留站点文件"*) ok "逐项给出保留提示" ;; *) b
 [ -f "$R/nginx/sites-enabled/zzz-user-own.conf" ] && ok "别人的配置依然安全" || bad "误删别人的配置"
 rm -rf /tmp/fwpurge_a /tmp/fwpurge_b /tmp/fwpurge_c
 
+echo "== 公网地址探测：IPv4 / 公网判定 =="
+for ip in 1.2.3.4 8.8.8.8 203.0.113.9 172.32.1.1; do
+    _is_public_ipv4 "$ip" && ok "公网: $ip" || bad "公网误判: $ip"
+done
+for ip in 10.0.0.5 172.16.3.4 172.31.255.255 192.168.1.1 127.0.0.1 169.254.169.254 100.64.1.1 100.127.255.254 0.0.0.0; do
+    _is_public_ipv4 "$ip" && bad "内网误判为公网: $ip" || ok "非公网: $ip"
+done
+for ip in "" "abc" "1.2.3" "1.2.3.4.5" "1.2.3.256" "1..2.3"; do
+    _is_ipv4 "$ip" && bad "非法 IPv4 被判合法: '$ip'" || ok "非法 IPv4: '$ip'"
+done
+_is_private_ipv4 10.1.2.3 && ok "10.1.2.3 判为内网" || bad "10.1.2.3 未判内网"
+_is_private_ipv4 8.8.8.8 && bad "8.8.8.8 误判内网" || ok "8.8.8.8 非内网"
+
+echo "== 公网地址探测：关闭开关 / 缓存 / 过期 =="
+PUBD=/tmp/fwpubtest.$$
+mkdir -p "$PUBD/dead"
+printf '#!/usr/bin/env bash\nexit 22\n' > "$PUBD/dead/curl"; chmod +x "$PUBD/dead/curl"
+printf '#!/usr/bin/env bash\nexit 1\n'  > "$PUBD/dead/wget"; chmod +x "$PUBD/dead/wget"
+out=$(FW_NO_PUBLIC_IP=1 FW_PUBLIC_IP_CACHE="$PUBD/c0" detect_public_ip)
+[ -z "$out" ] && ok "FW_NO_PUBLIC_IP=1 不出网、输出空" || bad "关闭开关仍输出: $out"
+printf '203.0.113.7\n' > "$PUBD/c1"
+out=$(PATH="$PUBD/dead:$PATH" FW_PUBLIC_IP_CACHE="$PUBD/c1" detect_public_ip)
+[ "$out" = "203.0.113.7" ] && ok "24h 内缓存命中（网络全挂也能读到）" || bad "缓存未命中: $out"
+printf '203.0.113.8\n' > "$PUBD/c2"; touch -d '3 days ago' "$PUBD/c2"
+out=$(PATH="$PUBD/dead:$PATH" FW_PUBLIC_IP_CACHE="$PUBD/c2" detect_public_ip)
+[ -z "$out" ] && ok "缓存过期 + 网络不可用 → 输出空" || bad "过期缓存被当成有效: $out"
+
+echo "== 公网地址探测：云元数据优先 > 回显兜底 > 全失败 =="
+mkdir -p "$PUBD/stub1"
+cat > "$PUBD/stub1/curl" <<'STUBC'
+#!/usr/bin/env bash
+case "$*" in
+    *opc/v2/vnics*) printf '[{"privateIp":"10.0.0.12","publicIp":"198.51.100.5"}]' ;;
+    *169.254.169.254*|*100.100.100.200*|*tencentyun*) exit 22 ;;
+    *) printf '203.0.113.99\n' ;;
+esac
+STUBC
+chmod +x "$PUBD/stub1/curl"
+out=$(PATH="$PUBD/stub1:$PATH" FW_PUBLIC_IP_CACHE="$PUBD/c3" detect_public_ip)
+[ "$out" = "198.51.100.5" ] && ok "Oracle 元数据取到公网地址（不被回显覆盖）" || bad "元数据优先失效: $out"
+[ "$(cat "$PUBD/c3" 2>/dev/null)" = "198.51.100.5" ] && ok "探测结果写入缓存" || bad "未写缓存"
+mkdir -p "$PUBD/stub2"
+cat > "$PUBD/stub2/curl" <<'STUBC'
+#!/usr/bin/env bash
+case "$*" in
+    *169.254.169.254*|*100.100.100.200*|*tencentyun*) exit 22 ;;
+    *api.ipify.org*) exit 22 ;;
+    *) printf '198.51.100.77\n' ;;
+esac
+STUBC
+chmod +x "$PUBD/stub2/curl"
+out=$(PATH="$PUBD/stub2:$PATH" FW_PUBLIC_IP_CACHE="$PUBD/c4" detect_public_ip)
+[ "$out" = "198.51.100.77" ] && ok "元数据全失败时回显兜底" || bad "回显兜底失效: $out"
+mkdir -p "$PUBD/stub3"
+printf '#!/usr/bin/env bash\nexit 22\n' > "$PUBD/stub3/curl"; chmod +x "$PUBD/stub3/curl"
+out=$(PATH="$PUBD/stub3:$PATH" FW_PUBLIC_IP_CACHE="$PUBD/c5" detect_public_ip)
+[ -z "$out" ] && ok "全部失败输出空（安装不被中断）" || bad "全失败仍输出: $out"
+[ -f "$PUBD/c5" ] && bad "失败却写了缓存" || ok "失败不写缓存"
+
+echo "== 公网地址探测：只在网卡是内网时才探测并打印 =="
+mkdir -p "$PUBD/bin"
+printf '#!/usr/bin/env bash\necho "1.1.1.1 via 10.0.0.1 dev eth0 src 10.0.0.12 uid 0"\n' > "$PUBD/bin/ip"; chmod +x "$PUBD/bin/ip"
+[ "$(PATH="$PUBD/bin:$PATH" local_ip)" = "10.0.0.12" ] && ok "local_ip 解析默认路由出口地址" || bad "local_ip 解析错误"
+out=$(PATH="$PUBD/bin:$PUBD/stub2:$PATH" FW_PUBLIC_IP_CACHE="$PUBD/c6" _print_public_line 42608)
+case "$out" in *"公网地址 : http://198.51.100.77:42608"*) ok "内网网卡 → 打印公网地址行" ;; *) bad "公网地址行缺失: $out" ;; esac
+case "$out" in *"内网地址 10.0.0.12"*) ok "提示里点明内网地址" ;; *) bad "缺少内网地址说明" ;; esac
+case "$out" in *"42608）"*) ok "提示里点明端口放行" ;; *) bad "缺少端口放行提示" ;; esac
+printf '#!/usr/bin/env bash\necho "1.1.1.1 via 1.1.1.1 dev eth0 src 198.51.100.30 uid 0"\n' > "$PUBD/bin/ip"; chmod +x "$PUBD/bin/ip"
+out=$(PATH="$PUBD/bin:$PUBD/stub2:$PATH" FW_PUBLIC_IP_CACHE="$PUBD/c7" _print_public_line 42608)
+[ -z "$out" ] && ok "网卡已是公网地址 → 不重复打印公网行" || bad "公网网卡仍打印公网行: $out"
+rm -rf "$PUBD"
+
 echo "============================================"
 echo "结果: $PASS 通过, $FAIL 失败"
 rm -f "$TMPF" /tmp/install_funcs_fw.sh
